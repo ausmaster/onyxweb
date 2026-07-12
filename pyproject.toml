@@ -1,0 +1,102 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "onyxweb"
+version = "2.0.0a0"
+description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[project.scripts]
+onyxweb = "onyxweb.__main__:main"
+onyxweb-download-chrome = "onyxweb._download_chrome:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-httpserver>=1.1",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # Parity oracle for the Rust-side header/body hashes (BBOT uses mmh3).
+    "mmh3>=4.0",
+]
+bench = [
+    "pytest>=8",
+    "playwright>=1.49",
+]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "rust-toolchain.toml" },
+    { file = "src/**/*.rs" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "D"]
+ignore = [
+    # Google-convention conflicts with these pydocstyle defaults:
+    "D203", # one-blank-line-before-class — google prefers D211
+    "D213", # multi-line-summary-second-line — google prefers D212
+    # __init__ args go in the class docstring under Google convention.
+    "D107",
+    # Magic methods (__repr__ etc.) don't need explicit docstrings.
+    "D105",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests get assert-style summaries; not full Google blocks.
+"tests/*" = ["D"]
+# Private modules: relax requirement on per-symbol docstrings.
+"python/onyxweb/_logging.py" = ["D102", "D103", "D107"]
+"python/onyxweb/_download_chrome.py" = ["D103"]
+
+[tool.ruff.lint.isort]
+# Coalesce `from X import a as b, c as d` onto one block — keeps PEP 484
+# explicit re-exports (`Dom as Dom`) compact and matches our import style:
+# single block per module, multi-line when ≥5 symbols.
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.maturin]
+python-source = "python"
+module-name = "onyxweb._onyxweb"
+features = ["pyo3/extension-module"]
+# Chrome-headless-shell (~179 MB per platform) is NOT bundled into the wheel.
+# Wheels stay small; end users fetch the pinned binary with `onyxweb --install`
+# after install — mirrors Playwright's `playwright install` pattern.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not benchmark'"
+asyncio_mode = "auto"
+markers = [
+    "benchmark: performance regression tests",
+    "real_sites: gauntlet tests against real production websites",
+    "threading: multi-thread / concurrency tests",
+]

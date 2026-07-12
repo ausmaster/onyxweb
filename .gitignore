@@ -1,0 +1,33 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.so
+*.pyd
+
+# IDE
+.idea/
+
+# Env
+.venv/
+.env
+
+# Maturin
+*.whl
+
+# OS
+.DS_Store
+
+# Ruff
+.ruff_cache/
+
+CLAUDE.md
+
+# Bundled chromium binaries — populated at wheel build time (`uv run onyxweb-download-chrome`).
+# Not committed to git (too large); maturin `include` picks them up from disk.
+python/onyxweb/_binaries/

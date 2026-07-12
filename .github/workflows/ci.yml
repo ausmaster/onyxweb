@@ -1,0 +1,144 @@
+# Cross-platform wheel matrix. Wheels are uploaded as artifacts — no auto-
+# publish. Trigger: push to master, PRs, and manual workflow_dispatch.
+#
+# Platforms target what `onyxweb-download-chrome` can stage a binary for:
+# linux x86_64 / aarch64, darwin x86_64 / arm64, windows x86_64. Adding a
+# platform requires both a matrix entry here AND a PLATFORMS row in
+# python/onyxweb/_download_chrome.py.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    # Static gates: ruff, mypy strict, cargo fmt, cargo clippy. Fast — runs
+    # on every PR / push to master alongside the wheel-build matrix.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Sync dev deps (builds Rust ext via cache-keys)
+        run: uv sync --group dev
+      - name: Ruff
+        run: uv run ruff check python/ tests/
+      - name: Mypy (strict)
+        run: uv run mypy python/onyxweb/ tests/
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel (manylinux_2_28)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: "2_28"
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64
+          - runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --find-interpreter
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x86_64
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  test:
+    # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
+    # fetch chrome-headless-shell via the new `onyxweb --install` path, run
+    # the default pytest suite. Skips the benchmark tests (-m 'not benchmark'
+    # from pyproject addopts).
+    needs: [linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - name: Install wheel + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -m pip install 'pytest>=8' 'pytest-httpserver>=1.1'
+      - name: Fetch chrome-headless-shell
+        run: onyxweb --install
+      - name: Run default test suite
+        run: pytest tests/

@@ -1,0 +1,3 @@
+# No V8 anymore. Chromium is a subprocess now, not a linked library.
+# This file is empty/unused in the CDP engine era. Kept as a placeholder so
+# anyone consulting .cargo/ knows no special env vars are required.
