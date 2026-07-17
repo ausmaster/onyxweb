@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import hashlib
 
-import onyxweb
 import mmh3
+import onyxweb
 from pytest_httpserver import HTTPServer
 
 

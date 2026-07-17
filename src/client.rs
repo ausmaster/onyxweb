@@ -33,7 +33,7 @@ use crate::config::{
 use crate::engine::{CaptureMode, CaptureOutput, capture_page};
 use crate::error::{OnyxError, Result};
 use crate::pool::PagePool;
-use crate::result::{ConsoleMessageRs, RawFetchOutput, RawRenderOutput};
+use crate::result::{RawFetchOutput, RawRenderOutput};
 use crate::runtime;
 
 // One place maps a captured page into each Python-visible raw output. Both
@@ -347,14 +347,15 @@ async fn do_fetch_all_inner(
     Ok(out.into())
 }
 
-/// Run a batch of URLs in parallel. Returns one `Result` per URL — partial
-/// failures are surfaced per-item rather than aborting the batch.
+/// Run a batch of URLs in parallel. Returns `(url, Result)` per URL, in input
+/// order — partial failures are surfaced per-item rather than aborting the
+/// batch, and the URL is paired so a failure knows which fetch it was.
 async fn do_batch_inner(
     state: Arc<ClientState>,
     urls: Vec<String>,
     fetch_cfg: FetchConfigRs,
     mode: CaptureMode,
-) -> Vec<std::result::Result<CaptureOutput, OnyxError>> {
+) -> Vec<(String, std::result::Result<CaptureOutput, OnyxError>)> {
     let shot_cfg = ScreenshotConfigRs::default();
     // Snapshot config ONCE for the whole batch — in-batch updates don't re-apply.
     let base_cfg = state.config.read().clone();
@@ -365,19 +366,26 @@ async fn do_batch_inner(
             let base = base_cfg.clone();
             let fc = fetch_cfg.clone();
             let sc = shot_cfg.clone();
+            // The URL travels with its task so the result pairs back to it.
             tokio::spawn(async move {
-                let guard = pool.acquire().await?;
-                capture_page(&guard, &url, &base, &fc, &sc, mode).await
+                let r = async {
+                    let guard = pool.acquire().await?;
+                    capture_page(&guard, &url, &base, &fc, &sc, mode).await
+                }
+                .await;
+                (url, r)
             })
         })
         .collect();
     let mut collected = Vec::with_capacity(tasks.len());
     for h in tasks {
-        let r = match h.await {
-            Ok(inner) => inner,
-            Err(e) => Err(OnyxError::Internal(format!("join: {e}"))),
-        };
-        collected.push(r);
+        match h.await {
+            Ok(pair) => collected.push(pair),
+            Err(e) => collected.push((
+                String::new(),
+                Err(OnyxError::Internal(format!("join: {e}"))),
+            )),
+        }
     }
     collected
 }
@@ -392,10 +400,12 @@ async fn do_close_inner(state: Arc<ClientState>) {
     }
 }
 
-/// Append one batch result to `list`, with per-item failure → stub-result
-/// fallback. Shared by sync and async batch wrappers.
-fn batch_result_to_py(
+/// Append one batch item to `list`. A success appends the raw output; a failure
+/// appends the enriched exception INSTANCE (`.url` / `.kind`) — callers get a
+/// `list[result | Exception]`, never a silent stub. Shared by sync + async.
+fn batch_item_to_py(
     py: Python<'_>,
+    url: &str,
     result: std::result::Result<CaptureOutput, OnyxError>,
     mode: CaptureMode,
     list: &Bound<'_, PyList>,
@@ -407,24 +417,9 @@ fn batch_result_to_py(
             CaptureMode::Both => list.append(RawFetchOutput::from(out)),
         },
         Err(e) => {
-            log::warn!("batch item failed: {e}");
-            // Synthesize a single error-level ConsoleMessage so the stub
-            // result still surfaces the failure via `RenderResult.errors`.
-            // Timestamp is 0.0 — there's no real event time for an internal
-            // failure.
-            let stub = CaptureOutput {
-                console_messages: vec![ConsoleMessageRs {
-                    kind: "error".to_string(),
-                    text: e.to_string(),
-                    timestamp: 0.0,
-                }],
-                ..Default::default()
-            };
-            match mode {
-                CaptureMode::Html => list.append(RawRenderOutput::from(stub)),
-                CaptureMode::Png => list.append(PyBytes::new(py, b"")),
-                CaptureMode::Both => list.append(RawFetchOutput::from(stub)),
-            }
+            log::warn!("batch item failed ({url}): {e}");
+            let exc = e.into_py_err(py, url).into_value(py);
+            list.append(exc)
         }
     }
 }
@@ -539,8 +534,9 @@ impl Client {
         let fetch_cfg = parse_fetch_config(per_call).map_err(PyErr::from)?;
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
+        let url_err = url.clone();
         py.allow_threads(move || runtime.block_on(do_fetch_inner(state, url, fetch_cfg)))
-            .map_err(PyErr::from)
+            .map_err(|e| e.into_py_err(py, &url_err))
     }
 
     /// Screenshot URL → image bytes (png/jpeg/webp depending on per_shot.format).
@@ -554,9 +550,10 @@ impl Client {
         let shot_cfg = parse_screenshot_config(per_shot).map_err(PyErr::from)?;
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
+        let url_err = url.clone();
         let png = py
             .allow_threads(move || runtime.block_on(do_screenshot_inner(state, url, shot_cfg)))
-            .map_err(PyErr::from)?;
+            .map_err(|e| e.into_py_err(py, &url_err))?;
         Ok(PyBytes::new(py, &png))
     }
 
@@ -573,10 +570,11 @@ impl Client {
         let shot_cfg = parse_screenshot_config(per_shot).map_err(PyErr::from)?;
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
+        let url_err = url.clone();
         py.allow_threads(move || {
             runtime.block_on(do_fetch_all_inner(state, url, fetch_cfg, shot_cfg))
         })
-        .map_err(PyErr::from)
+        .map_err(|e| e.into_py_err(py, &url_err))
     }
 
     /// Batch of URLs (parallel inside Rust tokio). Returns list of results
@@ -604,8 +602,8 @@ impl Client {
             .allow_threads(move || runtime.block_on(do_batch_inner(state, urls, fetch_cfg, mode)));
 
         let results = PyList::empty(py);
-        for r in outputs {
-            batch_result_to_py(py, r, mode, &results)?;
+        for (url, r) in outputs {
+            batch_item_to_py(py, &url, r, mode, &results)?;
         }
         Ok(results)
     }
@@ -658,10 +656,11 @@ impl Client {
         self.check_open().map_err(PyErr::from)?;
         let fetch_cfg = parse_fetch_config(per_call).map_err(PyErr::from)?;
         let state = self.inner.clone();
+        let url_err = url.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             do_fetch_inner(state, url, fetch_cfg)
                 .await
-                .map_err(PyErr::from)
+                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))
         })
     }
 
@@ -675,10 +674,11 @@ impl Client {
         self.check_open().map_err(PyErr::from)?;
         let shot_cfg = parse_screenshot_config(per_shot).map_err(PyErr::from)?;
         let state = self.inner.clone();
+        let url_err = url.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let bytes = do_screenshot_inner(state, url, shot_cfg)
                 .await
-                .map_err(PyErr::from)?;
+                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))?;
             Python::with_gil(|py| -> PyResult<Py<PyBytes>> {
                 Ok(PyBytes::new(py, &bytes).unbind())
             })
@@ -697,10 +697,11 @@ impl Client {
         let fetch_cfg = parse_fetch_config(per_call).map_err(PyErr::from)?;
         let shot_cfg = parse_screenshot_config(per_shot).map_err(PyErr::from)?;
         let state = self.inner.clone();
+        let url_err = url.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             do_fetch_all_inner(state, url, fetch_cfg, shot_cfg)
                 .await
-                .map_err(PyErr::from)
+                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))
         })
     }
 
@@ -725,8 +726,8 @@ impl Client {
             let outputs = do_batch_inner(state, urls, fetch_cfg, mode).await;
             Python::with_gil(|py| -> PyResult<Py<PyList>> {
                 let results = PyList::empty(py);
-                for r in outputs {
-                    batch_result_to_py(py, r, mode, &results)?;
+                for (url, r) in outputs {
+                    batch_item_to_py(py, &url, r, mode, &results)?;
                 }
                 Ok(results.unbind())
             })

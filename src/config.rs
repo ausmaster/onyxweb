@@ -547,9 +547,7 @@ fn parse_action(v: &Bound<'_, PyAny>) -> Result<ActionRs> {
             let duration_ms: u64 = d
                 .get_item("duration_ms")
                 .map_err(to_internal)?
-                .ok_or_else(|| {
-                    OnyxError::InvalidConfig("Wait: missing 'duration_ms'".to_string())
-                })?
+                .ok_or_else(|| OnyxError::InvalidConfig("Wait: missing 'duration_ms'".to_string()))?
                 .extract()
                 .map_err(to_internal)?;
             Ok(ActionRs::Wait { duration_ms })
@@ -777,9 +775,9 @@ fn parse_chrome(v: &Bound<'_, PyAny>) -> Result<ChromeRs> {
 }
 
 fn parse_user_agent_brand_version(v: &Bound<'_, PyAny>) -> Result<UserAgentBrandVersionRs> {
-    let d = v.downcast::<PyDict>().map_err(|_| {
-        OnyxError::InvalidConfig("user_agent brand entry must be dict".to_string())
-    })?;
+    let d = v
+        .downcast::<PyDict>()
+        .map_err(|_| OnyxError::InvalidConfig("user_agent brand entry must be dict".to_string()))?;
     let brand: String = d
         .get_item("brand")?
         .ok_or_else(|| OnyxError::InvalidConfig("brand entry missing 'brand'".to_string()))?

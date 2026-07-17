@@ -34,15 +34,15 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel as _BaseModel
 
+from onyxweb._logging import configure as _configure_logging, logger, set_log_level
 from onyxweb._onyxweb import (
-    OnyxwebError as OnyxwebError,
     Client as _RustClient,
     Dom as Dom,
     Element as Element,
+    OnyxwebError as OnyxwebError,
     _FetchOutput,
     _RenderOutput,
 )
-from onyxweb._logging import configure as _configure_logging, logger, set_log_level
 from onyxweb.config import (
     ChromeConfig,
     Click,
@@ -806,25 +806,29 @@ class Client:
         *,
         capture: Literal["html", "png", "both"] = "html",
         config: FetchConfig | None = None,
-    ) -> list[RenderResult | FetchResult | bytes]:
+    ) -> list[RenderResult | FetchResult | bytes | Exception]:
         """Run a batch of URLs in parallel (tokio-driven). Returns when all complete.
 
-        Return type depends on ``capture``:
-          - "html" → list[RenderResult]
-          - "png" → list[bytes]
-          - "both" → list[FetchResult]
+        Return type depends on ``capture`` (``"html"`` → RenderResult, ``"png"``
+        → bytes, ``"both"`` → FetchResult), positionally aligned with ``urls``.
+
+        A URL that fails is returned **in place** as the exception instance a
+        single fetch would raise (``TimeoutError`` for timeouts, ``OnyxwebError``
+        otherwise), carrying ``.url`` (which URL) and ``.kind`` (the cause
+        category). Detect with ``isinstance(item, Exception)`` — one bad URL
+        never sinks the rest of the batch.
         """
         fc = config or FetchConfig()
         url_list = list(urls)
         _client_log.info("batch: %d URLs, capture=%s", len(url_list), capture)
         raws = self._rust.batch(url_list, capture, fc.model_dump())
-        results: list[RenderResult | FetchResult | bytes]
+        results: list[RenderResult | FetchResult | bytes | Exception]
         if capture == "html":
-            results = [_make_render_result(r) for r in raws]
+            results = [r if isinstance(r, Exception) else _make_render_result(r) for r in raws]
         elif capture == "png":
-            results = [bytes(b) for b in raws]
+            results = [r if isinstance(r, Exception) else bytes(r) for r in raws]
         else:
-            results = [FetchResult(r) for r in raws]
+            results = [r if isinstance(r, Exception) else FetchResult(r) for r in raws]
         _client_log.debug("batch done: %d results returned", len(results))
         return results
 
@@ -1157,7 +1161,7 @@ class AsyncClient:
         *,
         capture: Literal["html", "png", "both"] = "html",
         config: FetchConfig | None = None,
-    ) -> list[RenderResult | FetchResult | bytes]:
+    ) -> list[RenderResult | FetchResult | bytes | Exception]:
         """Run a batch of URLs in parallel (tokio-driven). Awaits all.
 
         Args:
@@ -1167,9 +1171,11 @@ class AsyncClient:
             config: A ``FetchConfig`` applied to every URL in the batch.
 
         Returns:
-            List of results in input order. Per-URL failures are returned as
-            stub results (empty html/bytes + ``errors`` populated) rather
-            than aborting the batch.
+            List of results in input order. A URL that fails is returned **in
+            place** as the exception instance a single fetch would raise
+            (``TimeoutError`` for timeouts, ``OnyxwebError`` otherwise), carrying
+            ``.url`` and ``.kind``. Detect with ``isinstance(item, Exception)``;
+            one bad URL never aborts the batch.
 
         Raises:
             ValueError: If ``capture`` is not one of the three valid values.
@@ -1178,13 +1184,13 @@ class AsyncClient:
         url_list = list(urls)
         _client_log.info("abatch: %d URLs, capture=%s", len(url_list), capture)
         raws = await self._rust.batch_async(url_list, capture, fc.model_dump())
-        results: list[RenderResult | FetchResult | bytes]
+        results: list[RenderResult | FetchResult | bytes | Exception]
         if capture == "html":
-            results = [_make_render_result(r) for r in raws]
+            results = [r if isinstance(r, Exception) else _make_render_result(r) for r in raws]
         elif capture == "png":
-            results = [bytes(b) for b in raws]
+            results = [r if isinstance(r, Exception) else bytes(r) for r in raws]
         else:
-            results = [FetchResult(r) for r in raws]
+            results = [r if isinstance(r, Exception) else FetchResult(r) for r in raws]
         _client_log.debug("abatch done: %d results returned", len(results))
         return results
 

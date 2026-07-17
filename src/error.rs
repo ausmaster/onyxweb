@@ -3,8 +3,8 @@
 //! `create_exception!` subclass of `RuntimeError` (so `except RuntimeError`
 //! keeps working). Mapping lives in `From<OnyxError> for PyErr` below.
 
-use pyo3::PyErr;
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
+use pyo3::prelude::*;
 use thiserror::Error;
 
 // Base class for all onyxweb errors. Subclasses RuntimeError so existing
@@ -68,6 +68,36 @@ pub enum OnyxError {
 impl OnyxError {
     pub fn cdp<E: std::fmt::Display>(e: E) -> Self {
         Self::Cdp(e.to_string())
+    }
+
+    /// Stable category string for the cause — attached to Python exceptions as
+    /// `.kind` so callers can branch on it without parsing the message.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            OnyxError::ChromeNotFound(_) => "chrome_not_found",
+            OnyxError::LaunchFailed(_) => "launch_failed",
+            OnyxError::NavigationTimeout { .. } => "navigation_timeout",
+            OnyxError::PostLoadScript { .. } => "post_load_script",
+            OnyxError::Timeout(_) => "timeout",
+            OnyxError::Cdp(_) => "cdp",
+            OnyxError::InvalidUrl(_) => "invalid_url",
+            OnyxError::InvalidConfig(_) => "invalid_config",
+            OnyxError::Io(_) => "io",
+            OnyxError::Internal(_) => "internal",
+        }
+    }
+
+    /// Build the Python exception (`TimeoutError` for timeouts, `OnyxwebError`
+    /// otherwise — see `From<OnyxError>`), enriched with `.url` (which fetch
+    /// failed) and `.kind` (the cause category). Used both to raise from a
+    /// single fetch and to return the exception in a `batch` result list.
+    pub fn into_py_err(self, py: Python<'_>, url: &str) -> PyErr {
+        let kind = self.kind();
+        let err: PyErr = self.into();
+        let value = err.value(py).as_any();
+        let _ = value.setattr("url", url);
+        let _ = value.setattr("kind", kind);
+        err
     }
 }
 
