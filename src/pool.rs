@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::emulation::{
-    SetDeviceMetricsOverrideParams, SetGeolocationOverrideParams, SetLocaleOverrideParams,
-    SetScriptExecutionDisabledParams, SetTimezoneOverrideParams, UserAgentBrandVersion,
-    UserAgentMetadata,
+    MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
+    SetGeolocationOverrideParams, SetLocaleOverrideParams, SetScriptExecutionDisabledParams,
+    SetTimezoneOverrideParams, UserAgentBrandVersion, UserAgentMetadata,
 };
 // EmulateNetworkConditionsParams is deprecated upstream in chromiumoxide
 // 0.9 (CDP renamed it). The replacement isn't yet exported; allow the
@@ -37,7 +39,7 @@ use crate::result::ConsoleMessageRs;
 
 /// Name of the isolated JS world used for ``scripts.isolated_world``
 /// registrations. Page JS cannot read or tamper with globals defined here.
-const ISOLATED_WORLD_NAME: &str = "onyxweb_isolated";
+const DEFAULT_ISOLATED_WORLD_NAME: &str = "util";
 
 /// Build a `Vec<BlockPattern>` for `Network.setBlockedURLs` from a slice of
 /// URL pattern strings. URLPattern syntax (`*://*.doubleclick.net/*`),
@@ -132,6 +134,8 @@ pub struct ResponseState {
     pending_extra: HashMap<(String, u16), ExtraInfoRs>,
     /// Main-document redirect hops for the current fetch, in order.
     redirects: Vec<RedirectHopRs>,
+    /// Main-document network failure (DNS, connection refused, ...), if any.
+    nav_error: Option<String>,
 }
 
 /// Convert a CDP `Headers` (JSON object) into (name, value) pairs. CDP joins
@@ -177,6 +181,8 @@ pub struct PooledPage {
     /// code path than `Page.navigate` (chromiumoxide's command future hangs
     /// for hash-only URLs after a previous nav on the same tab).
     pub current_url: Arc<Mutex<Option<String>>>,
+    /// Set when a fetch wedged or killed this tab; `acquire()` recreates it.
+    pub poisoned: AtomicBool,
 }
 
 /// Pool sized to the Client's `concurrency`. `acquire()` returns page + permit
@@ -186,6 +192,8 @@ pub struct PagePool {
     browser: Arc<Browser>,
     pages: Mutex<Vec<PooledPage>>,
     sem: Arc<Semaphore>,
+    /// Base config, kept so a poisoned tab can be recreated on acquire.
+    config: ClientConfigRs,
     #[allow(dead_code)]
     size: usize,
 }
@@ -211,6 +219,7 @@ impl PagePool {
             browser,
             pages: Mutex::new(created),
             sem: Arc::new(Semaphore::new(size)),
+            config: base.clone(),
             size,
         }))
     }
@@ -229,11 +238,20 @@ impl PagePool {
             .acquire_owned()
             .await
             .map_err(|e| OnyxError::Internal(format!("pool sem: {e}")))?;
-        let pooled = self
+        let mut pooled = self
             .pages
             .lock()
             .pop()
             .expect("semaphore permitted but pool is empty");
+        if pooled.poisoned.load(Ordering::Acquire) {
+            log::debug!(target: "onyxweb::pool", "recreating poisoned pooled tab");
+            let _ = tokio::time::timeout(Duration::from_secs(5), pooled.page.close()).await;
+            let _ = self
+                .browser
+                .dispose_browser_context(pooled.browser_context_id.clone())
+                .await;
+            pooled = create_pooled_page(&self.browser, &self.config).await?;
+        }
         pooled.console_messages.lock().clear();
         // Snapshot previous response before clearing — same-doc navs (no new
         // HTTP response) propagate the prior document's metadata. Only shift
@@ -248,6 +266,7 @@ impl PagePool {
             }
             rs.pending_extra.clear();
             rs.redirects.clear();
+            rs.nav_error = None;
         }
         log::trace!(
             target: "onyxweb::pool",
@@ -295,6 +314,15 @@ impl PageGuard {
         &self.page.as_ref().expect("guard drained").page
     }
 
+    /// Flag this tab as unusable so `acquire()` recreates it before reuse.
+    pub fn mark_poisoned(&self) {
+        self.page
+            .as_ref()
+            .expect("guard drained")
+            .poisoned
+            .store(true, Ordering::Release);
+    }
+
     pub fn console_messages(&self) -> Arc<Mutex<Vec<ConsoleMessageRs>>> {
         self.page
             .as_ref()
@@ -335,6 +363,17 @@ impl PageGuard {
             .response
             .lock()
             .redirects
+            .clone()
+    }
+
+    /// Main-document network failure recorded during this fetch, if any.
+    pub fn nav_error(&self) -> Option<String> {
+        self.page
+            .as_ref()
+            .expect("guard drained")
+            .response
+            .lock()
+            .nav_error
             .clone()
     }
 
@@ -496,6 +535,15 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
         .await?;
     }
 
+    if let Some(scheme) = &base.emulation.prefers_color_scheme {
+        page.execute(
+            SetEmulatedMediaParams::builder()
+                .feature(MediaFeature::new("prefers-color-scheme", scheme.clone()))
+                .build(),
+        )
+        .await?;
+    }
+
     if !base.emulation.javascript_enabled {
         page.execute(SetScriptExecutionDisabledParams::new(true))
             .await?;
@@ -517,8 +565,8 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
     let level = base.capture_console_level;
     {
         use chromiumoxide::cdp::browser_protocol::network::{
-            EventRequestWillBeSent, EventResponseReceived, EventResponseReceivedExtraInfo,
-            ResourceType,
+            EventLoadingFailed, EventRequestWillBeSent, EventResponseReceived,
+            EventResponseReceivedExtraInfo, ResourceType,
         };
         use chromiumoxide::cdp::browser_protocol::page::{
             EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
@@ -720,6 +768,22 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
             }
         });
 
+        // Network.loadingFailed — a main-document failure (DNS, connection
+        // refused). Skips intentional aborts; capture_page surfaces it since the
+        // error page otherwise fires a lifecycle event and looks like success.
+        let fail_cl = response.clone();
+        let mut fail_stream = page
+            .event_listener::<EventLoadingFailed>()
+            .await
+            .map_err(OnyxError::from)?;
+        tokio::spawn(async move {
+            while let Some(evt) = fail_stream.next().await {
+                if matches!(evt.r#type, ResourceType::Document) && evt.canceled != Some(true) {
+                    fail_cl.lock().nav_error = Some(evt.error_text.clone());
+                }
+            }
+        });
+
         // Page.frameNavigated — fires on every cross-document navigation
         // (full nav). Updates current_url so we can detect when an upcoming
         // fetch is a same-document navigation.
@@ -778,6 +842,7 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
         console_messages,
         response,
         current_url,
+        poisoned: AtomicBool::new(false),
     })
 }
 
@@ -852,10 +917,15 @@ async fn register_init_scripts(page: &Page, base: &ClientConfigRs) -> Result<()>
     }
 
     for src in &s.isolated_world {
+        let world_name = if s.isolated_world_name.is_empty() {
+            DEFAULT_ISOLATED_WORLD_NAME
+        } else {
+            s.isolated_world_name.as_str()
+        };
         page.execute(
             AddScriptToEvaluateOnNewDocumentParams::builder()
                 .source(src.clone())
-                .world_name(ISOLATED_WORLD_NAME)
+                .world_name(world_name)
                 .build()
                 .map_err(|e| OnyxError::Cdp(format!("isolated script: {e}")))?,
         )

@@ -81,14 +81,28 @@ BASIC_UA_METADATA: dict[str, Any] = {
 # guard with feature checks so double-registration or running on shapes
 # other than chrome-headless-shell is harmless.
 
-_PATCH_WEBDRIVER = """\
-/* navigator.webdriver — Akamai/PerimeterX/DataDome/Cloudflare read this
-   property and treat true as 'automation'. Real browsers never expose it.
-   We redefine via the prototype so the getter returns undefined. */
-Object.defineProperty(Navigator.prototype, 'webdriver', {
-  get: () => undefined,
-  configurable: true,
-});
+_PATCH_NATIVE_STEALTH = """\
+/* navigator.webdriver — the most-checked automation tell (Akamai/PerimeterX/
+   DataDome/Cloudflare). A patched arrow getter () => undefined is itself a tell
+   via .toString(), so route it (and toString itself) through a
+   Function.prototype.toString that reports [native code] for our functions. */
+(() => {
+  const orig = Function.prototype.toString;
+  const native = new WeakMap();
+  const proxy = new Proxy(orig, {
+    apply: (t, self, args) =>
+      native.has(self) ? native.get(self) : Reflect.apply(t, self, args),
+  });
+  native.set(proxy, orig.call(orig));
+  Object.defineProperty(Function.prototype, 'toString', {
+    value: proxy, configurable: true, writable: true,
+  });
+  const g = () => undefined;
+  native.set(g, orig.call(orig).replace('toString', 'get webdriver'));
+  Object.defineProperty(Navigator.prototype, 'webdriver', {
+    get: g, configurable: true,
+  });
+})();
 """
 
 _PATCH_WINDOW_CHROME = """\
@@ -231,7 +245,7 @@ _PATCH_CANVAS_NOISE = """\
 
 
 BASIC_PATCHES: list[str] = [
-    _PATCH_WEBDRIVER,
+    _PATCH_NATIVE_STEALTH,
     _PATCH_WINDOW_CHROME,
     _PATCH_PLUGINS,
     _PATCH_PERMISSIONS,

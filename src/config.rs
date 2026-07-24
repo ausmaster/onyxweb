@@ -128,6 +128,7 @@ pub struct ScriptsRs {
     pub on_dom_content_loaded: Vec<String>,
     pub on_load: Vec<String>,
     pub isolated_world: Vec<String>,
+    pub isolated_world_name: String,
     pub url_scoped: HashMap<String, Vec<String>>,
 }
 
@@ -900,6 +901,11 @@ fn parse_scripts(v: &Bound<'_, PyAny>) -> Result<ScriptsRs> {
         }
         if let Some(x) = d.get_item("isolated_world")? {
             out.isolated_world = parse_str_list(&x)?;
+        }
+        if let Some(x) = d.get_item("isolated_world_name")?
+            && !x.is_none()
+        {
+            out.isolated_world_name = x.extract().map_err(to_internal)?;
         }
         if let Some(x) = d.get_item("url_scoped")? {
             out.url_scoped = parse_url_scoped(&x)?;

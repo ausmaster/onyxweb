@@ -248,6 +248,25 @@ def test_preset_overridable_via_pre_merge() -> None:
         assert len(c.config.scripts.on_new_document) == 5
 
 
+def test_stealth_webdriver_getter_stringifies_native() -> None:
+    """Under stealth.BASIC the patched webdriver getter — and our patched
+    toString itself — report ``[native code]``, closing the arrow-getter
+    ``.toString()`` tell, while webdriver still reads undefined."""
+    with onyxweb.Client(**stealth.BASIC) as c:
+        r = c.fetch(
+            "data:text/html,<html></html>",
+            post_load_scripts=[
+                "Object.getOwnPropertyDescriptor(Navigator.prototype,'webdriver').get.toString()",
+                "Function.prototype.toString.toString()",
+                "navigator.webdriver",
+            ],
+        )
+    wd = r.post_load_results[0]
+    assert "[native code]" in wd and "webdriver" in wd, wd
+    assert "[native code]" in r.post_load_results[1]
+    assert r.post_load_results[2] is None
+
+
 def test_stealth_basic_removes_headless_substring(httpserver: HTTPServer) -> None:
     """Regression guard at the wire level — ``HeadlessChrome`` must not appear
     in the UA when stealth.BASIC is active. This is the specific tripwire that

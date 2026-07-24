@@ -14,6 +14,7 @@ a plain fetch still reports "this site is behind Akamai" as recon.
 from __future__ import annotations
 
 import onyxweb
+from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
 
@@ -38,7 +39,7 @@ def _akamai_like(request: Request) -> Response:
     return resp
 
 
-def test_bypass_anti_bot_recovers(httpserver) -> None:
+def test_bypass_anti_bot_recovers(httpserver: HTTPServer) -> None:
     httpserver.expect_request("/").respond_with_handler(_akamai_like)
     url = httpserver.url_for("/")
     with onyxweb.Client(concurrency=1) as client:
@@ -52,7 +53,7 @@ def test_bypass_anti_bot_recovers(httpserver) -> None:
         assert r2.anti_bot == onyxweb.AntiBot(vendor="akamai", kind="block", resolved=True)
 
 
-def test_off_by_default_stays_blocked(httpserver) -> None:
+def test_off_by_default_stays_blocked(httpserver: HTTPServer) -> None:
     """Without the opt-in, the poisoned second fetch stays a 403."""
     httpserver.expect_request("/").respond_with_handler(_akamai_like)
     url = httpserver.url_for("/")
@@ -66,7 +67,7 @@ def test_off_by_default_stays_blocked(httpserver) -> None:
         )
 
 
-def test_client_level_default_heals(httpserver) -> None:
+def test_client_level_default_heals(httpserver: HTTPServer) -> None:
     """Client(bypass_anti_bot=True) heals every fetch without a per-call flag."""
     httpserver.expect_request("/").respond_with_handler(_akamai_like)
     url = httpserver.url_for("/")
@@ -75,7 +76,7 @@ def test_client_level_default_heals(httpserver) -> None:
         assert client.fetch(url).status_code == 200  # inherits base True -> heals
 
 
-def test_plain_403_not_retried_even_with_heal(httpserver) -> None:
+def test_plain_403_not_retried_even_with_heal(httpserver: HTTPServer) -> None:
     """A 403 without an anti-bot signature is a normal response, not a block."""
     calls: list[int] = []
 
@@ -93,7 +94,7 @@ def test_plain_403_not_retried_even_with_heal(httpserver) -> None:
     assert len(calls) == 1  # no self-heal retry
 
 
-def test_heal_preserves_benign_cookies(httpserver) -> None:
+def test_heal_preserves_benign_cookies(httpserver: HTTPServer) -> None:
     """Heal drops only anti-bot cookies; a benign cookie survives the retry."""
     seen: dict[str, str] = {}
 
@@ -138,7 +139,7 @@ def _challenge_then_real(request: Request) -> Response:
     return Response(body, status=200, content_type="text/html")
 
 
-def test_challenge_interstitial_captured_without_bypass(httpserver) -> None:
+def test_challenge_interstitial_captured_without_bypass(httpserver: HTTPServer) -> None:
     httpserver.expect_request("/").respond_with_handler(_challenge_then_real)
     with onyxweb.Client(concurrency=1) as client:  # bypass off
         r = client.fetch(httpserver.url_for("/"))
@@ -150,7 +151,7 @@ def test_challenge_interstitial_captured_without_bypass(httpserver) -> None:
         )
 
 
-def test_challenge_interstitial_waited_out_with_bypass(httpserver) -> None:
+def test_challenge_interstitial_waited_out_with_bypass(httpserver: HTTPServer) -> None:
     httpserver.expect_request("/").respond_with_handler(_challenge_then_real)
     # Fresh context (no solved cookie) so the fetch actually faces the challenge.
     with onyxweb.Client(concurrency=1, bypass_anti_bot=True) as client:
@@ -164,7 +165,7 @@ def test_challenge_interstitial_waited_out_with_bypass(httpserver) -> None:
         )
 
 
-def test_clean_page_has_no_anti_bot_indicator(httpserver) -> None:
+def test_clean_page_has_no_anti_bot_indicator(httpserver: HTTPServer) -> None:
     """A normal 200 with no WAF markers reports ``anti_bot is None``."""
     httpserver.expect_request("/").respond_with_data(
         "<html><body>hello world</body></html>", content_type="text/html"
@@ -183,7 +184,7 @@ def test_clean_page_has_no_anti_bot_indicator(httpserver) -> None:
 # false-positives across the huge slice of the web behind these WAFs.
 
 
-def test_large_cloudflare_page_beacon_not_flagged(httpserver) -> None:
+def test_large_cloudflare_page_beacon_not_flagged(httpserver: HTTPServer) -> None:
     """A big real page with CF's passive beacon + Turnstile widget → not a WAF."""
     body = (
         "<html><head><title>Real Shop</title>"
@@ -199,7 +200,7 @@ def test_large_cloudflare_page_beacon_not_flagged(httpserver) -> None:
         assert r.anti_bot is None
 
 
-def test_large_imperva_page_resource_ref_not_flagged(httpserver) -> None:
+def test_large_imperva_page_resource_ref_not_flagged(httpserver: HTTPServer) -> None:
     """A big real page that references `_Incapsula_Resource` → not a WAF."""
     body = (
         "<html><head><title>State Site</title>"
@@ -213,7 +214,7 @@ def test_large_imperva_page_resource_ref_not_flagged(httpserver) -> None:
         assert r.anti_bot is None
 
 
-def test_cloudflare_interstitial_stub_detected(httpserver) -> None:
+def test_cloudflare_interstitial_stub_detected(httpserver: HTTPServer) -> None:
     """A small CF "Just a moment" stub (challenge-only token) → detected."""
     body = (
         "<html><head><title>Just a moment...</title></head><body>"
@@ -229,7 +230,7 @@ def test_cloudflare_interstitial_stub_detected(httpserver) -> None:
         )
 
 
-def test_imperva_interstitial_stub_detected(httpserver) -> None:
+def test_imperva_interstitial_stub_detected(httpserver: HTTPServer) -> None:
     """A tiny Imperva JS stub (no visible text) → detected via the size gate."""
     body = (
         "<html><body>"
@@ -245,7 +246,7 @@ def test_imperva_interstitial_stub_detected(httpserver) -> None:
         )
 
 
-def test_cloudflare_cf_mitigated_header_is_challenge_not_block(httpserver) -> None:
+def test_cloudflare_cf_mitigated_header_is_challenge_not_block(httpserver: HTTPServer) -> None:
     """Cloudflare's `cf-mitigated: challenge` response header authoritatively
     marks a challenge (per CF docs) — a CF challenge is a 403, so without the
     header check `block_vendor` would mislabel it a hard block. The header is
@@ -277,7 +278,7 @@ def test_cloudflare_cf_mitigated_header_is_challenge_not_block(httpserver) -> No
 # (more precise, no false positives). AWS WAF, Kasada, Fastly.
 
 
-def test_aws_waf_challenge_action_header(httpserver) -> None:
+def test_aws_waf_challenge_action_header(httpserver: HTTPServer) -> None:
     """AWS WAF Challenge action: `x-amzn-waf-action: challenge` (HTTP 202,
     silent auto-solving interstitial) → aws challenge."""
 
@@ -296,7 +297,7 @@ def test_aws_waf_challenge_action_header(httpserver) -> None:
         )
 
 
-def test_aws_waf_captcha_action_header(httpserver) -> None:
+def test_aws_waf_captcha_action_header(httpserver: HTTPServer) -> None:
     """AWS WAF CAPTCHA action: `x-amzn-waf-action: captcha` (HTTP 405,
     interactive) → aws challenge (we can't auto-solve it → resolved False)."""
 
@@ -315,7 +316,7 @@ def test_aws_waf_captcha_action_header(httpserver) -> None:
         )
 
 
-def test_aws_waf_token_cookie_alone_not_flagged(httpserver) -> None:
+def test_aws_waf_token_cookie_alone_not_flagged(httpserver: HTTPServer) -> None:
     """The `aws-waf-token` cookie is set on passed pages too — presence leaks
     and must NOT be a block signal."""
 
@@ -334,7 +335,7 @@ def test_aws_waf_token_cookie_alone_not_flagged(httpserver) -> None:
         assert r.anti_bot is None
 
 
-def test_kasada_x_kpsdk_ct_block_header(httpserver) -> None:
+def test_kasada_x_kpsdk_ct_block_header(httpserver: HTTPServer) -> None:
     """Kasada silent-PoW hard block: the `x-kpsdk-ct` response header on a
     403/429 → kasada block (recon signal; not defeatable CDP-only)."""
 
@@ -351,7 +352,7 @@ def test_kasada_x_kpsdk_ct_block_header(httpserver) -> None:
         )
 
 
-def test_fastly_406_block_with_signature(httpserver) -> None:
+def test_fastly_406_block_with_signature(httpserver: HTTPServer) -> None:
     """Fastly / Signal Sciences blocks default to HTTP 406 (not 403/429), so
     a 406 with a WAF body signature must register as a block."""
 
@@ -373,7 +374,7 @@ def test_fastly_406_block_with_signature(httpserver) -> None:
 # stub (a page that IS a captcha gate), never on a full-size page.
 
 
-def test_recaptcha_stub_detected(httpserver) -> None:
+def test_recaptcha_stub_detected(httpserver: HTTPServer) -> None:
     """A small page that is essentially a reCAPTCHA gate → recaptcha challenge."""
     body = (
         "<html><head><title>Verify</title></head><body>"
@@ -388,7 +389,7 @@ def test_recaptcha_stub_detected(httpserver) -> None:
         )
 
 
-def test_hcaptcha_stub_detected(httpserver) -> None:
+def test_hcaptcha_stub_detected(httpserver: HTTPServer) -> None:
     """A small page that is essentially an hCaptcha gate → hcaptcha challenge."""
     body = (
         "<html><head><title>Verify</title></head><body>"
@@ -403,7 +404,7 @@ def test_hcaptcha_stub_detected(httpserver) -> None:
         )
 
 
-def test_large_page_with_recaptcha_form_not_flagged(httpserver) -> None:
+def test_large_page_with_recaptcha_form_not_flagged(httpserver: HTTPServer) -> None:
     """A normal large page with a reCAPTCHA-protected form → not a WAF gate."""
     body = (
         "<html><head><title>Contact</title></head><body>"

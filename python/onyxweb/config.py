@@ -242,9 +242,13 @@ class ScriptsConfig(BaseModel):
     wrapper."""
 
     isolated_world: list[str] = Field(default_factory=list)
-    """Runs in a named isolated JavaScript world (``onyxweb_isolated``)
+    """Runs in a named isolated JavaScript world (see ``isolated_world_name``)
     where page scripts cannot read or tamper with global state. Use for
     stealth patches that anti-bot JS shouldn't observe."""
+
+    isolated_world_name: str = "util"
+    """Name of the ``isolated_world`` JS world. Defaults to a generic ``"util"``
+    rather than a branded string."""
 
     url_scoped: dict[str, list[str]] = Field(default_factory=dict)
     """Scripts gated to URLs containing the key as a substring. Sugar —

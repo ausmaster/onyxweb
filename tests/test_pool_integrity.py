@@ -9,7 +9,10 @@ on top of the same cleanup phase.
 
 from __future__ import annotations
 
+import time
+
 import onyxweb
+import pytest
 from pytest_httpserver import HTTPServer
 
 
@@ -86,3 +89,20 @@ def test_pool_integrity_with_same_doc_navs(httpserver: HTTPServer) -> None:
 
     for r, label in [(r1, "r1"), (r2, "r2"), (r3, "r3"), (r4, "r4"), (r5, "r5"), (r6, "r6")]:
         assert r.status_code == 200, f"{label}: status={r.status_code}"
+
+
+def test_failed_nav_recovers_pool_tab(httpserver: HTTPServer) -> None:
+    """A failed/timed-out nav must not wedge the pooled tab: the next fetch on the
+    same (concurrency=1) tab recovers instead of queuing 30s behind the stuck nav."""
+    httpserver.expect_request("/").respond_with_data(
+        "<html><body>recovered</body></html>", content_type="text/html"
+    )
+    with onyxweb.Client(concurrency=1) as c:
+        with pytest.raises((RuntimeError, TimeoutError)):
+            c.fetch("not-a-url", timeout_ms=3000)  # hangs -> times out, wedges tab pre-fix
+        t = time.perf_counter()
+        r = c.fetch(httpserver.url_for("/"), timeout_ms=8000)
+        elapsed = time.perf_counter() - t
+    assert r.status_code == 200
+    assert "recovered" in r
+    assert elapsed < 5, f"pooled tab wedged after failed nav: {elapsed:.1f}s"
