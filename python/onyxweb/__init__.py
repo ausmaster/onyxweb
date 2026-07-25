@@ -479,6 +479,8 @@ class RenderResult(str):
     metadata: ResponseMetadata
     headers: ResponseHeaders
     anti_bot: AntiBot | None
+    _raw: _RenderOutput | _FetchOutput | None
+    _dom: Dom | None
 
     def __new__(
         cls,
@@ -493,7 +495,7 @@ class RenderResult(str):
         metadata: ResponseMetadata | None = None,
         headers: ResponseHeaders | None = None,
         anti_bot: AntiBot | None = None,
-        _raw: _RenderOutput | None = None,
+        _raw: _RenderOutput | _FetchOutput | None = None,
     ) -> RenderResult:
         """Construct a RenderResult; ``_raw`` is internal (Rust output object)."""
         instance = super().__new__(cls, html)
@@ -525,8 +527,8 @@ class RenderResult(str):
             final_url=final_url,
             elapsed_s=elapsed_s,
         )
-        instance._raw = _raw  # type: ignore[attr-defined]
-        instance._dom = None  # type: ignore[attr-defined]
+        instance._raw = _raw
+        instance._dom = None
         return instance
 
     @property
@@ -537,14 +539,15 @@ class RenderResult(str):
     @property
     def dom(self) -> Dom:
         """Rust-parsed DOM (lazy). First access triggers html5ever parse."""
-        if self._dom is None:  # type: ignore[attr-defined]
-            raw = self._raw  # type: ignore[attr-defined]
-            if raw is None:
+        dom = self._dom
+        if dom is None:
+            if self._raw is None:
                 raise AttributeError(
                     "this RenderResult was not produced by onyxweb; .dom unavailable"
                 )
-            object.__setattr__(self, "_dom", raw.make_dom())
-        return self._dom  # type: ignore[attr-defined]
+            dom = self._raw.make_dom()
+            object.__setattr__(self, "_dom", dom)
+        return dom
 
     def __repr__(self) -> str:
         trunc = str(self)[:60] + "…" if len(self) > 60 else str(self)
@@ -583,17 +586,17 @@ class FetchResult:
     @property
     def final_url(self) -> str:
         """URL the browser ended up at, after any redirects."""
-        return self._raw.final_url  # type: ignore[no-any-return]
+        return self._raw.final_url
 
     @property
     def status_code(self) -> int:
         """Final HTTP status code of the main document response."""
-        return self._raw.status_code  # type: ignore[no-any-return]
+        return self._raw.status_code
 
     @property
     def elapsed_s(self) -> float:
         """End-to-end page-visit time in seconds."""
-        return self._raw.elapsed_s  # type: ignore[no-any-return]
+        return self._raw.elapsed_s
 
     @property
     def metadata(self) -> ResponseMetadata:
