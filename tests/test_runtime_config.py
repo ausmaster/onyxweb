@@ -36,6 +36,14 @@ class TestLiveSetattr:
             c.config.network.user_agent = "updated"
             assert c.config.concurrency == 4  # unchanged
 
+    def test_proxy_is_runtime_mutable(self) -> None:
+        """Proxy is per-context, not launch-only — setattr must not raise."""
+        with onyxweb.Client() as c:
+            c.config.network.proxy = "http://127.0.0.1:9"
+            c.config.network.proxy_bypass_list = "<-loopback>"
+            assert c.config.network.proxy == "http://127.0.0.1:9"
+            assert c.config.network.proxy_bypass_list == "<-loopback>"
+
     def test_scripts_on_new_document_setattr(self) -> None:
         """Live-assigning scripts writes through to Rust.
 
@@ -71,7 +79,6 @@ class TestLaunchOnlyRejection:
             lambda c: setattr(c.config.chrome, "headless", False),
             lambda c: setattr(c.config.chrome, "user_data_dir", "/tmp/x"),
             lambda c: setattr(c.config.chrome, "engine", "full"),
-            lambda c: setattr(c.config.network, "proxy", "http://x:1"),
             lambda c: setattr(c.config.network, "ignore_https_errors", True),
             lambda c: setattr(c.config.timeout, "launch_ms", 99999),
         ],

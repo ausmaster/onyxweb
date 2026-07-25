@@ -642,7 +642,6 @@ _LAUNCH_ONLY_FIELDS: tuple[tuple[str, ...], ...] = (
     ("chrome", "user_data_dir"),   # Chrome user-data-dir is per-process
     ("chrome", "headless"),        # ditto
     ("chrome", "engine"),          # binary is chosen + exec'd at launch
-    ("network", "proxy"),          # --proxy-server is a CLI flag
     ("network", "ignore_https_errors"),  # --ignore-certificate-errors is a CLI flag
     ("timeout", "launch_ms"),      # only meaningful before Chrome is up
 )
@@ -1405,6 +1404,7 @@ _FLAT_KWARG_MAP: dict[str, tuple[str, ...]] = {
     "user_agent": ("network", "user_agent"),
     "user_agent_metadata": ("network", "user_agent_metadata"),
     "proxy": ("network", "proxy"),
+    "proxy_bypass_list": ("network", "proxy_bypass_list"),
     "extra_headers": ("network", "extra_headers"),
     "ignore_https_errors": ("network", "ignore_https_errors"),
     "block_urls": ("network", "block_urls"),

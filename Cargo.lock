@@ -920,6 +920,7 @@ dependencies = [
  "murmur3",
  "once_cell",
  "parking_lot",
+ "percent-encoding",
  "pyo3",
  "pyo3-async-runtimes",
  "scraper",

@@ -17,7 +17,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, CaptureScreenshotParams,
-    EventDomContentEventFired, EventLoadEventFired, EventNavigatedWithinDocument, NavigateParams,
+    EventDomContentEventFired, EventFrameNavigated, EventLoadEventFired, NavigateParams,
     ReferrerPolicy, RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier,
 };
 use futures::StreamExt;
@@ -312,11 +312,8 @@ pub async fn capture_page(
                     .await?;
             }
 
-            // Subscribe BEFORE goto (race-free). goto returns on navigate ack
-            // (~5-10ms), well before any lifecycle event — DO NOT race it against
-            // these streams or the goto arm always wins.
+            // Subscribe before the nav so the race below can't miss an early event.
             let t_goto = Instant::now();
-            log::trace!(target: "onyxweb::engine", "[{url}] subscribe lifecycle streams");
             let mut dcl_stream = page
                 .event_listener::<EventDomContentEventFired>()
                 .await
@@ -325,113 +322,70 @@ pub async fn capture_page(
                 .event_listener::<EventLoadEventFired>()
                 .await
                 .map_err(OnyxError::from)?;
-            // Same-document navs (hash-only / pushState) fire
-            // `navigatedWithinDocument`, not DCL or load. Subscribe before goto so
-            // a hash-only fetch on a previously-loaded pool tab doesn't hang.
-            let mut within_doc_stream = page
-                .event_listener::<EventNavigatedWithinDocument>()
+            let mut frame_nav_stream = page
+                .event_listener::<EventFrameNavigated>()
                 .await
                 .map_err(OnyxError::from)?;
 
-            // chromiumoxide's `Page.navigate` future never resolves for a
-            // hash-only nav on a pooled tab (a command-routing bug on the
-            // long-lived session — chromium answers immediately, but the response
-            // doesn't reach the awaiting future). Work around it per case:
-            //   - no per-call init scripts: `Runtime.evaluate("location.href =
-            //     url")` — a separate CDP channel, unaffected by the bug.
-            //   - with init scripts: chromium fires
-            //     addScriptToEvaluateOnNewDocument only on new-document navs, so
-            //     append a cache-buster to force a full nav (the scripts fire; the
-            //     cache-buster is visible in `r.final_url`).
-            let cache_buster_url: String;
+            // chromiumoxide's Page.navigate future hangs on a hash-only nav on a
+            // pooled tab: same-doc navs without init scripts use Runtime.evaluate;
+            // with init scripts, a cache-buster forces a new-document nav so
+            // addScriptToEvaluateOnNewDocument fires.
             let needs_init_scripts = !per_call.scripts.is_empty();
-            let same_doc_nav = match guard.current_url() {
-                Some(prev) if is_same_document_change(&prev, url) => {
-                    if needs_init_scripts {
-                        cache_buster_url = append_cache_buster(url);
-                        log::trace!(
-                            target: "onyxweb::engine",
-                            "[{url}] same-doc + per-call init scripts: routing as full-nav via {cache_buster_url}"
-                        );
-                        let nav_params = match referrer.as_ref() {
-                            Some(r) => NavigateParams::builder()
-                                .url(cache_buster_url.clone())
-                                .referrer(r.clone())
-                                .referrer_policy(ReferrerPolicy::UnsafeUrl)
-                                .build()
-                                .map_err(|e| OnyxError::Cdp(format!("navigate params: {e}")))?,
-                            None => NavigateParams::new(cache_buster_url.clone()),
-                        };
-                        page.goto(nav_params).await?;
-                        let t_nav_ack = t_goto.elapsed();
-                        log::trace!(target: "onyxweb::engine", "[{url}] cache-busted goto ack in {t_nav_ack:?}");
-                        false
-                    } else {
-                        log::trace!(
-                            target: "onyxweb::engine",
-                            "[{url}] same-doc nav detected (prev={prev}); using Runtime.evaluate"
-                        );
-                        let escaped =
-                            serde_json::to_string(url).unwrap_or_else(|_| "''".to_string());
-                        page.evaluate(format!("location.href = {escaped};").as_str())
-                            .await?;
-                        let t_nav_ack = t_goto.elapsed();
-                        log::trace!(target: "onyxweb::engine", "[{url}] evaluate-nav ack in {t_nav_ack:?}");
-                        true
-                    }
-                }
-                _ => {
-                    log::trace!(target: "onyxweb::engine", "[{url}] navigate (wait_until={wait_until:?})");
-                    let nav_params = match referrer.as_ref() {
-                        // ReferrerPolicy::UnsafeUrl tells chromium to pass the
-                        // full referrer URL through unchanged. The default policy
-                        // (`strict-origin-when-cross-origin`) strips path and
-                        // query for cross-origin requests, which would mangle
-                        // testing-tool use cases that need the exact Referer
-                        // they specified.
-                        Some(r) => NavigateParams::builder()
-                            .url(url.to_string())
-                            .referrer(r.clone())
-                            .referrer_policy(ReferrerPolicy::UnsafeUrl)
-                            .build()
-                            .map_err(|e| OnyxError::Cdp(format!("navigate params: {e}")))?,
-                        None => NavigateParams::new(url.to_string()),
-                    };
-                    page.goto(nav_params).await?;
-                    let t_nav_ack = t_goto.elapsed();
-                    log::trace!(target: "onyxweb::engine", "[{url}] navigate ack in {t_nav_ack:?}");
-                    false
-                }
-            };
+            let is_same_doc =
+                matches!(guard.current_url(), Some(prev) if is_same_document_change(&prev, url));
 
-            if !same_doc_nav {
-                match wait_until {
-                    WaitUntil::DomContentLoaded => {
-                        // DCL preferred; load covers tiny docs that never fire DCL;
-                        // navigatedWithinDocument covers same-doc navs that race
-                        // goto's response (rare but possible on full nav too).
-                        tokio::select! {
-                            _ = dcl_stream.next() => {
-                                log::trace!(target: "onyxweb::engine", "[{url}] DCL fired");
-                            }
-                            _ = load_stream.next() => {
-                                log::trace!(target: "onyxweb::engine", "[{url}] load fired (no DCL)");
-                            }
-                            _ = within_doc_stream.next() => {
-                                log::trace!(target: "onyxweb::engine", "[{url}] navigatedWithinDocument fired");
-                            }
+            let nav_params: Option<NavigateParams> = if is_same_doc && !needs_init_scripts {
+                let escaped = serde_json::to_string(url).unwrap_or_else(|_| "''".to_string());
+                page.evaluate(format!("location.href = {escaped};").as_str())
+                    .await?;
+                None
+            } else {
+                let target = if is_same_doc {
+                    append_cache_buster(url)
+                } else {
+                    url.to_string()
+                };
+                // ReferrerPolicy::UnsafeUrl passes the full referrer through; the
+                // default strips path/query cross-origin.
+                Some(match referrer.as_ref() {
+                    Some(r) => NavigateParams::builder()
+                        .url(target)
+                        .referrer(r.clone())
+                        .referrer_policy(ReferrerPolicy::UnsafeUrl)
+                        .build()
+                        .map_err(|e| OnyxError::Cdp(format!("navigate params: {e}")))?,
+                    None => NavigateParams::new(target),
+                })
+            };
+            let same_doc_nav = nav_params.is_none();
+
+            // Race goto (blocks until every frame loads) against the lifecycle
+            // event, gated behind the new doc's main-frame commit so the outgoing
+            // page's lingering pushState / late load can't resolve early and
+            // capture stale content. Dropping goto is safe (see nav_error below).
+            if let Some(nav_params) = nav_params {
+                let nav_fut = page.goto(nav_params);
+                let lifecycle = async {
+                    while let Some(evt) = frame_nav_stream.next().await {
+                        if evt.frame.parent_id.is_none() {
+                            break;
                         }
                     }
-                    WaitUntil::Load => {
-                        tokio::select! {
-                            _ = load_stream.next() => {
-                                log::trace!(target: "onyxweb::engine", "[{url}] load fired");
-                            }
-                            _ = within_doc_stream.next() => {
-                                log::trace!(target: "onyxweb::engine", "[{url}] navigatedWithinDocument fired");
-                            }
+                    match wait_until {
+                        // load: DCL-miss fallback.
+                        WaitUntil::DomContentLoaded => tokio::select! {
+                            _ = dcl_stream.next() => {}
+                            _ = load_stream.next() => {}
+                        },
+                        WaitUntil::Load => {
+                            let _ = load_stream.next().await;
                         }
                     }
+                };
+                tokio::select! {
+                    r = nav_fut => { r?; }
+                    _ = lifecycle => {}
                 }
             }
             log::trace!(
@@ -439,6 +393,12 @@ pub async fn capture_page(
                 "[{url}] nav done in {:?}",
                 t_goto.elapsed()
             );
+
+            // A main-doc network failure (DNS, connection refused) still fires a
+            // lifecycle event via its error page, so surface it explicitly.
+            if !same_doc_nav && let Some(err) = guard.nav_error() {
+                return Err(OnyxError::Cdp(err));
+            }
 
             // Optional post-event settle — lets late async JS mutate the DOM on
             // SPAs that render AFTER the chosen lifecycle event fires.
@@ -503,32 +463,42 @@ pub async fn capture_page(
             // path with zero CDP overhead. Cleanup (``Fetch.disable``) runs
             // unconditionally below.
             if per_call.block_navigation {
-                log::trace!(
-                    target: "onyxweb::engine",
-                    "[{url}] block_navigation: enabling Fetch interception (Document only)"
-                );
-                let document_only = RequestPattern::builder()
-                    .resource_type(ResourceType::Document)
-                    .build();
-                page.execute(FetchEnableParams::builder().pattern(document_only).build())
-                    .await?;
-                let mut paused_stream = page
-                    .event_listener::<EventRequestPaused>()
-                    .await
-                    .map_err(OnyxError::from)?;
-                let page_for_task = page.clone();
-                tokio::spawn(async move {
-                    while let Some(evt) = paused_stream.next().await {
-                        // Pattern guarantees only Document-type requests reach
-                        // us; abort each.
-                        let _ = page_for_task
-                            .execute(FailRequestParams::new(
-                                evt.request_id.clone(),
-                                ErrorReason::Aborted,
-                            ))
-                            .await;
-                    }
-                });
+                if guard.auth_fetch_active() {
+                    // chromiumoxide owns this tab's Fetch domain for proxy auth;
+                    // adding our own Fetch interception would clobber it, so
+                    // navigation blocking is unavailable here.
+                    log::warn!(
+                        target: "onyxweb::engine",
+                        "[{url}] block_navigation is unsupported with an authenticated proxy; navigation not blocked"
+                    );
+                } else {
+                    log::trace!(
+                        target: "onyxweb::engine",
+                        "[{url}] block_navigation: enabling Fetch interception (Document only)"
+                    );
+                    let document_only = RequestPattern::builder()
+                        .resource_type(ResourceType::Document)
+                        .build();
+                    page.execute(FetchEnableParams::builder().pattern(document_only).build())
+                        .await?;
+                    let mut paused_stream = page
+                        .event_listener::<EventRequestPaused>()
+                        .await
+                        .map_err(OnyxError::from)?;
+                    let page_for_task = page.clone();
+                    tokio::spawn(async move {
+                        while let Some(evt) = paused_stream.next().await {
+                            // Pattern guarantees only Document-type requests reach
+                            // us; abort each.
+                            let _ = page_for_task
+                                .execute(FailRequestParams::new(
+                                    evt.request_id.clone(),
+                                    ErrorReason::Aborted,
+                                ))
+                                .await;
+                        }
+                    });
+                }
             }
 
             // Per-call post-load scripts — run arbitrary JS on the loaded page
@@ -825,21 +795,23 @@ pub async fn capture_page(
         let _ = page.execute(SetExtraHttpHeadersParams::new(headers)).await;
     }
 
-    // Per-call navigation-block cleanup — disable the Fetch domain so the
-    // listener task's stream ends and any future fetches on this tab aren't
-    // intercepted. CDP auto-continues paused requests on disable.
-    if per_call.block_navigation {
+    // Per-call navigation-block cleanup — disable the Fetch domain this call
+    // enabled (CDP auto-continues paused requests on disable). Skipped under an
+    // authenticated proxy, where we never enabled our own Fetch (chromiumoxide
+    // owns it) — disabling would break auth on the next fetch.
+    if per_call.block_navigation && !guard.auth_fetch_active() {
         let _ = page.execute(FetchDisableParams::default()).await;
     }
 
     // On error, reset the page so the next URL on this tab isn't poisoned by
     // a half-loaded predecessor.
     if matches!(&fut_result, Err(_) | Ok(Err(_))) {
-        log::debug!(target: "onyxweb::engine", "[{url}] error — reset to about:blank");
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            let _ = page.goto("about:blank").await;
-        })
-        .await;
+        // Reset the tab; if that fails (wedged by a stuck nav, or the target
+        // died) mark it so the pool recreates it before the next fetch.
+        let reset = tokio::time::timeout(Duration::from_secs(2), page.goto("about:blank")).await;
+        if !matches!(reset, Ok(Ok(_))) {
+            guard.mark_poisoned();
+        }
     }
 
     let mut result = fut_result.map_err(|_| {

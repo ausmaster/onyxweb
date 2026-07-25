@@ -40,7 +40,7 @@ def _cfg() -> onyxweb.FetchConfig:
     return onyxweb.FetchConfig(timeout_ms=_TIMEOUT_MS)
 
 
-def test_batch_returns_exception_in_list_for_timeout(tserver) -> None:
+def test_batch_returns_exception_in_list_for_timeout(tserver: HTTPServer) -> None:
     tserver.expect_request("/ok").respond_with_handler(_ok)
     tserver.expect_request("/slow").respond_with_handler(_slow)
     ok, slow = tserver.url_for("/ok"), tserver.url_for("/slow")
@@ -50,11 +50,13 @@ def test_batch_returns_exception_in_list_for_timeout(tserver) -> None:
     assert results[0].status_code == 200
     err = results[1]
     assert isinstance(err, TimeoutError)  # a real exception object, not a stub
-    assert err.url == slow
-    assert err.kind in ("navigation_timeout", "timeout")
+    # .url / .kind are injected onto the exception by the Rust layer (into_py_err),
+    # so they aren't statically visible on the builtin TimeoutError.
+    assert err.url == slow  # type: ignore[attr-defined]
+    assert err.kind in ("navigation_timeout", "timeout")  # type: ignore[attr-defined]
 
 
-def test_batch_positional_alignment_mixed(tserver) -> None:
+def test_batch_positional_alignment_mixed(tserver: HTTPServer) -> None:
     """Order is preserved: item i corresponds to urls[i], failures interleaved."""
     tserver.expect_request("/ok").respond_with_handler(_ok)
     tserver.expect_request("/slow").respond_with_handler(_slow)
@@ -66,7 +68,7 @@ def test_batch_positional_alignment_mixed(tserver) -> None:
     assert isinstance(results[2], onyxweb.RenderResult)
 
 
-def test_batch_png_and_both_modes_return_exceptions(tserver) -> None:
+def test_batch_png_and_both_modes_return_exceptions(tserver: HTTPServer) -> None:
     """A failed item is an exception in png/both modes too (not empty bytes)."""
     tserver.expect_request("/slow").respond_with_handler(_slow)
     slow = tserver.url_for("/slow")
@@ -74,11 +76,11 @@ def test_batch_png_and_both_modes_return_exceptions(tserver) -> None:
         png = client.batch([slow], capture="png", config=_cfg())
         both = client.batch([slow], capture="both", config=_cfg())
     assert isinstance(png[0], TimeoutError)
-    assert png[0].url == slow
+    assert png[0].url == slow  # type: ignore[attr-defined]
     assert isinstance(both[0], TimeoutError)
 
 
-def test_batch_all_success_has_no_exceptions(tserver) -> None:
+def test_batch_all_success_has_no_exceptions(tserver: HTTPServer) -> None:
     tserver.expect_request("/ok").respond_with_handler(_ok)
     ok = tserver.url_for("/ok")
     with onyxweb.Client(concurrency=2) as client:
@@ -87,11 +89,11 @@ def test_batch_all_success_has_no_exceptions(tserver) -> None:
     assert not any(isinstance(r, Exception) for r in results)
 
 
-def test_single_fetch_raises_enriched_timeout(tserver) -> None:
+def test_single_fetch_raises_enriched_timeout(tserver: HTTPServer) -> None:
     """A single fetch still RAISES, but the exception now carries .url / .kind."""
     tserver.expect_request("/slow").respond_with_handler(_slow)
     slow = tserver.url_for("/slow")
     with onyxweb.Client(concurrency=1) as client, pytest.raises(TimeoutError) as ei:
         client.fetch(slow, config=_cfg())
-    assert ei.value.url == slow
-    assert ei.value.kind in ("navigation_timeout", "timeout")
+    assert ei.value.url == slow  # type: ignore[attr-defined]
+    assert ei.value.kind in ("navigation_timeout", "timeout")  # type: ignore[attr-defined]

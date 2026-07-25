@@ -322,6 +322,13 @@ class TestScriptsConfig:
         c = ClientConfig()
         assert c.scripts.on_new_document == ["console.log(1)"]
 
+    def test_isolated_world_name_default_generic(self) -> None:
+        assert ScriptsConfig().isolated_world_name == "util"
+        assert ClientConfig().scripts.isolated_world_name == "util"
+
+    def test_isolated_world_name_configurable(self) -> None:
+        assert ScriptsConfig(isolated_world_name="myworld").isolated_world_name == "myworld"
+
 
 class TestClientConstructors:
     """Client ctor accepts config= or flat kwargs, not both."""

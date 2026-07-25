@@ -72,7 +72,7 @@ def test_batch_results_carry_metadata_headers(httpserver: HTTPServer) -> None:
         )
     assert len(results) == 2
     for r in results:
-        assert not isinstance(r, bytes)
+        assert not isinstance(r, (bytes, Exception))
         assert r.metadata.status_code == 200
         assert r.headers["x-bw"] == "b"
         assert r.headers.hashes is not None

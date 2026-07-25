@@ -154,7 +154,15 @@ class NetworkConfig(BaseModel):
     mismatch. See :class:`UserAgentMetadata`."""
 
     proxy: str | None = None
-    """``http://host:port`` or ``socks5://host:port`` — passed as a Chrome CLI flag."""
+    """Per-context proxy — ``http://host:port``, ``http://user:pass@host:port``
+    (Basic auth, supplied via ``Fetch.authRequired``), or ``socks5://host:port``
+    (SOCKS5 auth is unsupported — a chromium handshake limitation). Runtime-mutable:
+    a change applies as pooled tabs cycle."""
+
+    proxy_bypass_list: str | None = None
+    """Chrome ``--proxy-bypass-list`` equivalent (per-context). Comma-separated
+    hosts that skip the proxy; ``<-loopback>`` forces localhost through it
+    (loopback is implicitly bypassed otherwise)."""
 
     extra_headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP request headers applied to every fetch on this Client.
@@ -242,9 +250,13 @@ class ScriptsConfig(BaseModel):
     wrapper."""
 
     isolated_world: list[str] = Field(default_factory=list)
-    """Runs in a named isolated JavaScript world (``onyxweb_isolated``)
+    """Runs in a named isolated JavaScript world (see ``isolated_world_name``)
     where page scripts cannot read or tamper with global state. Use for
     stealth patches that anti-bot JS shouldn't observe."""
+
+    isolated_world_name: str = "util"
+    """Name of the ``isolated_world`` JS world. Defaults to a generic ``"util"``
+    rather than a branded string."""
 
     url_scoped: dict[str, list[str]] = Field(default_factory=dict)
     """Scripts gated to URLs containing the key as a substring. Sugar —
@@ -374,6 +386,7 @@ class ClientConfig(BaseSettings):
             "user_agent": ("network", "user_agent"),
             "user_agent_metadata": ("network", "user_agent_metadata"),
             "proxy": ("network", "proxy"),
+            "proxy_bypass_list": ("network", "proxy_bypass_list"),
             "extra_headers": ("network", "extra_headers"),
             "ignore_https_errors": ("network", "ignore_https_errors"),
             "block_urls": ("network", "block_urls"),
@@ -624,7 +637,11 @@ class FetchConfig(BaseModel):
     lifecycle event. Used by DOMino's ``ClickJSElements`` to click
     multiple ``[href^="javascript:"]`` links on the same page state.
     Cleanup disables the Fetch domain before the page returns to the
-    pool."""
+    pool.
+
+    Unavailable with an authenticated proxy: chromiumoxide owns the Fetch
+    domain to answer proxy auth, so navigation blocking is skipped (a warning
+    is logged) rather than break authentication."""
 
     bypass_anti_bot: bool | None = None
     """Per-call override for anti-bot handling (``None`` inherits the Client's
