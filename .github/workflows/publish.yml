@@ -1,3 +1,7 @@
+# Manual publish to (Test)PyPI via Trusted Publishing (OIDC). Builds the full
+# wheel matrix + sdist, then publishes to the chosen index. Run it from the
+# Actions tab ("Run workflow" -> pick testpypi (default) or pypi). Requires a
+# matching GitHub Environment (testpypi / pypi) and a PyPI trusted publisher.
 name: Publish
 
 on:
