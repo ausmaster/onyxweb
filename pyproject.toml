@@ -4,13 +4,42 @@ build-backend = "maturin"
 
 [project]
 name = "onyxweb"
-version = "2.0.0a0"
+version = "0.2.0"
 description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "AusMaster", email = "ausmasterproductions@gmail.com" }]
+keywords = [
+    "chromium", "cdp", "headless", "browser", "scraping",
+    "screenshot", "rendering", "html", "anti-bot", "bbot",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ausmaster/onyxweb"
+Repository = "https://github.com/ausmaster/onyxweb"
+Issues = "https://github.com/ausmaster/onyxweb/issues"
 
 [project.scripts]
 onyxweb = "onyxweb.__main__:main"
