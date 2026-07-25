@@ -248,6 +248,25 @@ def test_preset_overridable_via_pre_merge() -> None:
         assert len(c.config.scripts.on_new_document) == 5
 
 
+def test_stealth_webdriver_getter_stringifies_native() -> None:
+    """Under stealth.BASIC the patched webdriver getter — and our patched
+    toString itself — report ``[native code]``, closing the arrow-getter
+    ``.toString()`` tell, while webdriver still reads undefined."""
+    with onyxweb.Client(**stealth.BASIC) as c:
+        r = c.fetch(
+            "data:text/html,<html></html>",
+            post_load_scripts=[
+                "Object.getOwnPropertyDescriptor(Navigator.prototype,'webdriver').get.toString()",
+                "Function.prototype.toString.toString()",
+                "navigator.webdriver",
+            ],
+        )
+    wd = r.post_load_results[0]
+    assert "[native code]" in wd and "webdriver" in wd, wd
+    assert "[native code]" in r.post_load_results[1]
+    assert r.post_load_results[2] is None
+
+
 def test_stealth_basic_removes_headless_substring(httpserver: HTTPServer) -> None:
     """Regression guard at the wire level — ``HeadlessChrome`` must not appear
     in the UA when stealth.BASIC is active. This is the specific tripwire that
@@ -260,6 +279,31 @@ def test_stealth_basic_removes_headless_substring(httpserver: HTTPServer) -> Non
     ua = httpserver.log[0][0].headers.get("User-Agent") or ""
     assert "HeadlessChrome" not in ua
     assert f"Chrome/{CHROME_VERSION.split('.')[0]}" in ua
+
+
+def test_full_engine_has_webgl_context() -> None:
+    """The full engine must expose a WebGL context.
+
+    ``--disable-gpu`` without a software fallback leaves
+    ``getContext('webgl') === null`` — a strong headless tell. Skipped when full
+    Chrome isn't installed.
+    """
+    from onyxweb.presets.full import stealth as full_stealth
+
+    try:
+        client = onyxweb.Client(navigation_timeout_ms=15_000, **full_stealth.BASIC)
+    except onyxweb.OnyxwebError as e:
+        if "not found" in str(e).lower():
+            pytest.skip(f"full Chrome unavailable: {e}")
+        raise
+    try:
+        r = client.fetch(
+            "data:text/html,<html></html>",
+            post_load_scripts=["!!document.createElement('canvas').getContext('webgl')"],
+        )
+    finally:
+        client.close()
+    assert r.post_load_results[0] is True, "full engine exposes no WebGL context"
 
 
 # ---------------------------------------------------------------------------

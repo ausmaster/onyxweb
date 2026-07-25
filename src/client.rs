@@ -167,9 +167,6 @@ fn build_shell_launch(builder: BrowserConfigBuilder, cfg: &ClientConfigRs) -> Br
     if cfg.network.ignore_https_errors {
         b = b.arg("--ignore-certificate-errors");
     }
-    if let Some(proxy) = &cfg.network.proxy {
-        b = b.arg(format!("--proxy-server={proxy}"));
-    }
     if let Some(user_data_dir) = &cfg.chrome.user_data_dir {
         b = b.arg(format!("--user-data-dir={user_data_dir}"));
     }
@@ -200,6 +197,9 @@ fn build_full_launch(
         .disable_default_args()
         .no_sandbox()
         .arg("disable-gpu")
+        // Software WebGL: without it --disable-gpu leaves getContext('webgl')
+        // === null, itself a headless tell.
+        .arg("enable-unsafe-swiftshader")
         .arg("disable-dev-shm-usage")
         .arg("disable-blink-features=AutomationControlled")
         .arg(format!("user-agent={ua}"))
@@ -209,9 +209,6 @@ fn build_full_launch(
         ));
     if cfg.network.ignore_https_errors {
         b = b.arg("ignore-certificate-errors");
-    }
-    if let Some(proxy) = &cfg.network.proxy {
-        b = b.arg(format!("proxy-server={proxy}"));
     }
     if let Some(user_data_dir) = &cfg.chrome.user_data_dir {
         b = b.arg(format!("user-data-dir={user_data_dir}"));
@@ -256,7 +253,7 @@ struct ClientState {
     browser: Arc<Browser>,
     pool: Arc<PagePool>,
     handler_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    config: parking_lot::RwLock<ClientConfigRs>,
+    config: Arc<parking_lot::RwLock<ClientConfigRs>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -472,7 +469,8 @@ impl Client {
             .map_err(|e| OnyxError::LaunchFailed(e.to_string()))?;
 
         let concurrency = config_rs.concurrency.max(1);
-        let config_for_pool = config_rs.clone();
+        let shared_config = Arc::new(parking_lot::RwLock::new(config_rs));
+        let pool_config = shared_config.clone();
         let (browser, handler_task, pool) = py
             .allow_threads(|| {
                 runtime.block_on(async {
@@ -487,8 +485,7 @@ impl Client {
                         }
                     });
                     let browser = Arc::new(browser);
-                    let pool =
-                        PagePool::new(browser.clone(), concurrency, &config_for_pool).await?;
+                    let pool = PagePool::new(browser.clone(), concurrency, pool_config).await?;
                     Ok::<_, OnyxError>((browser, task, pool))
                 })
             })
@@ -499,7 +496,7 @@ impl Client {
             browser,
             pool,
             handler_task: parking_lot::Mutex::new(Some(handler_task)),
-            config: parking_lot::RwLock::new(config_rs),
+            config: shared_config,
             closed: std::sync::atomic::AtomicBool::new(false),
         };
 
@@ -515,7 +512,14 @@ impl Client {
         self.check_open().map_err(PyErr::from)?;
         let new_cfg = parse_client_config(config).map_err(PyErr::from)?;
         log::debug!(target: "onyxweb::client", "update_config applied");
-        *self.inner.config.write() = new_cfg;
+        let mut guard = self.inner.config.write();
+        let ctx_changed = guard.network.proxy != new_cfg.network.proxy
+            || guard.network.proxy_bypass_list != new_cfg.network.proxy_bypass_list;
+        *guard = new_cfg;
+        drop(guard);
+        if ctx_changed {
+            self.inner.pool.bump_generation();
+        }
         Ok(())
     }
 

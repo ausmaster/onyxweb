@@ -84,6 +84,8 @@ pub struct NetworkRs {
     pub user_agent: Option<String>,
     pub user_agent_metadata: Option<UserAgentMetadataRs>,
     pub proxy: Option<String>,
+    /// Per-context bypass list; `<-loopback>` forces localhost through the proxy.
+    pub proxy_bypass_list: Option<String>,
     pub extra_headers: HashMap<String, String>,
     pub ignore_https_errors: bool,
     pub block_urls: Vec<String>,
@@ -128,6 +130,7 @@ pub struct ScriptsRs {
     pub on_dom_content_loaded: Vec<String>,
     pub on_load: Vec<String>,
     pub isolated_world: Vec<String>,
+    pub isolated_world_name: String,
     pub url_scoped: HashMap<String, Vec<String>>,
 }
 
@@ -651,6 +654,11 @@ fn parse_network(v: &Bound<'_, PyAny>) -> Result<NetworkRs> {
         {
             out.proxy = Some(x.extract().map_err(to_internal)?);
         }
+        if let Some(x) = d.get_item("proxy_bypass_list")?
+            && !x.is_none()
+        {
+            out.proxy_bypass_list = Some(x.extract().map_err(to_internal)?);
+        }
         if let Some(x) = d.get_item("extra_headers")? {
             out.extra_headers = parse_headers(&x)?;
         }
@@ -900,6 +908,11 @@ fn parse_scripts(v: &Bound<'_, PyAny>) -> Result<ScriptsRs> {
         }
         if let Some(x) = d.get_item("isolated_world")? {
             out.isolated_world = parse_str_list(&x)?;
+        }
+        if let Some(x) = d.get_item("isolated_world_name")?
+            && !x.is_none()
+        {
+            out.isolated_world_name = x.extract().map_err(to_internal)?;
         }
         if let Some(x) = d.get_item("url_scoped")? {
             out.url_scoped = parse_url_scoped(&x)?;

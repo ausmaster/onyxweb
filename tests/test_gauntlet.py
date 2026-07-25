@@ -40,8 +40,10 @@ PYTHON_THREADS = int(os.environ.get("ONYXWEB_GAUNTLET_THREADS", "32"))
 NAV_TIMEOUT_MS = int(os.environ.get("ONYXWEB_NAV_TIMEOUT_MS", "10000"))
 
 
-def _classify(r: onyxweb.RenderResult | onyxweb.FetchResult) -> str:
+def _classify(r: onyxweb.RenderResult | onyxweb.FetchResult | Exception) -> str:
     """ok = real 2xx/3xx response; http4xx = got bytes but error status; fail = nav dead."""
+    if isinstance(r, Exception):
+        return "fail"
     if not r.status_code:
         return "fail"
     if r.status_code >= 400:
@@ -50,7 +52,7 @@ def _classify(r: onyxweb.RenderResult | onyxweb.FetchResult) -> str:
 
 
 def _count_ok(
-    results: list[onyxweb.RenderResult | onyxweb.FetchResult | bytes],
+    results: list[onyxweb.RenderResult | onyxweb.FetchResult | bytes | Exception],
     capture: str,
 ) -> int:
     if capture == "png":
