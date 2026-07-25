@@ -100,7 +100,7 @@ def proxy_factory() -> Iterator[Callable[..., tuple[str, ProxyState]]]:
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _handler_for(state))
         servers.append(srv)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        host, port = srv.server_address
+        port = srv.server_address[1]
         return f"http://127.0.0.1:{port}", state
 
     yield make
