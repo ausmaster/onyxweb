@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import onyxweb
 import pytest
+from pytest_httpserver import HTTPServer
+from werkzeug.wrappers import Response
 
 HTTPS_URL = "https://example.com"
 HTTP_URL = "http://example.com"
@@ -33,15 +35,24 @@ class TestFetchTopLevel:
         assert result.status_code == 200  # real status from main-doc response
         assert result.elapsed_s > 0
 
-    def test_fetch_404_returns_404_status(self) -> None:
+    def test_fetch_404_returns_404_status(self, httpserver: HTTPServer) -> None:
         """We capture the main-doc response status, not 200-on-any-navigation."""
-        result = onyxweb.fetch("https://httpbin.org/status/404")
+        httpserver.expect_request("/missing").respond_with_data(
+            "<html><body>nope</body></html>", status=404, content_type="text/html"
+        )
+        result = onyxweb.fetch(httpserver.url_for("/missing"))
         assert result.status_code == 404
 
-    def test_fetch_redirect_status_is_final(self) -> None:
-        """http → https redirect: status reflects the final resource, not the 301."""
-        result = onyxweb.fetch("http://httpbin.org/redirect-to?url=https://example.com")
-        assert result.final_url == "https://example.com/"
+    def test_fetch_redirect_status_is_final(self, httpserver: HTTPServer) -> None:
+        """A redirect: status/final_url reflect the destination, not the 3xx hop."""
+        httpserver.expect_request("/from").respond_with_response(
+            Response(status=302, headers={"Location": httpserver.url_for("/to")})
+        )
+        httpserver.expect_request("/to").respond_with_data(
+            "<html><body>arrived</body></html>", content_type="text/html"
+        )
+        result = onyxweb.fetch(httpserver.url_for("/from"))
+        assert result.final_url.endswith("/to")
         assert result.status_code == 200
 
     def test_fetch_html_property(self) -> None:
