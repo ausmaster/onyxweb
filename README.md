@@ -37,7 +37,7 @@ uv run onyxweb --install    # download chrome-headless-shell
 
 If chromium is already on the PATH, skip `--install`. onyxweb looks for a browser in this order: `chrome_path=` or `ONYXWEB_CHROME__PATH`, then the `--install` download, then `chromium` / `chrome` on the PATH.
 
-Wheels are prebuilt for linux (x86_64, aarch64), macOS (x86_64, arm64), and Windows x86_64. On anything else pip builds from source, which needs a stable Rust toolchain (install [rustup](https://rustup.rs)). The `--install` step is the same either way.
+Wheels are prebuilt for linux (x86_64, aarch64), macOS (arm64), and Windows x86_64. On anything else, including Intel macOS, pip builds from source, which needs a stable Rust toolchain (install [rustup](https://rustup.rs)). The `--install` step is the same either way.
 
 ## Benchmarks
 
