@@ -1,7 +1,12 @@
 # Manual publish to (Test)PyPI via Trusted Publishing (OIDC). Builds the full
-# wheel matrix + sdist, then publishes to the chosen index. Run it from the
-# Actions tab ("Run workflow" -> pick testpypi (default) or pypi). Requires a
-# matching GitHub Environment (testpypi / pypi) and a PyPI trusted publisher.
+# wheel matrix + sdist, smoke-tests the release wheel, then publishes to the
+# chosen index. Run it from the Actions tab ("Run workflow" -> pick testpypi
+# (default) or pypi). Requires a matching GitHub Environment (testpypi / pypi)
+# and a PyPI trusted publisher.
+#
+# testpypi runs publish a unique dev version (BASE.dev<run_number>) so retries
+# never collide with PyPI's immutable filenames; pypi runs publish the
+# pyproject version as-is and tag the commit.
 name: Publish
 
 on:
@@ -13,11 +18,55 @@ on:
         options: [testpypi, pypi]
         default: testpypi
 
+# Never run two publishes to the same index at once, and never cancel one
+# mid-upload (a half-finished upload is exactly what we want to avoid).
+concurrency:
+  group: publish-${{ inputs.repository }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
+  version:
+    # Single source of the published version. For testpypi it is made unique per
+    # run so re-publishing never hits PyPI's immutable-filename wall. Only
+    # pyproject.toml carries it (maturin reads the wheel version from [project]);
+    # Cargo.toml stays valid semver. Hand the file to every build job as an
+    # artifact so the rewrite happens once, with no per-platform shell.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: calc
+        run: |
+          BASE=$(python3 -c "import re;print(re.search(r'(?m)^version = \"([^\"]+)\"', open('pyproject.toml').read()).group(1))")
+          if [ "${{ inputs.repository }}" = "testpypi" ]; then
+            VERSION="${BASE}.dev${{ github.run_number }}"
+          else
+            VERSION="$BASE"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $VERSION to ${{ inputs.repository }}"
+      - name: Pin version into pyproject.toml
+        env:
+          V: ${{ steps.calc.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          v = os.environ["V"]
+          s = open("pyproject.toml").read()
+          s = re.sub(r'(?m)^version = "[^"]+"', f'version = "{v}"', s, count=1)
+          open("pyproject.toml", "w").write(s)
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-files
+          path: pyproject.toml
+
   linux:
+    needs: version
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -25,7 +74,12 @@ jobs:
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: version-files
+          path: .
+      - name: Build wheel (manylinux_2_28)
+        uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
@@ -37,41 +91,44 @@ jobs:
           path: dist
 
   macos:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-        include:
-          - target: aarch64
-            runner: macos-latest
+    # One job + --find-interpreter builds all versions. A python-version matrix
+    # would duplicate wheel filenames across artifacts and corrupt the publish
+    # merge (PyPI then rejects them as "Trailing data").
+    needs: version
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: version-files
+          path: .
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.x"
       - uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: aarch64
           args: --release --out dist --find-interpreter
           sccache: true
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.target }}-${{ matrix.python-version }}
+          name: wheels-macos-aarch64
           path: dist
 
   windows:
+    # One job (see macos): a python-version matrix duplicates wheels across
+    # artifacts and corrupts the publish merge.
+    needs: version
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: version-files
+          path: .
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.x"
           architecture: x64
       - uses: PyO3/maturin-action@v1
         with:
@@ -80,13 +137,18 @@ jobs:
           sccache: true
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-windows-x86_64-${{ matrix.python-version }}
+          name: wheels-windows-x86_64
           path: dist
 
   sdist:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: version-files
+          path: .
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
@@ -96,9 +158,32 @@ jobs:
           name: sdist
           path: dist
 
+  smoke:
+    # Gate the publish on the ACTUAL release wheel importing and fetching a real
+    # page (catches ABI / packaging breakage a unit suite on a dev build won't).
+    needs: [version, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - name: Install the built wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --pre onyxweb --find-links dist --force-reinstall
+      - name: Fetch chrome-headless-shell
+        run: onyxweb --install
+      - name: Smoke test
+        run: |
+          python -c "import onyxweb; r = onyxweb.fetch('https://example.com'); assert r.status_code == 200, r.status_code; assert 'Example Domain' in r; print('smoke OK', r.status_code)"
+
   publish:
     name: Publish to ${{ inputs.repository }}
-    needs: [linux, macos, windows, sdist]
+    needs: [version, linux, macos, windows, sdist, smoke]
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.repository }}
@@ -107,12 +192,44 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # Only wheel + sdist artifacts (not version-files) into dist.
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1.14
         with:
           packages-dir: dist
+          # Tolerate files already uploaded (e.g. a retry after a partial run).
+          skip-existing: true
           # Empty string → real PyPI; only set for TestPyPI.
           repository-url: ${{ inputs.repository == 'testpypi' && 'https://test.pypi.org/legacy/' || '' }}
+
+  tag:
+    # Tag real releases (pypi only) with v<version> for traceability.
+    needs: [version, publish]
+    if: inputs.repository == 'pypi'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag the release commit
+        env:
+          V: v${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          if git rev-parse "$V" >/dev/null 2>&1; then
+            echo "Tag $V already exists, skipping."
+          else
+            git tag -a "$V" -m "Release $V"
+            git push origin "$V"
+          fi
