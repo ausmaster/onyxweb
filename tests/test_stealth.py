@@ -281,6 +281,31 @@ def test_stealth_basic_removes_headless_substring(httpserver: HTTPServer) -> Non
     assert f"Chrome/{CHROME_VERSION.split('.')[0]}" in ua
 
 
+def test_full_engine_has_webgl_context() -> None:
+    """The full engine must expose a WebGL context.
+
+    ``--disable-gpu`` without a software fallback leaves
+    ``getContext('webgl') === null`` — a strong headless tell. Skipped when full
+    Chrome isn't installed.
+    """
+    from onyxweb.presets.full import stealth as full_stealth
+
+    try:
+        client = onyxweb.Client(navigation_timeout_ms=15_000, **full_stealth.BASIC)
+    except onyxweb.OnyxwebError as e:
+        if "not found" in str(e).lower():
+            pytest.skip(f"full Chrome unavailable: {e}")
+        raise
+    try:
+        r = client.fetch(
+            "data:text/html,<html></html>",
+            post_load_scripts=["!!document.createElement('canvas').getContext('webgl')"],
+        )
+    finally:
+        client.close()
+    assert r.post_load_results[0] is True, "full engine exposes no WebGL context"
+
+
 # ---------------------------------------------------------------------------
 # Real-site regression guard
 # ---------------------------------------------------------------------------

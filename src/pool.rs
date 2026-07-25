@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use chromiumoxide::auth::Credentials;
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
@@ -30,7 +31,7 @@ use chromiumoxide::cdp::browser_protocol::target::{
 };
 use chromiumoxide::{Browser, Page};
 use futures::StreamExt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{CaptureConsoleLevel, ClientConfigRs, UserAgentMetadataRs};
@@ -48,6 +49,35 @@ pub(crate) fn block_patterns(urls: &[String]) -> Vec<BlockPattern> {
     urls.iter()
         .map(|p| BlockPattern::new(p.clone(), true))
         .collect()
+}
+
+/// Split a proxy URL into a credential-free `scheme://host[:port]` (Chrome
+/// ignores creds in the proxy string) and optional percent-decoded
+/// `(user, pass)` for `page.authenticate`. No `@` → returned verbatim, no creds.
+pub(crate) fn split_proxy(proxy: &str) -> (String, Option<(String, String)>) {
+    if !proxy.contains('@') {
+        return (proxy.to_string(), None);
+    }
+    let Ok(u) = url::Url::parse(proxy) else {
+        return (proxy.to_string(), None);
+    };
+    if u.username().is_empty() {
+        return (proxy.to_string(), None);
+    }
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let host = u.host_str().unwrap_or_default();
+    let clean = match u.port() {
+        Some(p) => format!("{}://{host}:{p}", u.scheme()),
+        None => format!("{}://{host}", u.scheme()),
+    };
+    (
+        clean,
+        Some((decode(u.username()), decode(u.password().unwrap_or("")))),
+    )
 }
 
 /// Anti-bot cookie names (the "bot verdict" carriers) that self-heal drops
@@ -183,6 +213,12 @@ pub struct PooledPage {
     pub current_url: Arc<Mutex<Option<String>>>,
     /// Set when a fetch wedged or killed this tab; `acquire()` recreates it.
     pub poisoned: AtomicBool,
+    /// Config generation this tab was created at; a stale value triggers
+    /// recreation on `acquire()` so runtime proxy/bypass changes take effect.
+    pub generation: u64,
+    /// True when the proxy has credentials, so chromiumoxide owns the tab's Fetch
+    /// domain for auth — engine must not enable/disable its own Fetch here.
+    pub auth_fetch_active: bool,
 }
 
 /// Pool sized to the Client's `concurrency`. `acquire()` returns page + permit
@@ -192,8 +228,12 @@ pub struct PagePool {
     browser: Arc<Browser>,
     pages: Mutex<Vec<PooledPage>>,
     sem: Arc<Semaphore>,
-    /// Base config, kept so a poisoned tab can be recreated on acquire.
-    config: ClientConfigRs,
+    /// Live config, shared with the Client, read when a tab is (re)created so
+    /// runtime changes apply to fresh tabs.
+    config: Arc<RwLock<ClientConfigRs>>,
+    /// Bumped when a context-level field (proxy/bypass) changes; tabs created at
+    /// an older generation are recreated on acquire.
+    generation: AtomicU64,
     #[allow(dead_code)]
     size: usize,
 }
@@ -204,11 +244,12 @@ impl PagePool {
     pub async fn new(
         browser: Arc<Browser>,
         size: usize,
-        base: &ClientConfigRs,
+        config: Arc<RwLock<ClientConfigRs>>,
     ) -> Result<Arc<Self>> {
         let t0 = std::time::Instant::now();
         log::info!(target: "onyxweb::pool", "creating pool of {size} pages");
-        let futs = (0..size).map(|_| create_pooled_page(&browser, base));
+        let base = config.read().clone();
+        let futs = (0..size).map(|_| create_pooled_page(&browser, &base, 0));
         let created: Vec<PooledPage> = futures::future::try_join_all(futs).await?;
         log::info!(
             target: "onyxweb::pool",
@@ -219,9 +260,17 @@ impl PagePool {
             browser,
             pages: Mutex::new(created),
             sem: Arc::new(Semaphore::new(size)),
-            config: base.clone(),
+            config,
+            generation: AtomicU64::new(0),
             size,
         }))
+    }
+
+    /// Signal that context-level config (proxy/bypass) changed; tabs recreate
+    /// with the live config on their next acquire.
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        log::debug!(target: "onyxweb::pool", "config generation bumped; tabs recreate on next acquire");
     }
 
     #[allow(dead_code)]
@@ -243,14 +292,16 @@ impl PagePool {
             .lock()
             .pop()
             .expect("semaphore permitted but pool is empty");
-        if pooled.poisoned.load(Ordering::Acquire) {
-            log::debug!(target: "onyxweb::pool", "recreating poisoned pooled tab");
+        let generation = self.generation.load(Ordering::Acquire);
+        if pooled.poisoned.load(Ordering::Acquire) || pooled.generation != generation {
+            log::debug!(target: "onyxweb::pool", "recreating pooled tab (poisoned or stale config)");
             let _ = tokio::time::timeout(Duration::from_secs(5), pooled.page.close()).await;
             let _ = self
                 .browser
                 .dispose_browser_context(pooled.browser_context_id.clone())
                 .await;
-            pooled = create_pooled_page(&self.browser, &self.config).await?;
+            let base = self.config.read().clone();
+            pooled = create_pooled_page(&self.browser, &base, generation).await?;
         }
         pooled.console_messages.lock().clear();
         // Snapshot previous response before clearing — same-doc navs (no new
@@ -321,6 +372,12 @@ impl PageGuard {
             .expect("guard drained")
             .poisoned
             .store(true, Ordering::Release);
+    }
+
+    /// True when chromiumoxide owns this tab's Fetch domain for proxy auth;
+    /// engine must not enable/disable its own Fetch (would break auth).
+    pub fn auth_fetch_active(&self) -> bool {
+        self.page.as_ref().expect("guard drained").auth_fetch_active
     }
 
     pub fn console_messages(&self) -> Arc<Mutex<Vec<ConsoleMessageRs>>> {
@@ -424,12 +481,27 @@ impl Drop for PageGuard {
 }
 
 /// Create one page, apply base config, wire up persistent listeners.
-async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<PooledPage> {
+async fn create_pooled_page(
+    browser: &Browser,
+    base: &ClientConfigRs,
+    generation: u64,
+) -> Result<PooledPage> {
     let t0 = std::time::Instant::now();
     // Each tab gets its own browser context so cookies/storage are isolated
-    // per-tab (no cross-fetch poisoning, no concurrent clobbering).
+    // per-tab (no cross-fetch poisoning, no concurrent clobbering) and so the
+    // proxy is per-context (creds stripped — Chrome ignores them here; supplied
+    // via Fetch.authRequired below).
+    let mut ctx_params = CreateBrowserContextParams::default();
+    let proxy_creds = if let Some(p) = base.network.proxy.as_deref() {
+        let (clean, creds) = split_proxy(p);
+        ctx_params.proxy_server = Some(clean);
+        ctx_params.proxy_bypass_list = base.network.proxy_bypass_list.clone();
+        creds
+    } else {
+        None
+    };
     let browser_context_id = browser
-        .create_browser_context(CreateBrowserContextParams::default())
+        .create_browser_context(ctx_params)
         .await
         .map_err(OnyxError::from)?;
     let mut target = CreateTargetParams::new("about:blank");
@@ -562,6 +634,7 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
     let console_messages: Arc<Mutex<Vec<ConsoleMessageRs>>> = Arc::new(Mutex::new(Vec::new()));
     let response: Arc<Mutex<ResponseState>> = Arc::new(Mutex::new(ResponseState::default()));
     let current_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let auth_fetch_active = proxy_creds.is_some();
     let level = base.capture_console_level;
     {
         use chromiumoxide::cdp::browser_protocol::network::{
@@ -836,6 +909,17 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
         });
     }
 
+    // Authenticated proxy: chromiumoxide's NetworkManager owns the Fetch domain
+    // and answers Fetch.authRequired with these credentials on every challenge.
+    if let Some((user, pass)) = proxy_creds {
+        page.authenticate(Credentials {
+            username: user,
+            password: pass,
+        })
+        .await
+        .map_err(OnyxError::from)?;
+    }
+
     Ok(PooledPage {
         page,
         browser_context_id,
@@ -843,6 +927,8 @@ async fn create_pooled_page(browser: &Browser, base: &ClientConfigRs) -> Result<
         response,
         current_url,
         poisoned: AtomicBool::new(false),
+        generation,
+        auth_fetch_active,
     })
 }
 

@@ -84,6 +84,8 @@ pub struct NetworkRs {
     pub user_agent: Option<String>,
     pub user_agent_metadata: Option<UserAgentMetadataRs>,
     pub proxy: Option<String>,
+    /// Per-context bypass list; `<-loopback>` forces localhost through the proxy.
+    pub proxy_bypass_list: Option<String>,
     pub extra_headers: HashMap<String, String>,
     pub ignore_https_errors: bool,
     pub block_urls: Vec<String>,
@@ -651,6 +653,11 @@ fn parse_network(v: &Bound<'_, PyAny>) -> Result<NetworkRs> {
             && !x.is_none()
         {
             out.proxy = Some(x.extract().map_err(to_internal)?);
+        }
+        if let Some(x) = d.get_item("proxy_bypass_list")?
+            && !x.is_none()
+        {
+            out.proxy_bypass_list = Some(x.extract().map_err(to_internal)?);
         }
         if let Some(x) = d.get_item("extra_headers")? {
             out.extra_headers = parse_headers(&x)?;

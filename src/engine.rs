@@ -17,7 +17,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, CaptureScreenshotParams,
-    EventDomContentEventFired, EventLoadEventFired, EventNavigatedWithinDocument, NavigateParams,
+    EventDomContentEventFired, EventFrameNavigated, EventLoadEventFired, NavigateParams,
     ReferrerPolicy, RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier,
 };
 use futures::StreamExt;
@@ -322,8 +322,8 @@ pub async fn capture_page(
                 .event_listener::<EventLoadEventFired>()
                 .await
                 .map_err(OnyxError::from)?;
-            let mut within_doc_stream = page
-                .event_listener::<EventNavigatedWithinDocument>()
+            let mut frame_nav_stream = page
+                .event_listener::<EventFrameNavigated>()
                 .await
                 .map_err(OnyxError::from)?;
 
@@ -360,24 +360,32 @@ pub async fn capture_page(
             };
             let same_doc_nav = nav_params.is_none();
 
-            // Race goto against the chosen lifecycle event — goto() otherwise blocks
-            // until every frame fires `load`, defeating domcontentloaded. Dropping
-            // the goto future when a stream wins is safe; a nav failure still
-            // surfaces via the goto arm.
+            // Race goto (blocks until every frame loads) against the lifecycle
+            // event, gated behind the new doc's main-frame commit so the outgoing
+            // page's lingering pushState / late load can't resolve early and
+            // capture stale content. Dropping goto is safe (see nav_error below).
             if let Some(nav_params) = nav_params {
                 let nav_fut = page.goto(nav_params);
-                match wait_until {
-                    WaitUntil::DomContentLoaded => tokio::select! {
-                        r = nav_fut => { r?; }
-                        _ = dcl_stream.next() => {}
-                        _ = load_stream.next() => {}
-                        _ = within_doc_stream.next() => {}
-                    },
-                    WaitUntil::Load => tokio::select! {
-                        r = nav_fut => { r?; }
-                        _ = load_stream.next() => {}
-                        _ = within_doc_stream.next() => {}
-                    },
+                let lifecycle = async {
+                    while let Some(evt) = frame_nav_stream.next().await {
+                        if evt.frame.parent_id.is_none() {
+                            break;
+                        }
+                    }
+                    match wait_until {
+                        // load: DCL-miss fallback.
+                        WaitUntil::DomContentLoaded => tokio::select! {
+                            _ = dcl_stream.next() => {}
+                            _ = load_stream.next() => {}
+                        },
+                        WaitUntil::Load => {
+                            let _ = load_stream.next().await;
+                        }
+                    }
+                };
+                tokio::select! {
+                    r = nav_fut => { r?; }
+                    _ = lifecycle => {}
                 }
             }
             log::trace!(
@@ -455,32 +463,42 @@ pub async fn capture_page(
             // path with zero CDP overhead. Cleanup (``Fetch.disable``) runs
             // unconditionally below.
             if per_call.block_navigation {
-                log::trace!(
-                    target: "onyxweb::engine",
-                    "[{url}] block_navigation: enabling Fetch interception (Document only)"
-                );
-                let document_only = RequestPattern::builder()
-                    .resource_type(ResourceType::Document)
-                    .build();
-                page.execute(FetchEnableParams::builder().pattern(document_only).build())
-                    .await?;
-                let mut paused_stream = page
-                    .event_listener::<EventRequestPaused>()
-                    .await
-                    .map_err(OnyxError::from)?;
-                let page_for_task = page.clone();
-                tokio::spawn(async move {
-                    while let Some(evt) = paused_stream.next().await {
-                        // Pattern guarantees only Document-type requests reach
-                        // us; abort each.
-                        let _ = page_for_task
-                            .execute(FailRequestParams::new(
-                                evt.request_id.clone(),
-                                ErrorReason::Aborted,
-                            ))
-                            .await;
-                    }
-                });
+                if guard.auth_fetch_active() {
+                    // chromiumoxide owns this tab's Fetch domain for proxy auth;
+                    // adding our own Fetch interception would clobber it, so
+                    // navigation blocking is unavailable here.
+                    log::warn!(
+                        target: "onyxweb::engine",
+                        "[{url}] block_navigation is unsupported with an authenticated proxy; navigation not blocked"
+                    );
+                } else {
+                    log::trace!(
+                        target: "onyxweb::engine",
+                        "[{url}] block_navigation: enabling Fetch interception (Document only)"
+                    );
+                    let document_only = RequestPattern::builder()
+                        .resource_type(ResourceType::Document)
+                        .build();
+                    page.execute(FetchEnableParams::builder().pattern(document_only).build())
+                        .await?;
+                    let mut paused_stream = page
+                        .event_listener::<EventRequestPaused>()
+                        .await
+                        .map_err(OnyxError::from)?;
+                    let page_for_task = page.clone();
+                    tokio::spawn(async move {
+                        while let Some(evt) = paused_stream.next().await {
+                            // Pattern guarantees only Document-type requests reach
+                            // us; abort each.
+                            let _ = page_for_task
+                                .execute(FailRequestParams::new(
+                                    evt.request_id.clone(),
+                                    ErrorReason::Aborted,
+                                ))
+                                .await;
+                        }
+                    });
+                }
             }
 
             // Per-call post-load scripts — run arbitrary JS on the loaded page
@@ -777,10 +795,11 @@ pub async fn capture_page(
         let _ = page.execute(SetExtraHttpHeadersParams::new(headers)).await;
     }
 
-    // Per-call navigation-block cleanup — disable the Fetch domain so the
-    // listener task's stream ends and any future fetches on this tab aren't
-    // intercepted. CDP auto-continues paused requests on disable.
-    if per_call.block_navigation {
+    // Per-call navigation-block cleanup — disable the Fetch domain this call
+    // enabled (CDP auto-continues paused requests on disable). Skipped under an
+    // authenticated proxy, where we never enabled our own Fetch (chromiumoxide
+    // owns it) — disabling would break auth on the next fetch.
+    if per_call.block_navigation && !guard.auth_fetch_active() {
         let _ = page.execute(FetchDisableParams::default()).await;
     }
 
