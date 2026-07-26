@@ -15,7 +15,7 @@ import re
 
 import onyxweb
 import pytest
-from onyxweb._download_chrome import CHROME_VERSION
+from onyxweb.download import CHROME_VERSION
 from onyxweb.presets.shell import stealth
 from pytest_httpserver import HTTPServer
 
@@ -185,7 +185,7 @@ def test_basic_ua_major_matches_chrome_version() -> None:
 
     Detectors compare UA-claimed version against JS-feature shape; a mismatch
     is itself a fingerprint tell. Bumping ``CHROME_VERSION`` in
-    ``_download_chrome.py`` requires a paired bump of ``BASIC_UA`` and
+    ``download.py`` requires a paired bump of ``BASIC_UA`` and
     ``BASIC_UA_METADATA`` here.
     """
     chrome_major = CHROME_VERSION.split(".")[0]
@@ -208,7 +208,7 @@ def test_download_engine_specs() -> None:
     these drift, ``onyxweb-download-chrome`` puts the binary where
     ``chrome::find_bundled`` won't look.
     """
-    from onyxweb._download_chrome import _engine_download
+    from onyxweb.download import _engine_download
 
     assert _engine_download("full", "linux64") == ("chrome-linux64", "chrome", "full")
     assert _engine_download("shell", "linux64") == (

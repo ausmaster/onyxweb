@@ -60,6 +60,13 @@ from onyxweb.config import (
     ViewportConfig,
     Wait,
 )
+from onyxweb.download import (
+    CHROME_VERSION as CHROME_VERSION,
+    OnyxwebDownloadError as OnyxwebDownloadError,
+    aensure_chrome as aensure_chrome,
+    ensure_chrome as ensure_chrome,
+    find_chrome as find_chrome,
+)
 
 # Configure Python-side logging at import from ONYXWEB_LOG (defaults "warn").
 # The Rust side reads the same env var at PyO3 module init.
@@ -110,6 +117,12 @@ __all__ = [
     # Logging
     "logger",
     "set_log_level",
+    # Chrome install (host-app integration — see onyxweb.download)
+    "ensure_chrome",
+    "aensure_chrome",
+    "find_chrome",
+    "OnyxwebDownloadError",
+    "CHROME_VERSION",
 ]
 
 
