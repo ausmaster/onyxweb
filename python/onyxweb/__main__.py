@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.install:
-        from onyxweb._download_chrome import install_chrome
+        from onyxweb.download import install_chrome
         return install_chrome()
 
     if args.preset == "list":

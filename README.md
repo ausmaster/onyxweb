@@ -39,6 +39,18 @@ If chromium is already on the PATH, skip `--install`. onyxweb looks for a browse
 
 Wheels are prebuilt for linux (x86_64, aarch64), macOS (arm64), and Windows x86_64. On anything else, including Intel macOS, pip builds from source, which needs a stable Rust toolchain (install [rustup](https://rustup.rs)). The `--install` step is the same either way.
 
+If you're embedding onyxweb in another tool, you can do the browser install from Python and pick where the binary lands:
+
+```python
+path = onyxweb.ensure_chrome(dest="~/.mytool/tools")         # sync; returns the binary path
+path = await onyxweb.aensure_chrome(dest="~/.mytool/tools")  # async, for setup hooks
+here = onyxweb.find_chrome(dest="~/.mytool/tools")           # Path or None, no download
+```
+
+Both `ensure` calls are idempotent (they skip the download if the binary is already there) and hand back the path, which you pass straight to `Client(chrome_path=path)`. `find_chrome` is a cheap "is it installed?" predicate — useful for logging a one-time "downloading ~179 MB…" before the first `aensure_chrome`. That's the pattern a BBOT module uses: fetch the pinned browser into `~/.bbot/tools/` during async `setup_deps`, then drive it.
+
+Every expected install failure — unsupported/non-downloadable platform, network, permissions, disk, or a corrupt archive — raises `onyxweb.OnyxwebDownloadError` (a subclass of `OnyxwebError`, so `except onyxweb.OnyxwebError` catches it). `find_chrome` never raises — it returns `None` on any host it can't map.
+
 ## Benchmarks
 
 This is the reason the core is Rust rather than a wrapper over Playwright. 48-URL gauntlet, 16-core Linux, `chrome-headless-shell 148`. Full method is in `BENCHMARKS.md`.

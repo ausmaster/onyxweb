@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "onyxweb"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,7 +43,7 @@ Issues = "https://github.com/ausmaster/onyxweb/issues"
 
 [project.scripts]
 onyxweb = "onyxweb.__main__:main"
-onyxweb-download-chrome = "onyxweb._download_chrome:main"
+onyxweb-download-chrome = "onyxweb.download:main"
 
 [dependency-groups]
 dev = [
@@ -93,7 +93,7 @@ convention = "google"
 "tests/*" = ["D"]
 # Private modules: relax requirement on per-symbol docstrings.
 "python/onyxweb/_logging.py" = ["D102", "D103", "D107"]
-"python/onyxweb/_download_chrome.py" = ["D103"]
+"python/onyxweb/download.py" = ["D103"]
 
 [tool.ruff.lint.isort]
 # Coalesce `from X import a as b, c as d` onto one block — keeps PEP 484

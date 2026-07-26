@@ -47,7 +47,7 @@ from __future__ import annotations
 from typing import Any
 
 # Linux x86_64, Chrome 148 — matches the bundled chrome-headless-shell
-# (CHROME_VERSION in _download_chrome.py) so JS-feature shape and the UA
+# (CHROME_VERSION in download.py) so JS-feature shape and the UA
 # string don't disagree. Bump this in lockstep when CHROME_VERSION moves;
 # `test_basic_ua_major_matches_chrome_version` guards the major.
 BASIC_UA: str = (
