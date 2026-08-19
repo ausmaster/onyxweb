@@ -51,6 +51,7 @@ from onyxweb.config import (
     FetchConfig,
     Fill,
     Hover,
+    IncludeConfig,
     NetworkConfig,
     ScreenshotConfig,
     ScriptsConfig,
@@ -112,6 +113,7 @@ __all__ = [
     "EmulationConfig",
     "TimeoutConfig",
     "ChromeConfig",
+    "IncludeConfig",
     "UserAgentBrandVersion",
     "UserAgentMetadata",
     # Logging
@@ -1440,6 +1442,8 @@ _FLAT_KWARG_MAP: dict[str, tuple[str, ...]] = {
     "launch_timeout_ms": ("timeout", "launch_ms"),
     "screenshot_timeout_ms": ("timeout", "screenshot_ms"),
     # Chrome
+    "include_shadow_dom": ("include", "shadow_dom"),
+    "include_iframes": ("include", "iframes"),
     "chrome_path": ("chrome", "path"),
     "chrome_args": ("chrome", "args"),
     "user_data_dir": ("chrome", "user_data_dir"),

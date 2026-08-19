@@ -686,7 +686,11 @@ pub async fn capture_page(
 
             if matches!(mode, CaptureMode::Html | CaptureMode::Both) {
                 let t_html = Instant::now();
-                let html = page.content().await?;
+                let html = if base.include.shadow_dom || base.include.iframes {
+                    capture_html(page, base.include.shadow_dom, base.include.iframes).await?
+                } else {
+                    page.content().await?
+                };
                 log::trace!(
                     target: "onyxweb::engine",
                     "[{url}] content: {} bytes in {:?}",
@@ -845,7 +849,7 @@ pub async fn capture_page(
             Some(AntiBotRs {
                 vendor: vendor_opt(v),
                 kind: "challenge",
-                resolved: false,
+                resolved: v == "cloudflare" && turnstile_token_present(html),
             })
         } else {
             block_hit.map(|v| AntiBotRs {
@@ -945,6 +949,76 @@ fn challenge_vendor(html: &str) -> Option<&'static str> {
 
 fn looks_like_challenge(html: &str) -> bool {
     challenge_vendor(html).is_some()
+}
+
+/// Serialize the document, optionally reaching past `outerHTML`'s blind spots.
+///
+/// - shadow roots: `outerHTML` never emits them; `getHTML` does, but only for
+///   roots created `serializable` (the pool's init script guarantees that).
+/// - same-origin iframes: a separate document, so never in the parent's HTML.
+///   Stashed as `<iframe>` fallback children for the serialize, then restored.
+///
+/// Falls back to `page.content()` if the evaluate yields no string.
+async fn capture_html(
+    page: &chromiumoxide::Page,
+    deep_shadow: bool,
+    frames: bool,
+) -> Result<String> {
+    let js = format!(
+        r#"
+    (() => {{
+      const restore = [];
+      if ({frames}) {{
+        for (const f of document.querySelectorAll('iframe')) {{
+          try {{
+            const doc = f.contentDocument;
+            if (!doc) continue;
+            restore.push([f, f.innerHTML]);
+            f.innerHTML = doc.documentElement.outerHTML;
+          }} catch (e) {{ /* cross-origin: unreadable, leave as-is */ }}
+        }}
+      }}
+      const de = document.documentElement;
+      const dt = document.doctype ? '<!DOCTYPE ' + document.doctype.name + '>\n' : '';
+      const html = dt + (({deep_shadow}) && typeof de.getHTML === 'function'
+        ? de.getHTML({{ serializableShadowRoots: true }})
+        : de.outerHTML);
+      for (const [f, prev] of restore) f.innerHTML = prev;
+      return html;
+    }})()
+    "#
+    );
+    let res = page.evaluate(js.as_str()).await?;
+    match res.value().and_then(|v| v.as_str().map(str::to_string)) {
+        Some(html) => Ok(html),
+        None => page.content().await.map_err(OnyxError::from),
+    }
+}
+
+/// True when Turnstile has issued a token — the challenge passed. The token lands
+/// in a light-DOM `input[name=cf-turnstile-response]` (empty until then), so this
+/// needs no shadow-root access.
+fn turnstile_token_present(html: &str) -> bool {
+    const FIELD: &str = "cf-turnstile-response";
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(hit) = lower[from..].find(FIELD) {
+        let at = from + hit;
+        let tag_start = lower[..at].rfind('<').unwrap_or(0);
+        let tag_end = lower[at..].find('>').map_or(lower.len(), |e| at + e);
+        if let Some(v) = lower[tag_start..tag_end].find("value=") {
+            let rest = &lower[tag_start + v + "value=".len()..tag_end];
+            let value = match rest.chars().next() {
+                Some(q @ ('"' | '\'')) => rest[1..].split(q).next().unwrap_or(""),
+                _ => rest.split_whitespace().next().unwrap_or(""),
+            };
+            if !value.is_empty() {
+                return true;
+            }
+        }
+        from = tag_end.max(at + 1);
+    }
+    false
 }
 
 /// Response-header / status WAF signals — preferred over body matching for

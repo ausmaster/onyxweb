@@ -142,7 +142,13 @@ def test_synthetic_click_loop_executes_javascript_urls_and_onclick() -> None:
     """
 
     with onyxweb.Client() as c:
-        r = c.fetch(url, post_load_scripts=[click_loop], block_navigation=True)
+        # javascript: URL execution is scheduled, not synchronous with click().
+        r = c.fetch(
+            url,
+            post_load_scripts=[click_loop],
+            block_navigation=True,
+            wait_after_post_load_ms=300,
+        )
 
     texts = [m.text for m in r.console_messages]
     # Onclick handlers fired
@@ -232,6 +238,8 @@ async def test_async_synthetic_click_loop_via_post_load_script() -> None:
                 "document.querySelectorAll('[href^=\"javascript:\"]').forEach(el => el.click())"
             ],
             block_navigation=True,
+            # javascript: URL execution is scheduled, not synchronous with click().
+            wait_after_post_load_ms=300,
         )
 
     assert any("ASYNC_JS_URL_FIRED" in m.text for m in r.console_messages)
