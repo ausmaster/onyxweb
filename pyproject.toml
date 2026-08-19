@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "onyxweb"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
 readme = "README.md"
 requires-python = ">=3.10"
