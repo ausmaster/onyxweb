@@ -16,7 +16,7 @@
 //! Both forms route through the same `do_*_inner` async helpers, so there's
 //! exactly one implementation of each operation and two callable shapes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chromiumoxide::browser::BrowserConfigBuilder;
@@ -167,9 +167,6 @@ fn build_shell_launch(builder: BrowserConfigBuilder, cfg: &ClientConfigRs) -> Br
     if cfg.network.ignore_https_errors {
         b = b.arg("--ignore-certificate-errors");
     }
-    if let Some(user_data_dir) = &cfg.chrome.user_data_dir {
-        b = b.arg(format!("--user-data-dir={user_data_dir}"));
-    }
     for arg in &cfg.chrome.args {
         b = b.arg(arg.clone());
     }
@@ -210,14 +207,29 @@ fn build_full_launch(
     if cfg.network.ignore_https_errors {
         b = b.arg("ignore-certificate-errors");
     }
-    if let Some(user_data_dir) = &cfg.chrome.user_data_dir {
-        b = b.arg(format!("user-data-dir={user_data_dir}"));
-    }
     for arg in &cfg.chrome.args {
         let a = arg.strip_prefix("--").unwrap_or(arg);
         b = b.arg(a.to_string());
     }
     b
+}
+
+/// Profile dir + whether it's ours to delete. Must go through the builder:
+/// chromiumoxide otherwise defaults every Client to one shared fixed path, which
+/// real Chrome's ProcessSingleton then refuses to open twice.
+fn resolve_user_data_dir(cfg: &ClientConfigRs) -> (PathBuf, bool) {
+    if let Some(dir) = &cfg.chrome.user_data_dir {
+        return (PathBuf::from(dir), false);
+    }
+    let unique = format!(
+        "onyxweb-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    (std::env::temp_dir().join(unique), true)
 }
 
 /// Fallback UA if the binary version can't be read. Linux desktop Chrome.
@@ -255,6 +267,8 @@ struct ClientState {
     handler_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     config: Arc<parking_lot::RwLock<ClientConfigRs>>,
     closed: std::sync::atomic::AtomicBool,
+    /// Profile dir to delete on close; None when the caller supplied their own.
+    ephemeral_profile: Option<PathBuf>,
 }
 
 impl ClientState {
@@ -395,6 +409,10 @@ async fn do_close_inner(state: Arc<ClientState>) {
     if let Some(task) = task_opt {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
+    // Best-effort: a leftover temp dir must never surface as a close() error.
+    if let Some(dir) = &state.ephemeral_profile {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Append one batch item to `list`. A success appends the raw output; a failure
@@ -449,7 +467,10 @@ impl Client {
         // Launch flags diverge by engine: the bundled shell keeps its legacy
         // flag set; the full engine gets a clean new-headless launch with the
         // automation tells stripped (see build_full_launch).
-        let mut builder = BrowserConfig::builder().chrome_executable(&chrome_path);
+        let (user_data_dir, ephemeral_profile) = resolve_user_data_dir(&config_rs);
+        let mut builder = BrowserConfig::builder()
+            .chrome_executable(&chrome_path)
+            .user_data_dir(&user_data_dir);
         builder = match config_rs.chrome.engine {
             ChromeEngine::HeadlessShell => build_shell_launch(builder, &config_rs),
             ChromeEngine::Full => build_full_launch(builder, &config_rs, &chrome_path),
@@ -498,6 +519,7 @@ impl Client {
             handler_task: parking_lot::Mutex::new(Some(handler_task)),
             config: shared_config,
             closed: std::sync::atomic::AtomicBool::new(false),
+            ephemeral_profile: ephemeral_profile.then_some(user_data_dir),
         };
 
         Ok(Self {

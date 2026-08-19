@@ -266,6 +266,31 @@ class ScriptsConfig(BaseModel):
     logic inside the script body and use ``on_new_document`` directly."""
 
 
+class IncludeConfig(BaseModel):
+    """Content to pull into the captured HTML beyond plain ``outerHTML``.
+
+    Scope is deliberately narrow: content the live page already renders but
+    ``outerHTML`` drops. Content that doesn't exist yet (lazy-loaded on scroll,
+    behind a "show more") is an ``actions`` / ``wait_after_ms`` concern, not this.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shadow_dom: bool = False
+    """Include shadow-root content. ``outerHTML`` never serializes shadow roots,
+    so component-internal text is missing from ``.dom`` — on lit.dev that hides
+    76 hosts' worth of rendered content. Enabling it registers an init script
+    forcing every root open + serializable, then captures via ``getHTML()``.
+
+    Off by default: forcing a closed root open is detectable by the widget that
+    created it, so it trades a fingerprinting tell for the extra content."""
+
+    iframes: bool = False
+    """Inline same-origin iframe documents as ``<iframe>`` fallback children.
+    An iframe is a separate document, so its content never appears in the
+    parent's ``outerHTML``. Cross-origin frames are unreadable and skipped."""
+
+
 class TimeoutConfig(BaseModel):
     """Per-operation time limits (ms)."""
 
@@ -369,6 +394,7 @@ class ClientConfig(BaseSettings):
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     emulation: EmulationConfig = Field(default_factory=EmulationConfig)
     scripts: ScriptsConfig = Field(default_factory=ScriptsConfig)
+    include: IncludeConfig = Field(default_factory=IncludeConfig)
     timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)
     chrome: ChromeConfig = Field(default_factory=ChromeConfig)
 
@@ -408,6 +434,8 @@ class ClientConfig(BaseSettings):
             "user_data_dir": ("chrome", "user_data_dir"),
             "headless": ("chrome", "headless"),
             "engine": ("chrome", "engine"),
+            "include_shadow_dom": ("include", "shadow_dom"),
+            "include_iframes": ("include", "iframes"),
         }
 
         nested: dict[str, dict[str, Any]] = {
@@ -416,6 +444,7 @@ class ClientConfig(BaseSettings):
             "emulation": {},
             "timeout": {},
             "chrome": {},
+            "include": {},
         }
         top: dict[str, Any] = {}
 
@@ -463,6 +492,7 @@ class ClientConfig(BaseSettings):
             "emulation": EmulationConfig,
             "timeout": TimeoutConfig,
             "chrome": ChromeConfig,
+            "include": IncludeConfig,
         }
         for sub_name, sub_kw in nested.items():
             if sub_kw and sub_name not in top:
@@ -695,6 +725,7 @@ class ScreenshotConfig(BaseModel):
 
 
 __all__ = [
+    "IncludeConfig",
     "ChromeConfig",
     "ClientConfig",
     "EmulationConfig",

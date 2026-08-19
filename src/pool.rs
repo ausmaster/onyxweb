@@ -42,6 +42,18 @@ use crate::result::ConsoleMessageRs;
 /// registrations. Page JS cannot read or tamper with globals defined here.
 const DEFAULT_ISOLATED_WORLD_NAME: &str = "util";
 
+/// Forces `attachShadow` open + serializable so shadow content is walkable and
+/// `getHTML()` will serialize it. `serializable` is the load-bearing half —
+/// without it `getHTML({serializableShadowRoots:true})` still omits the subtree.
+const OPEN_SHADOW_ROOTS_JS: &str = r#"
+(() => {
+  const orig = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (init) {
+    return orig.call(this, Object.assign({}, init, { mode: 'open', serializable: true }));
+  };
+})();
+"#;
+
 /// Build a `Vec<BlockPattern>` for `Network.setBlockedURLs` from a slice of
 /// URL pattern strings. URLPattern syntax (`*://*.doubleclick.net/*`),
 /// case-sensitive matching enabled.
@@ -973,6 +985,15 @@ fn build_ua_metadata(m: &UserAgentMetadataRs) -> Result<UserAgentMetadata> {
 /// Timing variants and URL scoping are implemented as source-wrapping; only
 /// ``on_new_document`` and ``isolated_world`` map 1:1 to the CDP primitive.
 async fn register_init_scripts(page: &Page, base: &ClientConfigRs) -> Result<()> {
+    // include.shadow_dom: force every root open + serializable so the capture
+    // step can serialize it. Must precede page scripts to catch every call.
+    if base.include.shadow_dom {
+        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
+            OPEN_SHADOW_ROOTS_JS.to_string(),
+        ))
+        .await?;
+    }
+
     let s = &base.scripts;
     let total = s.on_new_document.len()
         + s.on_dom_content_loaded.len()

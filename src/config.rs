@@ -67,6 +67,7 @@ pub struct ClientConfigRs {
     pub network: NetworkRs,
     pub emulation: EmulationRs,
     pub scripts: ScriptsRs,
+    pub include: IncludeRs,
     pub timeout: TimeoutRs,
     pub chrome: ChromeRs,
 }
@@ -132,6 +133,15 @@ pub struct ScriptsRs {
     pub isolated_world: Vec<String>,
     pub isolated_world_name: String,
     pub url_scoped: HashMap<String, Vec<String>>,
+}
+
+/// What the capture step pulls in beyond plain `outerHTML`.
+#[derive(Debug, Clone, Default)]
+pub struct IncludeRs {
+    /// Serialize shadow-root content (needs the open+serializable init script).
+    pub shadow_dom: bool,
+    /// Inline same-origin iframe documents as `<iframe>` fallback children.
+    pub iframes: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,6 +216,7 @@ impl Default for ClientConfigRs {
                 ..Default::default()
             },
             scripts: ScriptsRs::default(),
+            include: IncludeRs::default(),
             timeout: TimeoutRs::default(),
             chrome: ChromeRs {
                 headless: true,
@@ -377,6 +388,9 @@ pub fn parse_client_config(py_dict: &Bound<'_, PyAny>) -> Result<ClientConfigRs>
         }
         if let Some(v) = d.get_item("scripts")? {
             cfg.scripts = parse_scripts(&v)?;
+        }
+        if let Some(v) = d.get_item("include")? {
+            cfg.include = parse_include(&v)?;
         }
         if let Some(v) = d.get_item("timeout")? {
             cfg.timeout = parse_timeout(&v)?;
@@ -721,6 +735,19 @@ fn parse_emulation(v: &Bound<'_, PyAny>) -> Result<EmulationRs> {
         }
         if let Some(x) = d.get_item("javascript_enabled")? {
             out.javascript_enabled = x.extract().map_err(to_internal)?;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_include(v: &Bound<'_, PyAny>) -> Result<IncludeRs> {
+    let mut out = IncludeRs::default();
+    if let Some(d) = as_dict(v)? {
+        if let Some(x) = d.get_item("shadow_dom")? {
+            out.shadow_dom = x.extract().map_err(to_internal)?;
+        }
+        if let Some(x) = d.get_item("iframes")? {
+            out.iframes = x.extract().map_err(to_internal)?;
         }
     }
     Ok(out)
