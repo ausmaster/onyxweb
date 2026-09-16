@@ -11,7 +11,7 @@ use std::cell::RefCell;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scraper::{ElementRef, Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 
 // ----------------------------------------------------------------------------
 // Dom pyclass
@@ -317,9 +317,20 @@ fn parse_selector(s: &str) -> PyResult<Selector> {
 }
 
 fn collect_text(e: ElementRef<'_>) -> String {
+    // Text inside these is code or inert markup, not page content. Including it
+    // buries the words: script contents run 77-99% of the characters on a real
+    // page (cnn.com: 20 KB of text inside 2.15 MB).
+    const SKIP: &[&str] = &["script", "style", "noscript", "template"];
     let mut out = String::new();
-    for chunk in e.text() {
-        out.push_str(chunk);
+    let mut stack: Vec<_> = e.children().rev().collect();
+    while let Some(node) = stack.pop() {
+        match node.value() {
+            Node::Text(t) => out.push_str(t),
+            Node::Element(el) if !SKIP.contains(&el.name()) => {
+                stack.extend(node.children().rev());
+            }
+            _ => {}
+        }
     }
     out
 }

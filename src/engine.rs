@@ -878,7 +878,7 @@ const CHALLENGE_POLL_MS: u64 = 500;
 
 /// A real page behind these WAFs is large; a challenge interstitial is a tiny
 /// stub. Signals that ALSO leak onto normal pages only count below this size.
-const CHALLENGE_STUB_MAX_BYTES: usize = 15_000;
+const CHALLENGE_STUB_MAX_BYTES: usize = 30_720;
 
 /// Anti-bot challenge/interstitial detector — a small "checking your browser /
 /// verify you're human" page a WAF serves before the real one, which typically
@@ -895,14 +895,27 @@ const CHALLENGE_STUB_MAX_BYTES: usize = 15_000;
 /// Extend either list as new vendors appear.
 fn challenge_vendor(html: &str) -> Option<&'static str> {
     let lower = html.to_ascii_lowercase();
+    let has = |m: &str| lower.contains(m);
+    let any = |ms: &[&str]| ms.iter().any(|m| lower.contains(m));
+
+    // AWS WAF: the envelope vars persist on a SOLVED page, so only the live
+    // proof-of-work loader proves the gate is still up. Size-independent.
+    if any(&["gokuprops", "awswafcookiedomainlist"])
+        && any(&["token.awswaf.com", "awswafintegration", "checkforcerefresh"])
+    {
+        return Some("aws");
+    }
+
     // Interstitial-exclusive: absent from real pages. Any size.
     const STRONG_MARKERS: &[(&str, &str)] = &[
         ("akamai", "sec-if-cpt-container"),
+        ("akamai", "sec-cpt-if"),
+        ("akamai", "/_sec/cp_challenge"),
         ("akamai", "scf-akamai"),
         ("cloudflare", "cf-browser-verification"),
         ("cloudflare", "cf_chl_"), // window._cf_chl_opt, cf_chl_opt, ...
         ("datadome", "captcha-delivery.com"),
-        ("perimeterx", "px-captcha"),
+        ("datadome", "ddcaptchaencoded"),
         ("imperva", "incapsula incident"),
     ];
     if let Some((vendor, _)) = STRONG_MARKERS.iter().find(|(_, m)| lower.contains(m)) {
@@ -911,23 +924,68 @@ fn challenge_vendor(html: &str) -> Option<&'static str> {
     if html.len() >= CHALLENGE_STUB_MAX_BYTES {
         return None;
     }
-    // Leaky markers — trusted only on a small stub, above: the passive
-    // Cloudflare beacon, Imperva's `_Incapsula_Resource` rewriting, and the
-    // reCAPTCHA/hCaptcha widget markers (which also appear on normal pages that
-    // merely embed a captcha-protected form).
+
+    // Akamai's sensor bundle loads on every Akamai-fronted page, so `akam/13`
+    // counts only alongside a challenge-specific co-signal.
+    if has("akam/13")
+        && any(&[
+            "sensor_data",
+            "bm-verify",
+            "sec-if-cpt-container",
+            "sec-cpt-if",
+        ])
+    {
+        return Some("akamai");
+    }
+    if has("_abck") {
+        return Some("akamai");
+    }
+    // PerimeterX before the generic captcha rules so attribution wins.
+    if any(&[
+        "press &amp; hold",
+        "press & hold",
+        "press and hold",
+        "px-captcha",
+    ]) {
+        return Some("perimeterx");
+    }
+    if has("pardon our interruption") {
+        return Some("imperva");
+    }
+    if any(&["_kpsdk", "ips.js"]) {
+        return Some("kasada");
+    }
+
     const WEAK_MARKERS: &[(&str, &str)] = &[
         ("cloudflare", "cdn-cgi/challenge-platform"),
         ("cloudflare", "turnstile"),
         ("imperva", "_incapsula_resource"),
         ("imperva", "/_incapsula"),
-        ("recaptcha", "g-recaptcha"),
-        ("recaptcha", "grecaptcha"),
-        ("hcaptcha", "h-captcha"),
-        ("hcaptcha", "hcaptcha"),
     ];
     if let Some((vendor, _)) = WEAK_MARKERS.iter().find(|(_, m)| lower.contains(m)) {
         return Some(vendor);
     }
+
+    // Invisible reCAPTCHA v3 ships on ordinary pages — its badge, response
+    // textarea and gstatic script are not a gate. A rendered widget carries
+    // `data-sitekey`, and an interactive one loads an anchor/bframe iframe.
+    let interactive = has("data-sitekey")
+        || any(&[
+            "api2/anchor",
+            "api2/bframe",
+            "hcaptcha.com/captcha",
+            "i'm not a robot",
+            "i\u{2019}m not a robot",
+            "select all images",
+            "recaptcha challenge",
+        ]);
+    if interactive && any(&["g-recaptcha", "grecaptcha"]) {
+        return Some("recaptcha");
+    }
+    if interactive && any(&["h-captcha", "hcaptcha"]) {
+        return Some("hcaptcha");
+    }
+
     const CHALLENGE_PHRASES: &[&str] = &[
         "checking your browser",
         "checking if the site connection is secure",
@@ -1046,8 +1104,30 @@ fn header_signal(out: &CaptureOutput) -> Option<(&'static str, &'static str)> {
     }
     // Kasada: `x-kpsdk-ct` on a hard block (silent PoW, no interstitial). A recon
     // signal only — not defeatable CDP-only.
-    if matches!(out.status_code, 403 | 429) && header("x-kpsdk-ct").is_some() {
-        return Some(("kasada", "block"));
+    // Kasada also serves 200 shells; match the whole x-kpsdk-* family.
+    if out
+        .headers
+        .iter()
+        .any(|(k, _)| k.to_ascii_lowercase().starts_with("x-kpsdk"))
+    {
+        let kind = if matches!(out.status_code, 403 | 429 | 498) {
+            "block"
+        } else {
+            "challenge"
+        };
+        return Some(("kasada", kind));
+    }
+    // Vendor-attributing headers: precise, and they fire where a generic
+    // `Server` header would leave the vendor unknown.
+    for (name, vendor) in [
+        ("x-datadome", "datadome"),
+        ("x-perimeterx-id", "perimeterx"),
+        ("x-iinfo", "imperva"),
+        ("x-akamai-transformed", "akamai"),
+    ] {
+        if header(name).is_some() && matches!(out.status_code, 403 | 429 | 498 | 503) {
+            return Some((vendor, "block"));
+        }
     }
     None
 }
@@ -1060,7 +1140,7 @@ fn header_signal(out: &CaptureOutput) -> Option<(&'static str, &'static str)> {
 fn block_vendor(out: &CaptureOutput) -> Option<&'static str> {
     // 403/429 are the usual WAF block codes; Fastly / Signal Sciences defaults
     // to 406. A signature is still required, so a plain 406 isn't flagged.
-    if !matches!(out.status_code, 403 | 429 | 406) {
+    if !matches!(out.status_code, 403 | 429 | 406 | 498) {
         return None;
     }
     // Join ALL `Server` header values — a CDN/proxy in front of the origin can

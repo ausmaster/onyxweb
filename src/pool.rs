@@ -178,6 +178,9 @@ pub struct ResponseState {
     redirects: Vec<RedirectHopRs>,
     /// Main-document network failure (DNS, connection refused, ...), if any.
     nav_error: Option<String>,
+    /// Frame id per in-flight Document request. `loadingFailed` carries no
+    /// frame, so this is how a failed subframe is told from the main document.
+    doc_frames: HashMap<String, String>,
 }
 
 /// Convert a CDP `Headers` (JSON object) into (name, value) pairs. CDP joins
@@ -328,6 +331,7 @@ impl PagePool {
                 rs.prev = rs.main.take();
             }
             rs.pending_extra.clear();
+            rs.doc_frames.clear();
             rs.redirects.clear();
             rs.nav_error = None;
         }
@@ -644,6 +648,16 @@ async fn create_pooled_page(
     // updates to ``capture_console_level`` via update_config don't re-arm
     // these listeners.
     let console_messages: Arc<Mutex<Vec<ConsoleMessageRs>>> = Arc::new(Mutex::new(Vec::new()));
+    // Seed from the live frame tree: the tab's first `about:blank` navigation
+    // happens before these listeners attach, so frameNavigated alone would leave
+    // this unset for the first fetch.
+    let main_frame_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(
+        page.mainframe()
+            .await
+            .ok()
+            .flatten()
+            .map(|f| f.inner().clone()),
+    ));
     let response: Arc<Mutex<ResponseState>> = Arc::new(Mutex::new(ResponseState::default()));
     let current_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let auth_fetch_active = proxy_creds.is_some();
@@ -753,13 +767,19 @@ async fn create_pooled_page(
         // the parsed set (no Set-Cookie); if the matching extraInfo already
         // arrived we upgrade to its raw headers + verbatim wire text.
         let resp_cl = response.clone();
+        let main_frame_for_resp = main_frame_id.clone();
         let mut resp_stream = page
             .event_listener::<EventResponseReceived>()
             .await
             .map_err(OnyxError::from)?;
         tokio::spawn(async move {
             while let Some(evt) = resp_stream.next().await {
-                if matches!(evt.r#type, ResourceType::Document) {
+                let is_main_frame = evt
+                    .frame_id
+                    .as_ref()
+                    .zip(main_frame_for_resp.lock().as_ref())
+                    .is_some_and(|(f, m)| f.inner() == m);
+                if matches!(evt.r#type, ResourceType::Document) && is_main_frame {
                     let resp = &evt.response;
                     let rid = evt.request_id.inner().clone();
                     let status = resp.status as u16;
@@ -834,6 +854,7 @@ async fn create_pooled_page(
         // (type Document) we record each hop (url, status, remote ip) in order,
         // giving callers the full redirect chain (matches blasthttp).
         let redir_cl = response.clone();
+        let main_frame_for_req = main_frame_id.clone();
         let mut req_stream = page
             .event_listener::<EventRequestWillBeSent>()
             .await
@@ -843,7 +864,20 @@ async fn create_pooled_page(
                 if !matches!(evt.r#type, Some(ResourceType::Document)) {
                     continue;
                 }
-                if let Some(resp) = &evt.redirect_response {
+                if let Some(fid) = &evt.frame_id {
+                    redir_cl
+                        .lock()
+                        .doc_frames
+                        .insert(evt.request_id.inner().clone(), fid.inner().clone());
+                }
+                let is_main_frame = evt
+                    .frame_id
+                    .as_ref()
+                    .zip(main_frame_for_req.lock().as_ref())
+                    .is_some_and(|(f, m)| f.inner() == m);
+                if let Some(resp) = &evt.redirect_response
+                    && is_main_frame
+                {
                     redir_cl.lock().redirects.push(RedirectHopRs {
                         url: resp.url.clone(),
                         status: resp.status as u16,
@@ -856,7 +890,10 @@ async fn create_pooled_page(
         // Network.loadingFailed — a main-document failure (DNS, connection
         // refused). Skips intentional aborts; capture_page surfaces it since the
         // error page otherwise fires a lifecycle event and looks like success.
+        // Subframe documents fail routinely (blocked trackers, dead embeds) and
+        // must not fail the parent page, so the frame is checked first.
         let fail_cl = response.clone();
+        let main_frame_for_fail = main_frame_id.clone();
         let mut fail_stream = page
             .event_listener::<EventLoadingFailed>()
             .await
@@ -864,7 +901,12 @@ async fn create_pooled_page(
         tokio::spawn(async move {
             while let Some(evt) = fail_stream.next().await {
                 if matches!(evt.r#type, ResourceType::Document) && evt.canceled != Some(true) {
-                    fail_cl.lock().nav_error = Some(evt.error_text.clone());
+                    let mut rs = fail_cl.lock();
+                    let failed_frame = rs.doc_frames.get(evt.request_id.inner()).cloned();
+                    let main = main_frame_for_fail.lock().clone();
+                    if failed_frame.is_some() && failed_frame == main {
+                        rs.nav_error = Some(evt.error_text.clone());
+                    }
                 }
             }
         });
@@ -873,6 +915,7 @@ async fn create_pooled_page(
         // (full nav). Updates current_url so we can detect when an upcoming
         // fetch is a same-document navigation.
         let url_cl_full = current_url.clone();
+        let main_frame_for_nav = main_frame_id.clone();
         let mut frame_nav_stream = page
             .event_listener::<EventFrameNavigated>()
             .await
@@ -881,6 +924,7 @@ async fn create_pooled_page(
             while let Some(evt) = frame_nav_stream.next().await {
                 if evt.frame.parent_id.is_none() {
                     *url_cl_full.lock() = Some(evt.frame.url.clone());
+                    *main_frame_for_nav.lock() = Some(evt.frame.id.inner().clone());
                 }
             }
         });
