@@ -48,10 +48,8 @@ def test_shadow_content_recovered_on_real_site() -> None:
     deep = _fetch(include_shadow_dom=True)
 
     # lit.dev's own components; their markup only exists inside shadow roots.
-    assert "<litdev-cookie-banner" in plain.dom.html(), "sanity: host element is light-DOM"
-    assert len(deep.dom.html()) > len(plain.dom.html()), (
-        "shadow-inclusive capture should be strictly larger"
-    )
+    assert "<litdev-cookie-banner" in plain.html, "sanity: host element is light-DOM"
+    assert len(deep.html) > len(plain.html), "shadow-inclusive capture should be strictly larger"
     # The banner's rendered text lives inside the component's shadow root.
-    assert "Cookies consent notice" not in plain.dom.html()
-    assert "Cookies consent notice" in deep.dom.html()
+    assert "Cookies consent notice" not in plain.html
+    assert "Cookies consent notice" in deep.html

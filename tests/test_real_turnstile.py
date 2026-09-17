@@ -67,7 +67,7 @@ def test_interactive_gate_reports_unresolved() -> None:
 def test_include_shadow_dom_recovers_real_widget_markup() -> None:
     """Turnstile's widget lives in a closed shadow root — captured only when enabled."""
     plain = _fetch("managed.html")
-    assert "challenges.cloudflare.com/cdn-cgi" not in plain.dom.html()
+    assert "challenges.cloudflare.com/cdn-cgi" not in plain.html
 
     try:
         with onyxweb.Client(
@@ -76,5 +76,5 @@ def test_include_shadow_dom_recovers_real_widget_markup() -> None:
             deep = c.fetch(BASE + "managed.html", wait_after_ms=SETTLE_MS)
     except (onyxweb.OnyxwebError, TimeoutError) as e:
         pytest.skip(f"unreachable: {e}")
-    assert "challenges.cloudflare.com/cdn-cgi" in deep.dom.html()
+    assert "challenges.cloudflare.com/cdn-cgi" in deep.html
     assert deep.dom.query_one("iframe") is not None

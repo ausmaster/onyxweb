@@ -37,7 +37,7 @@ def test_block_navigation_doesnt_block_initial_page_load(httpserver: HTTPServer)
     with onyxweb.Client() as c:
         r = c.fetch(httpserver.url_for("/"), block_navigation=True)
 
-    assert "initial-loaded" in r, f"initial load was blocked? html={r[:200]}"
+    assert "initial-loaded" in r, f"initial load was blocked? html={r.html[:200]}"
     assert r.status_code == 200
 
 
@@ -97,7 +97,7 @@ def test_block_navigation_prevents_js_redirect_from_click(
         f"block_navigation didn't prevent nav; final_url={r.final_url}"
     )
     # The captured HTML reflects the original page (we never left).
-    assert "ORIGINAL_PAGE" in r, f"page changed despite block_navigation; html={r[:300]}"
+    assert "ORIGINAL_PAGE" in r, f"page changed despite block_navigation; html={r.html[:300]}"
 
 
 # ----------------------------------------------------------------------------
@@ -129,7 +129,7 @@ def test_block_navigation_doesnt_leak_to_next_fetch(httpserver: HTTPServer) -> N
         r2 = c.fetch(httpserver.url_for("/two"))
 
     assert "PAGE_TWO_LOADED" in r2, (
-        f"second fetch didn't load (Fetch domain leak from #1); html={r2[:300]}"
+        f"second fetch didn't load (Fetch domain leak from #1); html={r2.html[:300]}"
     )
     assert r2.status_code == 200
 
@@ -162,7 +162,7 @@ def test_block_navigation_cleanup_after_action_triggered_nav_attempt(
         r2 = c.fetch(httpserver.url_for("/elsewhere"))
 
     assert "ELSEWHERE_REACHED" in r2, (
-        f"normal navigation broken after block_navigation cleanup; html={r2[:300]}"
+        f"normal navigation broken after block_navigation cleanup; html={r2.html[:300]}"
     )
 
 

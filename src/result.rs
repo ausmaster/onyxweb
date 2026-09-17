@@ -104,7 +104,17 @@ impl RawRenderOutput {
     /// Build a Dom from the HTML (lazy-parse on first query). Called from
     /// Python-side RenderResult.dom property.
     fn make_dom(&self) -> Dom {
-        Dom::from_html(self.html.clone())
+        Dom::new(self.html.clone(), Some(self.final_url.clone()))
+    }
+
+    /// Case-sensitive substring test over the captured HTML, like `str.__contains__`.
+    fn contains(&self, needle: &str) -> bool {
+        self.html.contains(needle)
+    }
+
+    /// Characters of captured HTML, like `len()` on the Python string.
+    fn char_len(&self) -> usize {
+        self.html.chars().count()
     }
 }
 
@@ -173,6 +183,16 @@ pub struct RawFetchOutput {
 #[pymethods]
 impl RawFetchOutput {
     fn make_dom(&self) -> Dom {
-        Dom::from_html(self.html.clone())
+        Dom::new(self.html.clone(), Some(self.final_url.clone()))
+    }
+
+    /// See `RawRenderOutput::contains`.
+    fn contains(&self, needle: &str) -> bool {
+        self.html.contains(needle)
+    }
+
+    /// See `RawRenderOutput::char_len`.
+    fn char_len(&self) -> usize {
+        self.html.chars().count()
     }
 }

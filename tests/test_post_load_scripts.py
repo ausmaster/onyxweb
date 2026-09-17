@@ -102,7 +102,7 @@ def test_post_load_script_dom_mutation_reflected_in_capture() -> None:
             ],
         )
 
-    assert "MUTATED_BY_PLS" in r, f"PLS mutation missing from capture: {r[:300]}"
+    assert "MUTATED_BY_PLS" in r, f"PLS mutation missing from capture: {r.html[:300]}"
     assert "ORIGINAL" not in r
 
 
@@ -274,7 +274,7 @@ def test_post_load_script_async_iife_is_awaited() -> None:
     assert 'data-mark="AWAITED"' in r, (
         "page.evaluate did NOT await the async IIFE — the post-load timeout "
         "fired and capture happened before the script's async work completed. "
-        f"html: {r[:300]}"
+        f"html: {r.html[:300]}"
     )
 
 

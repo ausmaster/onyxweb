@@ -29,7 +29,7 @@ def test_module_fetch_all() -> None:
     assert isinstance(fr.html, onyxweb.RenderResult)
     assert fr.png.startswith(PNG_MAGIC)
     assert "Example Domain" in fr.html
-    assert fr.html.dom.title() == "Example Domain"
+    assert fr.html.title == "Example Domain"
 
 
 def test_client_context_manager_closes_cleanly() -> None:

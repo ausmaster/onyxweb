@@ -105,7 +105,7 @@ def test_click_action_html_capture_reflects_post_action_state(
         )
 
     assert 'data-clicked="yes"' in r, (
-        f"action ran but HTML capture missed the post-action state: {r[:200]}"
+        f"action ran but HTML capture missed the post-action state: {r.html[:200]}"
     )
 
 

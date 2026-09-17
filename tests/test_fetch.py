@@ -59,9 +59,11 @@ class TestFetchTopLevel:
         result = onyxweb.fetch(HTTPS_URL)
         assert result.html == str(result)
 
-    def test_fetch_is_string(self) -> None:
+    def test_fetch_html_is_a_real_string(self) -> None:
+        """``.html`` is what regex, BeautifulSoup and file writes take."""
         result = onyxweb.fetch(HTTPS_URL)
-        assert isinstance(result, str)
+        assert isinstance(result.html, str)
+        assert "Example Domain" in result.html
 
     def test_fetch_invalid_url_raises(self) -> None:
         # chromium treats "not-a-url" as a host and hangs, so this surfaces as a
@@ -105,28 +107,36 @@ class TestFetchClient:
 
 
 class TestRenderResult:
-    """RenderResult is a str subclass with extra metadata + a lazy Rust DOM."""
+    """RenderResult is a structured result, not a str; raw access survives."""
 
-    def test_is_str_subclass(self) -> None:
+    def test_is_not_a_str(self) -> None:
+        """Dropping the base frees names like ``title`` for the page itself."""
         result = onyxweb.fetch(HTTPS_URL)
-        assert isinstance(result, str)
-        # str operations work
-        assert result.lower() == str(result).lower()
-        assert result[:15] == str(result)[:15]
+        assert not isinstance(result, str)
+        assert result.title == "Example Domain"
 
-    def test_dom_lazy_parses_and_queries(self) -> None:
+    def test_raw_access_still_works(self) -> None:
         result = onyxweb.fetch(HTTPS_URL)
-        # Title query
-        title = result.dom.title()
-        assert title == "Example Domain"
-        # Links query
-        links = result.dom.links()
-        assert isinstance(links, list)
-        # Count query stops at first match
-        assert result.dom.exists("h1") is True
-        assert result.dom.exists("fakeneverexists") is False
+        html = result.html
+        assert str(result) == html
+        assert "Example Domain" in result
+        assert "surely-not-present-xyz" not in result
+        assert len(result) == len(html)
+
+    def test_contains_is_case_sensitive_like_str(self) -> None:
+        """``in`` keeps ``str`` semantics even though Rust answers it."""
+        result = onyxweb.fetch(HTTPS_URL)
+        assert "Example Domain" in result
+        assert "EXAMPLE DOMAIN" not in result
+
+    def test_len_and_contains_do_not_materialize(self) -> None:
+        result = onyxweb.fetch(HTTPS_URL)
+        assert len(result) > 0
+        assert "Example" in result
+        assert result._html is None
 
     def test_repr_shape(self) -> None:
         result = onyxweb.fetch(HTTPS_URL)
         r = repr(result)
-        assert r.startswith("RenderResult(")
+        assert r.startswith("<RenderResult ")
+        assert len(r) < 200

@@ -41,7 +41,7 @@ def test_alert_does_not_hang_the_fetch() -> None:
     with onyxweb.Client(navigation_timeout_ms=5000) as c:
         r = c.fetch(url)
 
-    assert "OK" in r, f"page didn't load past alert(); html: {r[:200]}"
+    assert "OK" in r, f"page didn't load past alert(); html: {r.html[:200]}"
     assert r.status_code == 200
 
 
@@ -65,7 +65,7 @@ def test_confirm_returns_false_when_auto_dismissed() -> None:
         r = c.fetch(url)
 
     assert 'data-branch="dismissed"' in r, (
-        f"confirm() didn't return false; html: {r[:300]}"
+        f"confirm() didn't return false; html: {r.html[:300]}"
     )
 
 
@@ -85,7 +85,7 @@ def test_prompt_returns_null_when_auto_dismissed() -> None:
         r = c.fetch(url)
 
     assert 'data-result="null"' in r, (
-        f"prompt() didn't return null; html: {r[:300]}"
+        f"prompt() didn't return null; html: {r.html[:300]}"
     )
 
 
@@ -108,7 +108,7 @@ def test_multiple_dialogs_in_sequence_all_dismissed() -> None:
         r = c.fetch(url)
 
     assert 'data-results="confirm=false;prompt=null"' in r, (
-        f"sequential dialogs didn't all dismiss; html: {r[:400]}"
+        f"sequential dialogs didn't all dismiss; html: {r.html[:400]}"
     )
 
 
