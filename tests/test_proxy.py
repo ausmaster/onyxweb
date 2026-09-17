@@ -150,7 +150,7 @@ def test_proxy_basic_auth_succeeds(
     authed = proxy_url.replace("http://", "http://bob:s3cr3t@")
     with onyxweb.Client(proxy=authed, proxy_bypass_list=_BYPASS) as c:
         r = c.fetch(url)
-    assert "PROXIED_OK" in r, f"auth proxy did not let us through; html={r[:200]!r}"
+    assert "PROXIED_OK" in r, f"auth proxy did not let us through; html={r.html[:200]!r}"
     assert state.saw_valid_auth, "proxy never received valid credentials"
 
 

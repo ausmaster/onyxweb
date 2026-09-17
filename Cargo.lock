@@ -923,6 +923,7 @@ dependencies = [
  "percent-encoding",
  "pyo3",
  "pyo3-async-runtimes",
+ "regex",
  "scraper",
  "serde",
  "serde_json",

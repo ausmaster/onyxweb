@@ -1,4 +1,4 @@
-"""`.dom.text()` returns what the page displays, not its scripts.
+"""`RenderResult.text` returns what the page displays, not its scripts.
 
 A text node inside `<script>` or `<style>` is code, not content. Concatenating
 it buries the page's words: measured on saved captures, script contents are
@@ -33,11 +33,11 @@ _NOISE = ("JS_NOISE", "CSS_NOISE", "INLINE_JS_NOISE", "INLINE_CSS_NOISE",
 
 def test_text_excludes_script_and_style(data_url: DataUrl) -> None:
     r = onyxweb.fetch(data_url(_PAGE))
-    text = r.dom.text()
+    text = r.text
     assert "Visible Heading" in text
     assert "Body sentence." in text
     for noise in _NOISE:
-        assert noise not in text, f"{noise} leaked into .dom.text()"
+        assert noise not in text, f"{noise} leaked into .text"
 
 
 def test_element_text_excludes_script(data_url: DataUrl) -> None:

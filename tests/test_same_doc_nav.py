@@ -110,7 +110,7 @@ def test_same_doc_with_init_scripts_forces_full_nav(httpserver: HTTPServer) -> N
         r2 = c.fetch(base + "#x", scripts=[init_script])
         assert r2.status_code == 200
         assert "hooked" in r2, (
-            f"init_script didn't run on same-doc + init_scripts case; html: {r2[:300]!r}"
+            f"init_script didn't run on same-doc + init_scripts case; html: {r2.html[:300]!r}"
         )
         # final_url contains the cache-buster, marking the full-nav route.
         assert "__onyxweb_t=" in r2.final_url, (

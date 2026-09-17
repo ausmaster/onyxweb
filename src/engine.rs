@@ -193,6 +193,15 @@ pub async fn capture_page(
     let t0 = Instant::now();
     log::debug!(target: "onyxweb::engine", "[{url}] capture_page mode={mode:?}");
 
+    // Reject an unusable URL before touching the tab. Chrome answers its
+    // `Page.navigate` with an error at once, but chromiumoxide holds that error
+    // for a navigation that never starts, so the fetch would sit out its timeout.
+    if let Err(e) = url::Url::parse(url) {
+        return Err(OnyxError::InvalidUrl(format!(
+            "{url:?} ({e}); pass an absolute URL with a scheme, e.g. \"https://example.com/\""
+        )));
+    }
+
     let timeout_ms = per_call
         .timeout_ms
         .or(per_shot.timeout_ms)
@@ -441,7 +450,7 @@ pub async fn capture_page(
                         last_len = probe.len();
                         if !looks_like_challenge(&probe)
                             && stable
-                            && probe.len() > CHALLENGE_STUB_MAX_BYTES
+                            && probe.len() > RESOLVED_PAGE_MIN_BYTES
                         {
                             break;
                         }
@@ -812,7 +821,7 @@ pub async fn capture_page(
     if matches!(&fut_result, Err(_) | Ok(Err(_))) {
         // Reset the tab; if that fails (wedged by a stuck nav, or the target
         // died) mark it so the pool recreates it before the next fetch.
-        let reset = tokio::time::timeout(Duration::from_secs(2), page.goto("about:blank")).await;
+        let reset = tokio::time::timeout(RESET_TIMEOUT, page.goto("about:blank")).await;
         if !matches!(reset, Ok(Ok(_))) {
             guard.mark_poisoned();
         }
@@ -871,6 +880,11 @@ pub async fn capture_page(
     Ok(result)
 }
 
+/// How long a failed fetch waits for its tab to reset to `about:blank`. A healthy
+/// reset takes about 5 ms; after a stuck navigation it never completes and the tab
+/// is recreated instead (about 23 ms), so a longer wait only delays the error.
+const RESET_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Max time to wait for an anti-bot challenge interstitial to self-resolve.
 const CHALLENGE_MAX_WAIT_MS: u64 = 12_000;
 /// Poll interval while waiting for a challenge to resolve.
@@ -879,6 +893,12 @@ const CHALLENGE_POLL_MS: u64 = 500;
 /// A real page behind these WAFs is large; a challenge interstitial is a tiny
 /// stub. Signals that ALSO leak onto normal pages only count below this size.
 const CHALLENGE_STUB_MAX_BYTES: usize = 30_720;
+
+/// Smallest page the bypass wait accepts as the resolved one; less after a
+/// challenge reload is still the thin early page. Kept apart from
+/// `CHALLENGE_STUB_MAX_BYTES`, which tunes detection — sharing one constant made
+/// resolved pages of 15-30 KB wait out the whole `CHALLENGE_MAX_WAIT_MS`.
+const RESOLVED_PAGE_MIN_BYTES: usize = 15_000;
 
 /// Anti-bot challenge/interstitial detector — a small "checking your browser /
 /// verify you're human" page a WAF serves before the real one, which typically

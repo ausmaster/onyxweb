@@ -16,7 +16,7 @@ async def test_async_client_fetch() -> None:
         r = await ac.fetch(URL)
     assert isinstance(r, onyxweb.RenderResult)
     assert "Example Domain" in r
-    assert r.dom.title() == "Example Domain"
+    assert r.title == "Example Domain"
 
 
 async def test_async_client_screenshot() -> None:

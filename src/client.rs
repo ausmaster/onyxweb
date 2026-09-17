@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chromiumoxide::browser::BrowserConfigBuilder;
+use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use pyo3::prelude::*;
@@ -260,8 +261,7 @@ fn derive_chrome_ua(chrome_path: &Path) -> Option<String> {
 /// `update_config` can swap atomically without blocking in-flight fetches.
 struct ClientState {
     runtime: Arc<tokio::runtime::Runtime>,
-    /// Keeps the browser process alive while the pool exists.
-    #[allow(dead_code)]
+    /// Keeps the browser process alive while the pool exists; `close` shuts it down.
     browser: Arc<Browser>,
     pool: Arc<PagePool>,
     handler_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -401,13 +401,30 @@ async fn do_batch_inner(
     collected
 }
 
+/// Longest `close` waits for Chrome to shut down. A healthy shutdown takes about
+/// 10 ms; this only bites when Chrome has stopped responding, and such a process
+/// is still killed when the Client is freed.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn do_close_inner(state: Arc<ClientState>) {
-    state.pool.close_all().await;
-    // Drop the MutexGuard before any await — `take()` detaches the
-    // JoinHandle so we can join it without holding the lock.
-    let task_opt = state.handler_task.lock().take();
-    if let Some(task) = task_opt {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    // One budget for the whole shutdown: a frozen Chrome answers none of these
+    // commands, and chromiumoxide's own request timeout doesn't bound them.
+    let shutdown = async {
+        state.pool.close_all().await;
+        // The handler task ends only once the browser goes away, so tell Chrome
+        // to exit before joining it.
+        let _ = state.browser.execute(CloseParams::default()).await;
+        // `take()` detaches the JoinHandle so the lock isn't held across the join.
+        let task = state.handler_task.lock().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(CLOSE_TIMEOUT, shutdown).await.is_err() {
+        log::warn!(
+            target: "onyxweb::client",
+            "Chrome did not shut down within {CLOSE_TIMEOUT:?}; it will be killed when the Client is freed"
+        );
     }
     // Best-effort: a leftover temp dir must never surface as a close() error.
     if let Some(dir) = &state.ephemeral_profile {

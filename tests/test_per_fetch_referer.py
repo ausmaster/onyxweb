@@ -47,7 +47,7 @@ def test_referer_appears_in_document_referrer_js(httpserver: HTTPServer) -> None
             extra_headers={"Referer": "http://foo.bar/PAGE"},
             wait_after_ms=100,
         )
-    assert "http://foo.bar/PAGE" in r, f"document.referrer not in HTML: {r[:300]!r}"
+    assert "http://foo.bar/PAGE" in r, f"document.referrer not in HTML: {r.html[:300]!r}"
 
 
 def test_same_origin_referer_still_works(httpserver: HTTPServer) -> None:

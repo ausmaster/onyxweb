@@ -15,7 +15,7 @@ Typical usage::
     # Explicit Client for batch / tuning
     with onyxweb.Client(concurrency=16) as client:
         for result in client.batch(urls, capture="both"):
-            title = result.html.dom.title()
+            title = result.html.title
             ...
 
 All HTML search (``.dom.query()``, ``.dom.find()``, etc.) runs in Rust for
@@ -30,7 +30,8 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from functools import cached_property
+from typing import Any, Literal, Protocol, overload
 
 from pydantic import BaseModel as _BaseModel
 
@@ -67,6 +68,26 @@ from onyxweb.download import (
     aensure_chrome as aensure_chrome,
     ensure_chrome as ensure_chrome,
     find_chrome as find_chrome,
+)
+from onyxweb.records import (
+    PAGE_BUCKETS,
+    Bucket,
+    BucketView,
+    Comment,
+    Content,
+    Form,
+    Frame,
+    Image,
+    JsonLd,
+    Link,
+    Meta,
+    Overview,
+    OverviewRow,
+    Resources,
+    Script,
+    Style,
+    overview_str,
+    size_str,
 )
 
 # Configure Python-side logging at import from ONYXWEB_LOG (defaults "warn").
@@ -451,7 +472,6 @@ def _make_render_result(raw: _RenderOutput | _FetchOutput) -> RenderResult:
     errors = [m.text for m in console_messages if m.type == "error"]
     post_load_results = [json.loads(s) if s is not None else None for s in raw.post_load_results]
     return RenderResult(
-        raw.html,
         errors=errors,
         console_messages=console_messages,
         final_url=raw.final_url,
@@ -465,8 +485,17 @@ def _make_render_result(raw: _RenderOutput | _FetchOutput) -> RenderResult:
     )
 
 
-class RenderResult(str):
-    """Fully-rendered post-JS HTML. Subclasses ``str`` (lxml, regex, BS4 work).
+class RenderResult:
+    """A captured page, sorted into buckets.
+
+    The document itself stays in Rust until you ask for it — ``str(r)`` and
+    ``r.html`` materialize it, ``"x" in r`` and ``len(r)`` answer without
+    copying. Pass ``r.html`` to anything that needs a real ``str`` (``re``,
+    BeautifulSoup, ``file.write``).
+
+    Buckets — ``.scripts`` / ``.styles`` / ``.links`` / ``.images`` /
+    ``.iframes`` / ``.forms`` / ``.meta`` / ``.comments`` / ``.json_ld`` — are
+    lazy: sizing or printing one costs nothing until records are read.
 
     Adds:
       - ``.errors`` — list[str] of console errors and load errors
@@ -482,7 +511,7 @@ class RenderResult(str):
       - ``.headers`` — :class:`ResponseHeaders` (case-insensitive mapping of
         the response headers, ``.set_cookie`` / ``.cookies``, canonical
         ``.raw``, ``.hashes``)
-      - ``.dom`` — Rust-side HTML query (lazy; CSS selectors + BS4-like find)
+      - ``.dom`` — Rust-side CSS selection (lazy)
     """
 
     errors: list[str]
@@ -496,10 +525,11 @@ class RenderResult(str):
     anti_bot: AntiBot | None
     _raw: _RenderOutput | _FetchOutput | None
     _dom: Dom | None
+    _html: str | None
 
-    def __new__(
-        cls,
-        html: str,
+    def __init__(
+        self,
+        html: str | None = None,
         *,
         errors: list[str] | None = None,
         console_messages: list[ConsoleMessage] | None = None,
@@ -511,22 +541,25 @@ class RenderResult(str):
         headers: ResponseHeaders | None = None,
         anti_bot: AntiBot | None = None,
         _raw: _RenderOutput | _FetchOutput | None = None,
-    ) -> RenderResult:
-        """Construct a RenderResult; ``_raw`` is internal (Rust output object)."""
-        instance = super().__new__(cls, html)
-        instance.errors = errors or []
-        instance.console_messages = console_messages or []
-        instance.final_url = final_url
-        instance.status_code = status_code
-        instance.elapsed_s = elapsed_s
-        instance.post_load_results = post_load_results or []
-        instance.anti_bot = anti_bot
-        instance.headers = (
+    ) -> None:
+        """Construct a RenderResult; ``_raw`` is internal (Rust output object).
+
+        `html` is optional: when `_raw` is present the document is pulled from
+        Rust on first access instead of being copied in up front.
+        """
+        self.errors = errors or []
+        self.console_messages = console_messages or []
+        self.final_url = final_url
+        self.status_code = status_code
+        self.elapsed_s = elapsed_s
+        self.post_load_results = post_load_results or []
+        self.anti_bot = anti_bot
+        self.headers = (
             headers
             if headers is not None
             else ResponseHeaders([], "", Hashes(md5="", mmh3=0, sha256=""))
         )
-        instance.metadata = metadata or ResponseMetadata(
+        self.metadata = metadata or ResponseMetadata(
             status_code=status_code,
             status_text="",
             mime_type="",
@@ -542,14 +575,16 @@ class RenderResult(str):
             final_url=final_url,
             elapsed_s=elapsed_s,
         )
-        instance._raw = _raw
-        instance._dom = None
-        return instance
+        self._raw = _raw
+        self._dom = None
+        self._html = html
 
     @property
     def html(self) -> str:
-        """The raw rendered HTML as a plain ``str`` (same as ``str(self)``)."""
-        return str(self)
+        """The captured HTML as a plain ``str``. Copies out of Rust once."""
+        if self._html is None:
+            self._html = self._raw.html if self._raw is not None else ""
+        return self._html
 
     @property
     def dom(self) -> Dom:
@@ -564,14 +599,171 @@ class RenderResult(str):
             object.__setattr__(self, "_dom", dom)
         return dom
 
+    @cached_property
+    def _page(self) -> BucketView:
+        """Every bucket, unfiltered, over this result's single parse."""
+        return BucketView(self.dom.buckets, {})
+
+    @cached_property
+    def content(self) -> Content:
+        """What lives in the document itself — inline code, comments, forms, meta."""
+        return Content(self.dom.buckets)
+
+    @cached_property
+    def resources(self) -> Resources:
+        """What the document points the browser at — external code, images, links."""
+        return Resources(self.dom.buckets)
+
+    @property
+    def scripts(self) -> Bucket[Script]:
+        """Every ``<script>`` — inline source and the URLs the page pulls in."""
+        return self._page._bucket("scripts")
+
+    @property
+    def styles(self) -> Bucket[Style]:
+        """Every ``<style>`` body and stylesheet ``<link>``."""
+        return self._page._bucket("styles")
+
+    @property
+    def links(self) -> Bucket[Link]:
+        """Every ``<a href>`` — where the page points, not what it loads."""
+        return self._page._bucket("links")
+
+    @property
+    def images(self) -> Bucket[Image]:
+        """Every ``<img src>``."""
+        return self._page._bucket("images")
+
+    @property
+    def iframes(self) -> Bucket[Frame]:
+        """Every ``<iframe>`` — inline ``srcdoc`` bodies and framed documents."""
+        return self._page._bucket("iframes")
+
+    @property
+    def forms(self) -> Bucket[Form]:
+        """Every ``<form>`` and the fields it submits, hidden ones included."""
+        return self._page._bucket("forms")
+
+    @property
+    def meta(self) -> Bucket[Meta]:
+        """Every ``<meta>``; ``name`` / ``property`` / ``http-equiv`` fold to one key."""
+        return self._page._bucket("meta")
+
+    @property
+    def comments(self) -> Bucket[Comment]:
+        """Every HTML comment, in document order."""
+        return self._page._bucket("comments")
+
+    @property
+    def json_ld(self) -> Bucket[JsonLd]:
+        """Every ``application/ld+json`` block, decoded; malformed ones skipped."""
+        return self._page._bucket("json_ld")
+
+    @property
+    def text(self) -> str:
+        """What the page displays — script and style source excluded."""
+        return self.dom.buckets.text()
+
+    @property
+    def title(self) -> str | None:
+        """The ``<title>`` text, or ``None`` when the page has none."""
+        return self.dom.buckets.title()
+
+    @overload
+    def overview(self, prnt: Literal[False] = False) -> Overview: ...
+
+    @overload
+    def overview(self, prnt: Literal[True]) -> None: ...
+
+    def overview(self, prnt: bool = False) -> Overview | None:
+        """Query/print every bucket's count and size, read from the parse.
+
+        Builds no record, so it stays cheap on a page of any size.
+
+        Args:
+            prnt: If True, prints the overview table instead of returning it;
+                always returns None.
+
+        Returns:
+            `Overview`; None if prnt.
+        """
+        rows, text_size, total_size = self.dom.buckets.counts()
+        overview = Overview([OverviewRow(*row) for row in rows], text_size, total_size)
+        if prnt:
+            print(overview_str(overview))
+            return None
+        return overview
+
+    def search(
+        self,
+        query: str,
+        *,
+        field: str | None = None,
+        case_sensitive: bool = False,
+        regex: bool = False,
+    ) -> dict[str, Bucket[Any]]:
+        """Search every bucket at once and keep the ones with a match.
+
+        Args:
+            query: Text to find — a substring, or a pattern when `regex` is set.
+            field: Search only this record field. Buckets whose records have no
+                such field are skipped rather than raising.
+            case_sensitive: Match letter case exactly. Off by default.
+            regex: Treat `query` as a Rust ``regex`` pattern — linear time, so no
+                lookaround or backreferences.
+
+        Returns:
+            Bucket name -> lazy bucket of its matches, in overview order; empty
+            when nothing matched.
+
+        Raises:
+            ValueError: If `query` is not a valid pattern.
+        """
+        hits: dict[str, Bucket[Any]] = {}
+        for name in PAGE_BUCKETS:
+            bucket = self._page._bucket(name)
+            if field is not None and field not in bucket.fields:
+                continue
+            found = bucket.search(query, field=field, case_sensitive=case_sensitive, regex=regex)
+            if len(found):
+                hits[name] = found
+        return hits
+
+    def __str__(self) -> str:
+        return self.html
+
+    def __contains__(self, needle: object) -> bool:
+        """Case-sensitive substring search over the whole document, like ``str``."""
+        if not isinstance(needle, str):
+            return False
+        # Scan the capture in Rust unless the HTML is already a Python string.
+        if self._html is None and self._raw is not None:
+            return self._raw.contains(needle)
+        return needle in self.html
+
+    def __len__(self) -> int:
+        """Characters of captured HTML, counted in Rust unless already copied out."""
+        if self._html is None and self._raw is not None:
+            return self._raw.char_len()
+        return len(self.html)
+
     def __repr__(self) -> str:
-        trunc = str(self)[:60] + "…" if len(self) > 60 else str(self)
-        parts = [f"html={trunc!r}"]
-        if self.final_url:
-            parts.append(f"final_url={self.final_url!r}")
+        if self._raw is None:
+            return f"<RenderResult {size_str(len(self.html.encode()))}>"
+        overview = self.overview()
+        totals: dict[str, int] = {}
+        for row in overview.rows:
+            totals[row.bucket] = totals.get(row.bucket, 0) + row.count
+        parts = [size_str(overview.total_size)]
+        parts += [f"{totals[name]} {name}" for name in ("scripts", "styles", "forms", "links")]
+        parts.append(f"{size_str(overview.text_size)} text")
         if self.errors:
-            parts.append(f"errors=[{len(self.errors)}]")
-        return f"RenderResult({', '.join(parts)})"
+            parts.append(f"{len(self.errors)} errors")
+        # A data: URL carries the whole page, so the URL is clipped.
+        url = self.final_url if len(self.final_url) <= 60 else self.final_url[:59] + "…"
+        if url:
+            parts.append(repr(url))
+        return f"<RenderResult {' · '.join(parts)}>"
 
 
 class FetchResult:
@@ -958,7 +1150,7 @@ class AsyncClient:
         >>> async def main():
         ...     async with onyxweb.AsyncClient() as ac:
         ...         result = await ac.fetch("https://example.com")
-        ...         print(result.dom.title())
+        ...         print(result.title)
         >>>
         >>> asyncio.run(main())
     """

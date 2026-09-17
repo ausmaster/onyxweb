@@ -38,7 +38,7 @@ def test_wait_after_post_load_ms_lets_async_work_finish(data_url: DataUrl) -> No
             post_load_scripts=[schedule_async_mutation],
             wait_after_post_load_ms=500,  # > 300ms scheduled deferral
         )
-    assert "POST_ASYNC_DONE" in r, f"settle window missed; html: {r[:200]!r}"
+    assert "POST_ASYNC_DONE" in r, f"settle window missed; html: {r.html[:200]!r}"
 
 
 def test_zero_default_no_wait(data_url: DataUrl) -> None:
