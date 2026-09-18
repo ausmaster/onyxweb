@@ -13,6 +13,7 @@ root::
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from inspect import signature
@@ -42,6 +43,9 @@ def _clip(s: str, width: int = _REPR_WIDTH) -> str:
 R = TypeVar("R", bound="DataclassInstance")
 
 Where = Literal["inline", "external"]
+
+#: A frame's side — or ``"blank"`` when it holds nothing and loads nothing.
+FrameWhere = Literal["inline", "external", "blank"]
 
 #: One search term, as Rust receives it: ``(needle, field, case_sensitive, regex)``.
 Query = tuple[str, str | None, bool, bool]
@@ -127,7 +131,7 @@ class Link:
 
 @dataclass(frozen=True, repr=False)
 class Image:
-    """One ``<img src>``.
+    """One ``<img>`` whose ``src`` fetches something — an empty or ``about:`` one doesn't.
 
     Attributes:
         url: Absolute URL. A ``data:`` URI resolves to itself, so it equals `raw`.
@@ -145,20 +149,24 @@ class Image:
 
 @dataclass(frozen=True, repr=False)
 class Frame:
-    """One ``<iframe>`` — an inline ``srcdoc`` body, or a document pulled in.
+    """One ``<iframe>`` — an inline ``srcdoc`` body, a document pulled in, or a blank frame.
 
     ``srcdoc`` wins over ``src``: the browser renders the body and never requests
     the ``src``. Such a frame is ``"inline"``, but keeps its unused ``src`` in
-    `url` / `raw` because a declared-but-dead address is a recon signal.
+    `url` / `raw` because a declared-but-dead address is a recon signal. A frame
+    with neither a body nor a ``src`` that fetches is ``"blank"`` — often an ad
+    slot a script fills — and belongs to neither ``content`` nor ``resources``.
 
     Attributes:
-        where: ``"external"`` only when the frame loads its ``src``.
+        where: ``"external"`` only when the frame loads its ``src``;
+            ``"blank"`` when it has no ``src``, an empty one, or an ``about:`` one.
         srcdoc: The inline document body, or ``None``.
-        url: Absolute URL of the ``src``, or ``None`` when there is none.
+        url: Absolute URL of the ``src``, or ``None`` when there is none. A blank
+            frame's ``src`` is kept as authored rather than resolved.
         raw: The ``src`` exactly as authored, or ``None``.
     """
 
-    where: Where
+    where: FrameWhere
     srcdoc: str | None
     url: str | None
     raw: str | None
@@ -200,14 +208,13 @@ class Form:
     inputs: list[Input]
 
     @classmethod
-    def _from_row(
-        cls, url: str, raw: str, method: str, inputs: list[dict[str, str]]
-    ) -> Form:
+    def _from_row(cls, url: str, raw: str, method: str, inputs: list[dict[str, str]]) -> Form:
         """Build from a Rust row, promoting nested field dicts to `Input`."""
         return cls(url=url, raw=raw, method=method, inputs=[Input(**i) for i in inputs])
 
     def __repr__(self) -> str:
-        return f"<Form {self.method} {_clip(self.url)!r} {len(self.inputs)} fields>"
+        fields = count_str(len(self.inputs), "field", "fields")
+        return f"<Form {self.method} {_clip(self.url)!r} {fields}>"
 
 
 @dataclass(frozen=True, repr=False)
@@ -216,9 +223,10 @@ class Meta:
 
     Attributes:
         name: The ``name``, ``property`` or ``http-equiv`` value — all three fold
-            here so a caller looks in one place. ``""`` when the tag carries none
-            (a bare ``charset``, say).
-        content: The ``content`` attribute, or ``""``.
+            here so a caller looks in one place. ``"charset"`` for a
+            ``<meta charset>``; ``""`` when nothing names the tag.
+        content: The ``content`` attribute — the encoding for a
+            ``<meta charset>`` — or ``""``.
     """
 
     name: str
@@ -275,9 +283,48 @@ class JsonLd:
     def __repr__(self) -> str:
         return f"<JsonLd {_clip(str(self.data))!r}>"
 
+
+@dataclass(frozen=True, repr=False)
+class Match:
+    """One place a query matched inside a bucket's records.
+
+    Attributes:
+        index: The record's position in the bucket searched, so
+            ``bucket[index]`` and ``bucket.text(index)`` reach it.
+        field: The record field holding the match — ``"text"``, ``"url"``, or one
+            with nested values such as ``"attrs"``.
+        text: The matched text, in the page's own letter case.
+        groups: Each capture group's text; ``None`` for a group that took no part.
+        start: Character offset of the match in the string it came from — the
+            field's own value, for a string field.
+        end: Character offset just past the match.
+    """
+
+    index: int
+    field: str
+    text: str
+    groups: tuple[str | None, ...]
+    start: int
+    end: int
+
+    @property
+    def value(self) -> str:
+        """The first capture group when it took part, else the whole match."""
+        first = self.groups[0] if self.groups else None
+        return self.text if first is None else first
+
+    def __repr__(self) -> str:
+        return f"<Match #{self.index} {self.field} {_clip(self.value)!r}>"
+
+
 # ----------------------------------------------------------------------------
 # Formatter — returns the table; callers print it
 # ----------------------------------------------------------------------------
+
+
+def count_str(n: int, singular: str, plural: str) -> str:
+    """Render a count with a noun that agrees. Ex: ``(1, "form", "forms")`` -> ``"1 form"``."""
+    return f"{n} {singular if n == 1 else plural}"
 
 
 def size_str(n: int | None) -> str:
@@ -294,34 +341,47 @@ def size_str(n: int | None) -> str:
     return f"{n} B"
 
 
-def bucket_str(header: str, total: int, rows: list[dict[str, Any]], column: str | None) -> str:
+def bucket_str(
+    header: str,
+    total: int,
+    rows: list[dict[str, Any]],
+    column: str | None,
+    preview: str = "preview",
+) -> str:
     """Render a bucket's head rows as a table under `header`.
 
     Args:
         header: Title line, e.g. ``"Scripts · 4 (2 inline, 2 external)"``.
         total: How many records the bucket holds in full.
-        rows: ``{where, size, preview}`` dicts from the Rust ``head`` call.
+        rows: ``{index, where, size, preview, count}`` dicts from the Rust
+            ``head`` or ``matches`` call.
         column: Title of the leading column — ``"where"`` or ``"kind"`` — or
             ``None`` to leave it out.
+        preview: Title of the last column.
 
     Returns:
         The table, title line first. The size column appears only when some row
-        carries bytes; a trailing line counts what the head left out.
+        carries bytes, and a ``×`` column only when a row stands for repeats; a
+        trailing line counts the records the head left out.
     """
-    show_size = any(row.get("size") is not None for row in rows)
+    show_size = any(row["size"] is not None for row in rows)
+    show_count = any(row["count"] > 1 for row in rows)
     head = [f"{'#':>3}"] + ([f"{column:<8}"] if column else [])
     head += [f"{'size':>7}"] if show_size else []
-    lines = [header, "  ".join([*head, "preview"])]
-    for i, row in enumerate(rows):
-        cells = [f"{i:>3}"]
+    head += [f"{'×':>4}"] if show_count else []
+    lines = [header, "  ".join([*head, preview])]
+    for row in rows:
+        cells = [f"{row['index']:>3}"]
         if column:
-            cells.append(f"{row.get('where') or '':<8}")
+            cells.append(f"{row['where'] or '':<8}")
         if show_size:
-            cells.append(f"{size_str(row.get('size')):>7}")
-        cells.append(str(row.get("preview") or ""))
+            cells.append(f"{size_str(row['size']):>7}")
+        if show_count:
+            cells.append(f"{row['count'] if row['count'] > 1 else '':>4}")
+        cells.append(str(row["preview"] or ""))
         lines.append("  ".join(cells))
-    if len(rows) < total:
-        lines.append(f"… {total - len(rows)} more · [i] for one · .search(q) to filter")
+    if (shown := sum(row["count"] for row in rows)) < total:
+        lines.append(f"… {total - shown} more · [i] for one · .search(q) to filter")
     return "\n".join(lines)
 
 
@@ -331,7 +391,7 @@ class OverviewRow:
     """One line of an `Overview` — a bucket, or one side of a split bucket."""
 
     bucket: str
-    where: Where | None
+    where: FrameWhere | None
     count: int
     size: int | None  # bytes in the document; None when the bytes aren't in it
 
@@ -397,6 +457,7 @@ class Bucket(Sequence[R]):
         "_label",
         "_factory",
         "_column",
+        "_body",
         "_where",
         "_queries",
         "_records",
@@ -407,6 +468,7 @@ class Bucket(Sequence[R]):
     _label: str
     _factory: Callable[..., R]
     _column: str | None
+    _body: tuple[str, ...]
     _where: Where | None
     _queries: tuple[Query, ...]
     _records: list[R] | None
@@ -419,6 +481,7 @@ class Bucket(Sequence[R]):
         factory: Callable[..., R],
         *,
         column: str | None = None,
+        body: tuple[str, ...] = (),
         where: Where | None = None,
         queries: tuple[Query, ...] = (),
     ) -> None:
@@ -427,6 +490,7 @@ class Bucket(Sequence[R]):
         self._label = label
         self._factory = factory
         self._column = column
+        self._body = body
         self._where = where
         self._queries = queries
         self._records = None
@@ -503,9 +567,120 @@ class Bucket(Sequence[R]):
             self._label,
             self._factory,
             column=self._column,
+            body=self._body,
             where=self._where,
             queries=(*self._queries, term),
         )
+
+    @overload
+    def matches(
+        self,
+        query: str,
+        *,
+        field: str | None = None,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        prnt: Literal[False] = False,
+    ) -> list[Match]: ...
+
+    @overload
+    def matches(
+        self,
+        query: str,
+        *,
+        field: str | None = None,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        prnt: Literal[True],
+    ) -> None: ...
+
+    def matches(
+        self,
+        query: str,
+        *,
+        field: str | None = None,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        prnt: bool = False,
+    ) -> list[Match] | None:
+        """Query/print every place `query` matches in this bucket's records.
+
+        Where `search` keeps whole records, this hands back the matched text, so a
+        key inside a 700 KB script comes back without the script. It reads the
+        strings `search` reads, in record order; a text that an earlier field of
+        one record already matched counts once — a URL sits in ``url``, ``raw``
+        and ``attrs`` alike. Matching runs in Rust.
+
+        Args:
+            query: Text to find — a substring, or a pattern when `regex` is set.
+            field: Match only inside this record field; see `fields`.
+            case_sensitive: Match letter case exactly. Off by default.
+            regex: Treat `query` as a Rust ``regex`` pattern; its first capture
+                group becomes each match's `Match.value`.
+            prnt: If True, prints every match framed by its surroundings instead
+                of returning them; always returns None.
+
+        Returns:
+            Every `Match`, in record order. None if prnt.
+
+        Raises:
+            ValueError: If `field` is not a field of these records, or `query` is
+                not a valid pattern.
+        """
+        if field is not None and field not in self.fields:
+            raise ValueError(
+                f"{self._label} records have no field {field!r}; "
+                f"search one of {', '.join(self.fields)}."
+            )
+        term: Query = (query, field, case_sensitive, regex)
+        queries = list(self._queries)
+        if not prnt:
+            rows = self._rust.matches(self._name, term, self._where, queries)
+            return [Match(**row) for row in rows]
+        rows = self._rust.matches(self._name, term, self._where, queries, PREVIEW_WIDTH)
+        side = f" {self._where}" if self._where else ""
+        found = count_str(len(rows), "match", "matches")
+        hit_records = len({row["index"] for row in rows})
+        header = f"{self._label} · {found} in {hit_records} of {len(self)}{side}"
+        column = None if self._where else self._column
+        print(bucket_str(header, len(rows), rows, column, "match") if rows else header)
+        return None
+
+    @overload
+    def text(self, index: int, *, prnt: Literal[False] = False) -> str: ...
+
+    @overload
+    def text(self, index: int, *, prnt: Literal[True]) -> None: ...
+
+    def text(self, index: int, *, prnt: bool = False) -> str | None:
+        """Query/print one record's whole content given its index.
+
+        The body when the record has one — script or style source, a frame's
+        ``srcdoc``, a comment, JSON-LD as indented JSON — else its URL, or a
+        meta tag's ``content``. Nothing is clipped, unlike a record's ``repr``.
+
+        Args:
+            index: Position in this bucket, as a table's ``#`` column or
+                `Match.index` gives it.
+            prnt: If True, prints the content instead of returning it; always
+                returns None.
+
+        Returns:
+            The content; ``""`` when the record has none. None if prnt.
+
+        Raises:
+            IndexError: If `index` is past the end of the bucket.
+        """
+        record = self[index]
+        # The first body field the record fills wins: a script's source, else its URL.
+        found = next((v for name in self._body if (v := getattr(record, name)) is not None), "")
+        content = (
+            found if isinstance(found, str) else json.dumps(found, indent=2, ensure_ascii=False)
+        )
+        if prnt:
+            print(content)
+            return None
+        return content
 
     def table(self, n: int = HEAD_ROWS, width: int = PREVIEW_WIDTH) -> str:
         """Render the first `n` records as a table, previews clipped to `width`."""
@@ -529,7 +704,10 @@ class Bucket(Sequence[R]):
             header = f"{self._label} · {total}{side}"
         elif self._column == "where":
             inline = self._rust.count(self._name, "inline")
-            header = f"{self._label} · {total} ({inline} inline, {total - inline} external)"
+            external = self._rust.count(self._name, "external")
+            # Only frames can be blank, so the count shows only when one is.
+            blank = f", {total - inline - external} blank" if total > inline + external else ""
+            header = f"{self._label} · {total} ({inline} inline, {external} external{blank})"
         else:
             header = f"{self._label} · {total}"
         rows = self._rust.head(self._name, n, width, self._where, list(self._queries))
@@ -545,21 +723,22 @@ class Bucket(Sequence[R]):
 # Views — which buckets a handle holds, and which side of each it keeps
 # ----------------------------------------------------------------------------
 
-BUCKET_SPECS: Final[dict[str, tuple[str, Callable[..., Any], str | None]]] = {
-    "scripts": ("Scripts", Script, "where"),
-    "styles": ("Styles", Style, "where"),
-    "links": ("Links", Link, None),
-    "images": ("Images", Image, None),
-    "iframes": ("Iframes", Frame, "where"),
-    "forms": ("Forms", Form._from_row, None),
-    "meta": ("Meta", Meta, None),
-    "comments": ("Comments", Comment, None),
-    "json_ld": ("JsonLd", JsonLd, None),
-    "loaded": ("Loaded", Resource, "kind"),
+BUCKET_SPECS: Final[dict[str, tuple[str, Callable[..., Any], str | None, tuple[str, ...]]]] = {
+    "scripts": ("Scripts", Script, "where", ("text", "url")),
+    "styles": ("Styles", Style, "where", ("text", "url")),
+    "links": ("Links", Link, None, ("url",)),
+    "images": ("Images", Image, None, ("url",)),
+    "iframes": ("Iframes", Frame, "where", ("srcdoc", "url")),
+    "forms": ("Forms", Form._from_row, None, ("url",)),
+    "meta": ("Meta", Meta, None, ("content",)),
+    "comments": ("Comments", Comment, None, ("text",)),
+    "json_ld": ("JsonLd", JsonLd, None, ("data",)),
+    "loaded": ("Loaded", Resource, "kind", ("url",)),
 }
-"""Bucket name -> (display label, record factory, leading table column). A
-``"where"`` column marks a bucket that splits inline/external. A new category is
-one row here plus one Rust extractor."""
+"""Bucket name -> (display label, record factory, leading table column, body
+fields). A ``"where"`` column marks a bucket that splits inline/external; the
+body fields, first filled one winning, are what ``Bucket.text`` returns. A new
+category is one row here plus one Rust extractor."""
 
 PAGE_BUCKETS: Final[tuple[str, ...]] = (
     "scripts",
@@ -619,9 +798,15 @@ class BucketView:
         """Return the cached bucket for `name`, held to this view's side of it."""
         cached = self._cache.get(name)
         if cached is None:
-            label, factory, column = BUCKET_SPECS[name]
+            label, factory, column, body = BUCKET_SPECS[name]
             cached = Bucket(
-                self._rust, name, label, factory, column=column, where=self._sides.get(name)
+                self._rust,
+                name,
+                label,
+                factory,
+                column=column,
+                body=body,
+                where=self._sides.get(name),
             )
             self._cache[name] = cached
         return cached
@@ -643,9 +828,7 @@ class Content(BucketView):
         # Runtime-only so mypy still flags a wrong-side access statically.
         def __getattr__(self, name: str) -> NoReturn:
             if name in _RESOURCE_SIDES:
-                raise AttributeError(
-                    f"Content holds no `{name}` bucket; use `r.resources.{name}`."
-                )
+                raise AttributeError(f"Content holds no `{name}` bucket; use `r.resources.{name}`.")
             raise AttributeError(f"'Content' object has no attribute {name!r}")
 
     @property
@@ -700,9 +883,7 @@ class Resources(BucketView):
         # Runtime-only so mypy still flags a wrong-side access statically.
         def __getattr__(self, name: str) -> NoReturn:
             if name in _CONTENT_SIDES:
-                raise AttributeError(
-                    f"Resources holds no `{name}` bucket; use `r.content.{name}`."
-                )
+                raise AttributeError(f"Resources holds no `{name}` bucket; use `r.content.{name}`.")
             raise AttributeError(f"'Resources' object has no attribute {name!r}")
 
     @property
@@ -749,10 +930,12 @@ __all__ = [
     "Comment",
     "Form",
     "Frame",
+    "FrameWhere",
     "Image",
     "Input",
     "JsonLd",
     "Link",
+    "Match",
     "Meta",
     "Overview",
     "OverviewRow",
@@ -764,6 +947,7 @@ __all__ = [
     "Style",
     "Where",
     "bucket_str",
+    "count_str",
     "overview_str",
     "size_str",
 ]

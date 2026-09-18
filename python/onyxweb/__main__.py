@@ -18,7 +18,9 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import IO, Any, Literal, cast
+from typing import IO, Any, Literal, NoReturn, cast
+
+import pydantic
 
 import onyxweb
 
@@ -35,8 +37,16 @@ def _parse_header(s: str) -> tuple[str, str]:
     return k.strip(), v.strip()
 
 
+class _Parser(argparse.ArgumentParser):
+    """Argument parser whose usage errors exit 1, as the module docstring promises."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="python -m onyxweb",
         description="Fetch a URL, return fully-rendered HTML (post-JS) and/or a screenshot.",
     )
@@ -177,13 +187,16 @@ def _resolve_preset(name: str) -> dict[str, Any]:
     return node
 
 
-def _list_presets(stream: IO[str] = sys.stdout) -> None:
-    """Print available presets to ``stream``.
+def _list_presets(stream: IO[str] | None = None) -> None:
+    """Print available presets to ``stream`` (``sys.stdout`` when None).
 
     Walks the engine → purpose → NAME tree under ``onyxweb.presets`` and lists
     every uppercase ``dict`` bundle as ``engine.purpose.NAME``.
     """
     from onyxweb import presets
+
+    # Resolved per call: a default bound at import would ignore a redirected sys.stdout.
+    stream = stream or sys.stdout
 
     stream.write("Available presets (use --preset <engine>.<purpose>.<NAME>):\n")
     for engine_name in sorted(presets.__all__):
@@ -243,9 +256,8 @@ def _build_client_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return kwargs
 
 
-def _emit_meta(
-    html_result: onyxweb.RenderResult, stream: IO[str] = sys.stderr
-) -> None:
+def _emit_meta(html_result: onyxweb.RenderResult, stream: IO[str] | None = None) -> None:
+    stream = stream or sys.stderr  # resolved per call, like _list_presets
     stream.write(
         f"final_url={html_result.final_url}  "
         f"status={html_result.status_code}  "
@@ -292,7 +304,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         client_kwargs = _build_client_kwargs(args)
-    except ValueError as e:
+        # Validate before launching Chrome, so a bad flag is a usage error, not a traceback.
+        config = onyxweb.ClientConfig.from_flat(**client_kwargs)
+    except pydantic.ValidationError as ve:
+        p.error("; ".join(err["msg"].removeprefix("Value error, ") for err in ve.errors()))
+    except (ValueError, TypeError) as e:
         p.error(str(e))
     want_shot = bool(args.screenshot or args.screenshot_only)
     shot_path = args.screenshot or args.screenshot_only
@@ -316,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write("\n")
 
     try:
-        with onyxweb.Client(**client_kwargs) as client:
+        with onyxweb.Client(config=config) as client:
             if want_shot:
                 # img_format has been validated by _infer_format to be one of the
                 # three accepted literals, but static-typing doesn't know that.

@@ -45,6 +45,9 @@ from onyxweb._onyxweb import (
     _RenderOutput,
 )
 from onyxweb.config import (
+    _FLAT_KWARG_NAMES,
+    _FLAT_KWARG_PATHS,
+    _TOP_LEVEL_KWARGS,
     ChromeConfig,
     Click,
     ClientConfig,
@@ -86,6 +89,7 @@ from onyxweb.records import (
     Resources,
     Script,
     Style,
+    count_str,
     overview_str,
     size_str,
 )
@@ -631,12 +635,12 @@ class RenderResult:
 
     @property
     def images(self) -> Bucket[Image]:
-        """Every ``<img src>``."""
+        """Every ``<img>`` whose ``src`` fetches something."""
         return self._page._bucket("images")
 
     @property
     def iframes(self) -> Bucket[Frame]:
-        """Every ``<iframe>`` — inline ``srcdoc`` bodies and framed documents."""
+        """Every ``<iframe>`` — ``srcdoc`` bodies, framed documents, and blank frames."""
         return self._page._bucket("iframes")
 
     @property
@@ -646,7 +650,7 @@ class RenderResult:
 
     @property
     def meta(self) -> Bucket[Meta]:
-        """Every ``<meta>``; ``name`` / ``property`` / ``http-equiv`` fold to one key."""
+        """Every ``<meta>``; its ``name``, ``property``, ``http-equiv`` or ``charset`` is `name`."""
         return self._page._bucket("meta")
 
     @property
@@ -754,11 +758,12 @@ class RenderResult:
         totals: dict[str, int] = {}
         for row in overview.rows:
             totals[row.bucket] = totals.get(row.bucket, 0) + row.count
+        nouns = (("scripts", "script"), ("styles", "style"), ("forms", "form"), ("links", "link"))
         parts = [size_str(overview.total_size)]
-        parts += [f"{totals[name]} {name}" for name in ("scripts", "styles", "forms", "links")]
+        parts += [count_str(totals[plural], singular, plural) for plural, singular in nouns]
         parts.append(f"{size_str(overview.text_size)} text")
         if self.errors:
-            parts.append(f"{len(self.errors)} errors")
+            parts.append(count_str(len(self.errors), "error", "errors"))
         # A data: URL carries the whole page, so the URL is clipped.
         url = self.final_url if len(self.final_url) <= 60 else self.final_url[:59] + "…"
         if url:
@@ -940,6 +945,9 @@ class Client:
         """
         old_data = self._config.model_dump()
         new_data = new_config.model_dump()
+        # Nothing changed, so leave the pooled tabs (and their cookies) alone.
+        if new_data == old_data:
+            return
         for path in _LAUNCH_ONLY_FIELDS:
             if _get_nested(old_data, path) != _get_nested(new_data, path):
                 raise ValueError(
@@ -981,7 +989,10 @@ class Client:
             data = config.model_dump() if config else {}
             for k, v in overrides.items():
                 if k not in _SCREENSHOT_KWARGS:
-                    raise TypeError(f"unknown screenshot kwarg: {k!r}")
+                    raise TypeError(
+                        f"unknown screenshot kwarg: {k!r}; "
+                        f"use one of: {', '.join(sorted(_SCREENSHOT_KWARGS))}"
+                    )
                 data[k] = v
             sc = ScreenshotConfig.model_validate(data)
         _client_log.debug("screenshot: %s (format=%s)", url, sc.format)
@@ -1248,6 +1259,9 @@ class AsyncClient:
         """Validate launch-only invariants, push to Rust, store new config."""
         old_data = self._config.model_dump()
         new_data = new_config.model_dump()
+        # Nothing changed, so leave the pooled tabs (and their cookies) alone.
+        if new_data == old_data:
+            return
         for path in _LAUNCH_ONLY_FIELDS:
             if _get_nested(old_data, path) != _get_nested(new_data, path):
                 raise ValueError(
@@ -1322,7 +1336,10 @@ class AsyncClient:
             data = config.model_dump() if config else {}
             for k, v in overrides.items():
                 if k not in _SCREENSHOT_KWARGS:
-                    raise TypeError(f"unknown screenshot kwarg: {k!r}")
+                    raise TypeError(
+                        f"unknown screenshot kwarg: {k!r}; "
+                        f"use one of: {', '.join(sorted(_SCREENSHOT_KWARGS))}"
+                    )
                 data[k] = v
             sc = ScreenshotConfig.model_validate(data)
         _client_log.debug("ascreenshot: %s (format=%s)", url, sc.format)
@@ -1500,26 +1517,31 @@ _SCREENSHOT_KWARGS = {
     "wait_after_post_load_ms",
 }
 
+_FETCH_KWARGS = {
+    "actions",
+    "block_navigation",
+    "block_urls",
+    "extra_headers",
+    "bypass_anti_bot",
+    "hash_navigation",
+    "post_load_scripts",
+    "scripts",
+    "timeout_ms",
+    "wait_until",
+    "wait_after_ms",
+    "wait_after_post_load_ms",
+}
+
 
 def _merge_fetch_config(base: FetchConfig | None, overrides: dict[str, Any]) -> FetchConfig:
     if base is None and not overrides:
         return FetchConfig()
     data: dict[str, Any] = base.model_dump() if base else {}
     for k, v in overrides.items():
-        if k not in {
-            "actions",
-            "block_navigation",
-            "block_urls",
-            "extra_headers",
-            "bypass_anti_bot",
-            "post_load_scripts",
-            "scripts",
-            "timeout_ms",
-            "wait_until",
-            "wait_after_ms",
-            "wait_after_post_load_ms",
-        }:
-            raise TypeError(f"unknown fetch kwarg: {k!r}")
+        if k not in _FETCH_KWARGS:
+            raise TypeError(
+                f"unknown fetch kwarg: {k!r}; use one of: {', '.join(sorted(_FETCH_KWARGS))}"
+            )
         data[k] = v
     return FetchConfig.model_validate(data)
 
@@ -1604,51 +1626,12 @@ class _ConfigView:
         return self._target().model_dump_json(**kw)  # type: ignore[no-any-return]
 
 
-# update_config / Client(**kwargs) build a SPARSE partial dict (unlike
-# ClientConfig.from_flat, which fills defaults) — kept as a separate table.
-_FLAT_KWARG_MAP: dict[str, tuple[str, ...]] = {
-    # Viewport
-    "device_scale_factor": ("viewport", "device_scale_factor"),
-    "mobile": ("viewport", "mobile"),
-    # Network
-    "user_agent": ("network", "user_agent"),
-    "user_agent_metadata": ("network", "user_agent_metadata"),
-    "proxy": ("network", "proxy"),
-    "proxy_bypass_list": ("network", "proxy_bypass_list"),
-    "extra_headers": ("network", "extra_headers"),
-    "ignore_https_errors": ("network", "ignore_https_errors"),
-    "block_urls": ("network", "block_urls"),
-    "disable_cache": ("network", "disable_cache"),
-    "offline": ("network", "offline"),
-    "latency_ms": ("network", "latency_ms"),
-    "download_bps": ("network", "download_bps"),
-    "upload_bps": ("network", "upload_bps"),
-    # Emulation
-    "locale": ("emulation", "locale"),
-    "timezone": ("emulation", "timezone"),
-    "geolocation": ("emulation", "geolocation"),
-    "prefers_color_scheme": ("emulation", "prefers_color_scheme"),
-    "javascript_enabled": ("emulation", "javascript_enabled"),
-    # Timeout
-    "navigation_timeout_ms": ("timeout", "navigation_ms"),
-    "launch_timeout_ms": ("timeout", "launch_ms"),
-    "screenshot_timeout_ms": ("timeout", "screenshot_ms"),
-    # Chrome
-    "include_shadow_dom": ("include", "shadow_dom"),
-    "include_iframes": ("include", "iframes"),
-    "chrome_path": ("chrome", "path"),
-    "chrome_args": ("chrome", "args"),
-    "user_data_dir": ("chrome", "user_data_dir"),
-    "headless": ("chrome", "headless"),
-    "engine": ("chrome", "engine"),
-}
-
-
 def _flat_kwargs_to_partial(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Translate flat kwargs into a sparse nested dict.
 
-    Only mentioned fields appear in the output; defaults are NOT filled in.
-    Meant for merging onto an existing config.
+    Only mentioned fields appear in the output; defaults are NOT filled in, unlike
+    ``ClientConfig.from_flat``. Meant for merging onto an existing config; both
+    read the kwarg names from ``onyxweb.config``.
     """
     out: dict[str, Any] = {}
     for k, v in kwargs.items():
@@ -1674,24 +1657,12 @@ def _flat_kwargs_to_partial(kwargs: dict[str, Any]) -> dict[str, Any]:
                     f"scripts must be dict or ScriptsConfig, got {type(v).__name__}"
                 )
             continue
-        if k == "concurrency":
-            out["concurrency"] = v
+        if k in _TOP_LEVEL_KWARGS:
+            out[k] = v
             continue
-        if k == "wait_until":
-            out["wait_until"] = v
-            continue
-        if k == "wait_after_ms":
-            out["wait_after_ms"] = v
-            continue
-        if k == "capture_console_level":
-            out["capture_console_level"] = v
-            continue
-        if k == "bypass_anti_bot":
-            out["bypass_anti_bot"] = v
-            continue
-        if k not in _FLAT_KWARG_MAP:
-            raise TypeError(f"unknown ClientConfig kwarg: {k!r}")
-        sub, field = _FLAT_KWARG_MAP[k]
+        if k not in _FLAT_KWARG_PATHS:
+            raise TypeError(f"unknown ClientConfig kwarg: {k!r}; use one of: {_FLAT_KWARG_NAMES}")
+        sub, field = _FLAT_KWARG_PATHS[k]
         out.setdefault(sub, {})
         out[sub][field] = v
     return out

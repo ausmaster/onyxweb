@@ -42,6 +42,10 @@ use crate::result::ConsoleMessageRs;
 /// registrations. Page JS cannot read or tamper with globals defined here.
 const DEFAULT_ISOLATED_WORLD_NAME: &str = "util";
 
+/// Added to the viewport height for `screen.height`, approximating a real
+/// desktop's title bar + tabs + toolbar (Linux Chrome, roughly).
+pub(crate) const SCREEN_CHROME_PADDING_PX: i64 = 74;
+
 /// Forces `attachShadow` open + serializable so shadow content is walkable and
 /// `getHTML()` will serialize it. `serializable` is the load-bearing half —
 /// without it `getHTML({serializableShadowRoots:true})` still omits the subtree.
@@ -229,7 +233,7 @@ pub struct PooledPage {
     /// Set when a fetch wedged or killed this tab; `acquire()` recreates it.
     pub poisoned: AtomicBool,
     /// Config generation this tab was created at; a stale value triggers
-    /// recreation on `acquire()` so runtime proxy/bypass changes take effect.
+    /// recreation on `acquire()` so a runtime config change takes effect.
     pub generation: u64,
     /// True when the proxy has credentials, so chromiumoxide owns the tab's Fetch
     /// domain for auth — engine must not enable/disable its own Fetch here.
@@ -246,8 +250,8 @@ pub struct PagePool {
     /// Live config, shared with the Client, read when a tab is (re)created so
     /// runtime changes apply to fresh tabs.
     config: Arc<RwLock<ClientConfigRs>>,
-    /// Bumped when a context-level field (proxy/bypass) changes; tabs created at
-    /// an older generation are recreated on acquire.
+    /// Bumped on every config change; tabs created at an older generation are
+    /// recreated on acquire.
     generation: AtomicU64,
     #[allow(dead_code)]
     size: usize,
@@ -281,8 +285,8 @@ impl PagePool {
         }))
     }
 
-    /// Signal that context-level config (proxy/bypass) changed; tabs recreate
-    /// with the live config on their next acquire.
+    /// Signal that the client config changed; tabs recreate with the live
+    /// config on their next acquire.
     pub fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
         log::debug!(target: "onyxweb::pool", "config generation bumped; tabs recreate on next acquire");
@@ -496,6 +500,14 @@ impl Drop for PageGuard {
     }
 }
 
+/// Accept-Language form of a locale — `"fr-FR"` -> `"fr-FR,fr"`; Chrome adds its own q-values.
+fn accept_language_for(locale: &str) -> String {
+    match locale.split_once('-') {
+        Some((lang, _)) => format!("{locale},{lang}"),
+        None => locale.to_string(),
+    }
+}
+
 /// Create one page, apply base config, wire up persistent listeners.
 async fn create_pooled_page(
     browser: &Browser,
@@ -525,22 +537,41 @@ async fn create_pooled_page(
     let page = browser.new_page(target).await.map_err(OnyxError::from)?;
     log::trace!(target: "onyxweb::pool", "new_page in {:?}", t0.elapsed());
 
-    // Chrome's viewport defaults to 800×600 without an explicit override.
+    // Chrome's screen also defaults to 800×600; without an override a taller
+    // viewport alone leaves screen.height < innerHeight — no real desktop is that.
     page.execute(
         SetDeviceMetricsOverrideParams::builder()
             .width(base.viewport.width as i64)
             .height(base.viewport.height as i64)
             .device_scale_factor(base.viewport.device_scale_factor)
             .mobile(base.viewport.mobile)
+            .screen_width(base.viewport.width as i64)
+            .screen_height(base.viewport.height as i64 + SCREEN_CHROME_PADDING_PX)
             .build()
             .map_err(|e| OnyxError::Cdp(format!("metrics: {e}")))?,
     )
     .await?;
 
-    if let Some(ua) = &base.network.user_agent {
-        let mut builder = SetUserAgentOverrideParams::builder().user_agent(ua.clone());
+    // A bare `locale` or `user_agent_metadata` still needs a `user_agent` for
+    // this CDP call; read Chrome's own rather than leaving it blank.
+    if base.network.user_agent.is_some()
+        || base.emulation.locale.is_some()
+        || base.network.user_agent_metadata.is_some()
+    {
+        let ua = match &base.network.user_agent {
+            Some(ua) => ua.clone(),
+            None => page
+                .evaluate("navigator.userAgent")
+                .await?
+                .into_value()
+                .map_err(|e| OnyxError::Cdp(format!("UA: {e}")))?,
+        };
+        let mut builder = SetUserAgentOverrideParams::builder().user_agent(ua);
         if let Some(meta) = &base.network.user_agent_metadata {
             builder = builder.user_agent_metadata(build_ua_metadata(meta)?);
+        }
+        if let Some(locale) = &base.emulation.locale {
+            builder = builder.accept_language(accept_language_for(locale));
         }
         page.execute(
             builder
@@ -644,9 +675,8 @@ async fn create_pooled_page(
         .await?;
 
     // Persistent per-page listeners: structured console messages + main-doc
-    // HTTP status. Level filter is captured here at page creation; runtime
-    // updates to ``capture_console_level`` via update_config don't re-arm
-    // these listeners.
+    // HTTP status. The level filter is captured at page creation; a runtime
+    // config change recreates the tab, so an update reaches the next fetch.
     let console_messages: Arc<Mutex<Vec<ConsoleMessageRs>>> = Arc::new(Mutex::new(Vec::new()));
     // Seed from the live frame tree: the tab's first `about:blank` navigation
     // happens before these listeners attach, so frameNavigated alone would leave
