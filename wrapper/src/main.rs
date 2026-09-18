@@ -68,13 +68,11 @@ mod macos {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    /// `kill(pid, 0)` sends no signal, only probes existence. `ESRCH` alone means
-    /// gone; any other errno (e.g. `EPERM`) still means alive.
+    /// `kill(pid, 0)` sends no signal, only probes existence — but on macOS an
+    /// exited-not-yet-reaped zombie reports `EPERM` here, not `ESRCH`. Our own
+    /// parent is always same-user, so any error (not just `ESRCH`) means dead.
     fn alive(pid: libc::pid_t) -> bool {
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 
     pub fn run(chrome_path: String) -> ! {
