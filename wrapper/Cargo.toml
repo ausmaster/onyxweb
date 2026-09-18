@@ -1,0 +1,27 @@
+[package]
+name = "onyxweb_wrapper"
+version = "0.2.2"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "onyxweb_wrapper"
+path = "src/main.rs"
+
+# Separate from the main package: a sibling [[bin]] there dragged the pyo3
+# cdylib into every build, breaking macOS's -undefined dynamic_lookup flag.
+[target.'cfg(target_os = "linux")'.dependencies]
+ur-taking-me-with-you = "8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ur-taking-me-with-you = "8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+# [profile.release] lives at the workspace root — Cargo ignores a member's own.

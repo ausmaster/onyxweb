@@ -937,7 +937,6 @@ dependencies = [
  "chromiumoxide",
  "env_logger",
  "futures",
- "libc",
  "log",
  "md-5",
  "murmur3",
@@ -953,8 +952,15 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
- "ur-taking-me-with-you",
  "url",
+]
+
+[[package]]
+name = "onyxweb_wrapper"
+version = "0.2.2"
+dependencies = [
+ "libc",
+ "ur-taking-me-with-you",
  "windows-sys",
 ]
 
