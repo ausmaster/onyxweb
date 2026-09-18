@@ -54,6 +54,10 @@ CHROME_VERSION = "148.0.7778.56"
 # CDN: https://storage.googleapis.com/chrome-for-testing-public/<version>/<cft_plat>/<zip>
 CDN_BASE = "https://storage.googleapis.com/chrome-for-testing-public"
 
+# onyxweb_wrapper (see chrome::resolve_wrapper in Rust) sits flat in the same dir as
+# chrome-headless-shell; a shell install must preserve it like it preserves `full/`.
+WRAPPER_NAMES = {"onyxweb_wrapper", "onyxweb_wrapper.exe"}
+
 # internal_key (matches Rust `chrome::platform_subdir()`) → Chrome-for-Testing slug
 CFT_PLATFORM: dict[str, str] = {
     "linux_x86_64": "linux64",
@@ -169,9 +173,10 @@ def download_for(
         # Stream to a tempfile so we don't buffer 100+MB in memory.
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp_path = Path(tmp.name)
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as resp, open(
-            tmp_path, "wb"
-        ) as out:
+        with (
+            urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as resp,
+            open(tmp_path, "wb") as out,
+        ):
             total = int(resp.headers.get("Content-Length", 0))
             chunk = 1024 * 1024
             downloaded = 0
@@ -200,7 +205,7 @@ def download_for(
             for member in zf.namelist():
                 rel = member
                 if rel.startswith(zip_base + "/"):
-                    rel = rel[len(zip_base) + 1:]
+                    rel = rel[len(zip_base) + 1 :]
                 if not rel or rel.endswith("/"):
                     continue
                 target = (staging / rel).resolve()
@@ -217,15 +222,14 @@ def download_for(
         # Always ensure the main binary is executable (some zips lose the bit).
         staged_bin = staging / binary_name
         if staged_bin.is_file():
-            staged_bin.chmod(
-                staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-            )
+            staged_bin.chmod(staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
         # Swap staged files into dest_dir, replacing this engine's files but
         # PRESERVING the sibling engine: shell and full share the platform dir
         # (shell flat in it, full in the `full/` subdir), so a (re)install of one
         # must not delete the other. dest_sub is "" for shell, "full" for full.
-        preserve = set() if dest_sub else {"full"}
+        # onyxweb_wrapper also lives flat in the shell dir (see WRAPPER_NAMES).
+        preserve = set() if dest_sub else {"full", *WRAPPER_NAMES}
         dest_dir.mkdir(parents=True, exist_ok=True)
         for existing in list(dest_dir.iterdir()):
             if existing.name in preserve:
@@ -264,9 +268,7 @@ def default_dest_dir() -> Path:
     return Path(__file__).resolve().parent / "_binaries"
 
 
-def find_chrome(
-    *, engine: str | None = None, dest: Path | str | None = None
-) -> Path | None:
+def find_chrome(*, engine: str | None = None, dest: Path | str | None = None) -> Path | None:
     """Path to the installed Chrome binary for this platform, or ``None`` if absent.
 
     A cheap predicate (no network) so a host app can decide whether to announce a
@@ -396,15 +398,19 @@ async def aensure_chrome(
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--engine", choices=ENGINES, default=None,
+        "--engine",
+        choices=ENGINES,
+        default=None,
         help="which build to fetch (default: onyxweb's configured engine)",
     )
     p.add_argument(
-        "--dest", default=None,
+        "--dest",
+        default=None,
         help="Destination dir (default: <installed package>/_binaries)",
     )
     p.add_argument(
-        "--all", action="store_true",
+        "--all",
+        action="store_true",
         help="Download for every supported platform, not just the current one",
     )
     p.add_argument(
@@ -412,7 +418,8 @@ def main() -> int:
         help="Internal platform key to download (overrides --all)",
     )
     p.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Re-download even if binary is already present",
     )
     args = p.parse_args()
