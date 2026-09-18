@@ -10,7 +10,8 @@ All knobs live under ``ClientConfig``. Pydantic-settings auto-loads from env
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+import re
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,25 +25,18 @@ _FORBIDDEN_HEADERS: dict[str, str] = {
         "Cookie2 cannot be set via extra_headers — chromium silently drops it. "
         "onyxweb does not yet expose a cookie-setting API."
     ),
-    "set-cookie": (
-        "Set-Cookie is a response header; setting it on a request is meaningless."
-    ),
+    "set-cookie": ("Set-Cookie is a response header; setting it on a request is meaningless."),
     "host": (
-        "chromium computes Host from the request URL; "
-        "setExtraHTTPHeaders override is ignored."
+        "chromium computes Host from the request URL; setExtraHTTPHeaders override is ignored."
     ),
     "origin": (
-        "chromium computes Origin from the request URL and CORS state; "
-        "override is ignored."
+        "chromium computes Origin from the request URL and CORS state; override is ignored."
     ),
     "content-length": "chromium computes Content-Length from the request body.",
     "transfer-encoding": (
-        "Transfer-Encoding is set by chromium per HTTP framing; "
-        "override is ignored."
+        "Transfer-Encoding is set by chromium per HTTP framing; override is ignored."
     ),
-    "connection": (
-        "Connection is set by chromium per HTTP version; override is ignored."
-    ),
+    "connection": ("Connection is set by chromium per HTTP version; override is ignored."),
 }
 """Headers that chromium silently drops or computes from request state when
 set via ``Network.setExtraHTTPHeaders``. Values are user-facing error
@@ -52,6 +46,29 @@ messages that name a CDP alternative or note why the override is rejected.
 ``extra_headers`` and routes it through ``Page.navigate(referrer=...)``,
 which is the supported CDP path for navigation referrer.
 """
+
+
+# A URLPattern constructor string opens with its scheme: `*://`, `https:`, `data:`.
+_URL_PATTERN_SCHEME: Final = re.compile(r"[^:/?#]+:")
+
+
+def _validate_block_urls(v: list[str]) -> list[str]:
+    """Drop blank entries and reject ones Chrome can't parse as a URLPattern.
+
+    Chrome reads each entry as a URLPattern constructor string, so a bare glob such
+    as ``*doubleclick*`` has no scheme and would fail every fetch. Used by
+    ``NetworkConfig`` and ``FetchConfig``. Chrome's own parser rejects a few more
+    shapes (regexp groups, an unescaped IPv6 host); a fetch reports those as
+    ``kind="invalid_config"``.
+    """
+    kept = [p for p in v if p.strip()]
+    for p in kept:
+        if not _URL_PATTERN_SCHEME.match(p):
+            raise ValueError(
+                f"block_urls: {p!r} has no scheme, so Chrome can't parse it as a URLPattern; "
+                f'write it with one, e.g. "*://*.doubleclick.net/*".'
+            )
+    return kept
 
 
 def _validate_extra_headers(v: dict[str, str]) -> dict[str, str]:
@@ -107,7 +124,8 @@ class UserAgentMetadata(BaseModel):
     brands: list[UserAgentBrandVersion] | None = None
     """Entries emitted in ``Sec-CH-UA``. E.g. ``[{"brand":"Google Chrome",
     "version":"131"}, {"brand":"Chromium","version":"131"},
-    {"brand":"Not_A Brand","version":"24"}]``."""
+    {"brand":"Not/A)Brand","version":"99"}]`` — the last is Chrome's rotating
+    GREASE placeholder; verify it against a live browser before trusting it."""
 
     full_version_list: list[UserAgentBrandVersion] | None = None
     """Entries emitted in ``Sec-CH-UA-Full-Version-List``. Usually brand +
@@ -179,7 +197,8 @@ class NetworkConfig(BaseModel):
 
     block_urls: list[str] = Field(default_factory=list)
     """URLPattern strings (e.g. ``*://*.doubleclick.net/*``) to drop at the
-    network layer. Applied via ``Network.setBlockedURLs`` per pooled page."""
+    network layer. Each needs a scheme; blank entries are dropped. Applied via
+    ``Network.setBlockedURLs`` per pooled page."""
 
     disable_cache: bool = False
     offline: bool = False
@@ -189,8 +208,8 @@ class NetworkConfig(BaseModel):
 
     @field_validator("block_urls")
     @classmethod
-    def _no_empty_patterns(cls, v: list[str]) -> list[str]:
-        return [p for p in v if p.strip()]
+    def _url_patterns(cls, v: list[str]) -> list[str]:
+        return _validate_block_urls(v)
 
     @field_validator("extra_headers")
     @classmethod
@@ -204,6 +223,10 @@ class EmulationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     locale: str | None = None
+    """BCP-47 locale (e.g. ``fr-FR``). Drives ``Intl.*``, ``navigator.language``/
+    ``.languages`` and the ``Accept-Language`` request header together, so a
+    locale paired with a regional proxy doesn't leave those three disagreeing."""
+
     timezone: str | None = None
     """IANA timezone (e.g. ``America/New_York``)."""
 
@@ -228,9 +251,8 @@ class ScriptsConfig(BaseModel):
       that run inside a cross-origin iframe (e.g. Cloudflare Turnstile) are
       unaffected.
     * Scripts do NOT run in Service Workers / Shared Workers.
-    * Runtime changes to this config affect only *new* pool pages. Pages
-      already in the pool keep their original registrations — close the
-      Client and open a fresh one to re-apply everywhere.
+    * A runtime change applies from the next fetch: every pooled tab is
+      rebuilt with the new registrations when it is next acquired.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -297,8 +319,14 @@ class TimeoutConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     navigation_ms: int = Field(30000, ge=100)
+    """Default fetch budget; ``FetchConfig.timeout_ms`` overrides per call."""
+
     launch_ms: int = Field(15000, ge=500)
+    """Bounds ``Browser.launch`` itself — not page-pool warmup after it."""
+
     screenshot_ms: int = Field(5000, ge=100)
+    """Default budget for a screenshot-only call (``Client.screenshot``);
+    ``ScreenshotConfig.timeout_ms`` overrides per call."""
 
 
 class ChromeConfig(BaseModel):
@@ -326,6 +354,57 @@ class ChromeConfig(BaseModel):
       real Chrome UA. Near-indistinguishable from real Chrome; gets past
       Akamai/Cloudflare-class sites that hard-block the shell. Heavier. Requires
       a full Chrome binary (``path=`` / system / a future bundled build)."""
+
+
+# Flat kwarg -> (sub-config, field). The one map `Client(**kw)` and
+# `update_config(**kw)` both read, so the two entry paths can't drift apart.
+_FLAT_KWARG_PATHS: Final[dict[str, tuple[str, str]]] = {
+    "device_scale_factor": ("viewport", "device_scale_factor"),
+    "mobile": ("viewport", "mobile"),
+    "user_agent": ("network", "user_agent"),
+    "user_agent_metadata": ("network", "user_agent_metadata"),
+    "proxy": ("network", "proxy"),
+    "proxy_bypass_list": ("network", "proxy_bypass_list"),
+    "extra_headers": ("network", "extra_headers"),
+    "ignore_https_errors": ("network", "ignore_https_errors"),
+    "block_urls": ("network", "block_urls"),
+    "disable_cache": ("network", "disable_cache"),
+    "offline": ("network", "offline"),
+    "latency_ms": ("network", "latency_ms"),
+    "download_bps": ("network", "download_bps"),
+    "upload_bps": ("network", "upload_bps"),
+    "locale": ("emulation", "locale"),
+    "timezone": ("emulation", "timezone"),
+    "geolocation": ("emulation", "geolocation"),
+    "prefers_color_scheme": ("emulation", "prefers_color_scheme"),
+    "javascript_enabled": ("emulation", "javascript_enabled"),
+    "navigation_timeout_ms": ("timeout", "navigation_ms"),
+    "launch_timeout_ms": ("timeout", "launch_ms"),
+    "screenshot_timeout_ms": ("timeout", "screenshot_ms"),
+    "chrome_path": ("chrome", "path"),
+    "chrome_args": ("chrome", "args"),
+    "user_data_dir": ("chrome", "user_data_dir"),
+    "headless": ("chrome", "headless"),
+    "engine": ("chrome", "engine"),
+    "include_shadow_dom": ("include", "shadow_dom"),
+    "include_iframes": ("include", "iframes"),
+}
+
+# Flat kwargs that are `ClientConfig` fields themselves, passed through unchanged.
+_TOP_LEVEL_KWARGS: Final[tuple[str, ...]] = (
+    "concurrency",
+    "wait_until",
+    "wait_after_ms",
+    "wait_after_post_load_ms",
+    "bypass_anti_bot",
+    "capture_console_level",
+    "hash_navigation",
+)
+
+# Every flat kwarg, named in the error for an unknown one.
+_FLAT_KWARG_NAMES: Final[str] = ", ".join(
+    sorted(("viewport", "scripts", *_TOP_LEVEL_KWARGS, *_FLAT_KWARG_PATHS))
+)
 
 
 class ClientConfig(BaseSettings):
@@ -386,8 +465,22 @@ class ClientConfig(BaseSettings):
     - ``"all"`` — captures every standard ``console.*`` method (log, info,
       warning, error, debug, trace).
 
-    Captured at Client construction. Runtime updates via ``update_config``
-    do not re-arm the listeners on already-pooled pages.
+    A runtime change applies from the next fetch, like every other field: the
+    pooled tabs are rebuilt with the new filter when next acquired.
+    """
+
+    hash_navigation: Literal["reload", "continue"] = "reload"
+    """What a fetch does when its URL differs from the tab's page only after ``#``.
+
+    - ``"reload"`` (default) — load the page fresh, like any other fetch, so a
+      result never depends on what an earlier fetch left on the tab.
+    - ``"continue"`` — move within the loaded page, as an in-page anchor does:
+      no request is sent, and the page keeps its state and its response's
+      metadata, so per-call headers and blocks have nothing to apply to. For
+      hash-routed apps whose state should carry over. Per-call ``scripts`` still
+      reload, since they run only on a new document.
+
+    Per-call :attr:`FetchConfig.hash_navigation` overrides.
     """
 
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
@@ -405,39 +498,6 @@ class ClientConfig(BaseSettings):
         Powers the ``Client(viewport=(w,h), user_agent=..., concurrency=16)``
         shortcut.
         """
-        # Maps flat kwarg → (sub_config_name, field_name).
-        flat_map: dict[str, tuple[str, str]] = {
-            "device_scale_factor": ("viewport", "device_scale_factor"),
-            "mobile": ("viewport", "mobile"),
-            "user_agent": ("network", "user_agent"),
-            "user_agent_metadata": ("network", "user_agent_metadata"),
-            "proxy": ("network", "proxy"),
-            "proxy_bypass_list": ("network", "proxy_bypass_list"),
-            "extra_headers": ("network", "extra_headers"),
-            "ignore_https_errors": ("network", "ignore_https_errors"),
-            "block_urls": ("network", "block_urls"),
-            "disable_cache": ("network", "disable_cache"),
-            "offline": ("network", "offline"),
-            "latency_ms": ("network", "latency_ms"),
-            "download_bps": ("network", "download_bps"),
-            "upload_bps": ("network", "upload_bps"),
-            "locale": ("emulation", "locale"),
-            "timezone": ("emulation", "timezone"),
-            "geolocation": ("emulation", "geolocation"),
-            "prefers_color_scheme": ("emulation", "prefers_color_scheme"),
-            "javascript_enabled": ("emulation", "javascript_enabled"),
-            "navigation_timeout_ms": ("timeout", "navigation_ms"),
-            "launch_timeout_ms": ("timeout", "launch_ms"),
-            "screenshot_timeout_ms": ("timeout", "screenshot_ms"),
-            "chrome_path": ("chrome", "path"),
-            "chrome_args": ("chrome", "args"),
-            "user_data_dir": ("chrome", "user_data_dir"),
-            "headless": ("chrome", "headless"),
-            "engine": ("chrome", "engine"),
-            "include_shadow_dom": ("include", "shadow_dom"),
-            "include_iframes": ("include", "iframes"),
-        }
-
         nested: dict[str, dict[str, Any]] = {
             "viewport": {},
             "network": {},
@@ -458,8 +518,7 @@ class ClientConfig(BaseSettings):
                 top["viewport"] = v
             else:
                 raise TypeError(
-                    f"viewport must be (width, height) or ViewportConfig, "
-                    f"got {type(v).__name__}"
+                    f"viewport must be (width, height) or ViewportConfig, got {type(v).__name__}"
                 )
 
         # scripts={...} passes through as a whole sub-config (pydantic coerces
@@ -467,21 +526,16 @@ class ClientConfig(BaseSettings):
         if "scripts" in kwargs:
             top["scripts"] = kwargs.pop("scripts")
 
-        for top_field in (
-            "concurrency",
-            "wait_until",
-            "wait_after_ms",
-            "wait_after_post_load_ms",
-            "bypass_anti_bot",
-            "capture_console_level",
-        ):
+        for top_field in _TOP_LEVEL_KWARGS:
             if top_field in kwargs:
                 top[top_field] = kwargs.pop(top_field)
 
         for k, val in kwargs.items():
-            if k not in flat_map:
-                raise TypeError(f"unknown ClientConfig kwarg: {k!r}")
-            sub, field = flat_map[k]
+            if k not in _FLAT_KWARG_PATHS:
+                raise TypeError(
+                    f"unknown ClientConfig kwarg: {k!r}; use one of: {_FLAT_KWARG_NAMES}"
+                )
+            sub, field = _FLAT_KWARG_PATHS[k]
             nested[sub][field] = val
 
         # Build sub-configs only for sections the user actually touched; rest
@@ -641,16 +695,16 @@ class FetchConfig(BaseModel):
     modern Chrome — no need for trusted-events to make those work."""
 
     block_urls: list[str] = Field(default_factory=list)
-    """URL patterns to block at the network layer for this call. Additive
-    over the Client's base ``network.block_urls`` — both apply. Pattern
-    syntax matches CDP ``Network.setBlockedURLs`` (supports ``*``
-    wildcards). Restored to the Client-level base list after capture so
+    """URLPattern strings to block at the network layer for this call, e.g.
+    ``*://*.doubleclick.net/*``. Additive over the Client's base
+    ``network.block_urls`` — both apply. Each needs a scheme; blank entries
+    are dropped. Restored to the Client-level base list after capture so
     the per-call block doesn't leak to subsequent fetches on the same
     pooled tab."""
 
-    actions: list[
-        Annotated[Click | Fill | Hover | Wait, Field(discriminator="type")]
-    ] = Field(default_factory=list)
+    actions: list[Annotated[Click | Fill | Hover | Wait, Field(discriminator="type")]] = Field(
+        default_factory=list
+    )
     """Post-load actions to run after the lifecycle event and any
     ``wait_after_ms`` settle, before HTML capture. Click and Hover
     dispatch CDP-trusted mouse events (``Input.dispatchMouseEvent``);
@@ -682,6 +736,9 @@ class FetchConfig(BaseModel):
     Cloudflare / DataDome / PerimeterX / Imperva). See
     :attr:`ClientConfig.bypass_anti_bot`."""
 
+    hash_navigation: Literal["reload", "continue"] | None = None
+    """Per-call override of :attr:`ClientConfig.hash_navigation` (``None`` inherits)."""
+
     timeout_ms: int | None = Field(None, ge=100)
     wait_until: Literal["domcontentloaded", "load"] | None = None
     wait_after_ms: int | None = Field(None, ge=0, le=60000)
@@ -695,6 +752,11 @@ class FetchConfig(BaseModel):
     @classmethod
     def _no_forbidden_headers(cls, v: dict[str, str]) -> dict[str, str]:
         return _validate_extra_headers(v)
+
+    @field_validator("block_urls")
+    @classmethod
+    def _url_patterns(cls, v: list[str]) -> list[str]:
+        return _validate_block_urls(v)
 
 
 class ScreenshotConfig(BaseModel):

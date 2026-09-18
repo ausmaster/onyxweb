@@ -61,7 +61,9 @@ class Buckets:
     def counts(
         self,
     ) -> tuple[
-        list[tuple[str, Literal["inline", "external"] | None, int, int | None]], int, int
+        list[tuple[str, Literal["inline", "external", "blank"] | None, int, int | None]],
+        int,
+        int,
     ]: ...
     def head(
         self,
@@ -70,6 +72,14 @@ class Buckets:
         width: int,
         where_: str | None = ...,
         queries: list[tuple[str, str | None, bool, bool]] | None = ...,
+    ) -> list[dict[str, Any]]: ...
+    def matches(
+        self,
+        bucket: str,
+        query: tuple[str, str | None, bool, bool],
+        where_: str | None = ...,
+        queries: list[tuple[str, str | None, bool, bool]] | None = ...,
+        width: int | None = ...,
     ) -> list[dict[str, Any]]: ...
     def text(self) -> str: ...
     def title(self) -> str | None: ...

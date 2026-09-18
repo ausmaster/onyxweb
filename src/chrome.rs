@@ -125,6 +125,34 @@ fn find_bundled(engine: ChromeEngine) -> Option<PathBuf> {
     None
 }
 
+/// Canonical wrapper binary filename per platform.
+pub fn wrapper_binary_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "onyxweb_wrapper.exe";
+    #[allow(unreachable_code)]
+    "onyxweb_wrapper"
+}
+
+/// Bundled `chrome_executable()` points at instead of the real binary, so Chrome dies
+/// with an abruptly-killed onyxweb process. `None` (dev build, unsupported platform)
+/// means callers fall back to launching Chrome directly, unprotected.
+pub fn resolve_wrapper() -> Option<PathBuf> {
+    let rel = format!("_binaries/{}/{}", platform_subdir(), wrapper_binary_name());
+    if let Ok(pkg) = std::env::var("ONYXWEB_PKG_DIR") {
+        let p = Path::new(&pkg).join(&rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let p = Path::new(&manifest_dir).join("python/onyxweb").join(&rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn which_on_path(name: &str) -> Result<PathBuf> {
     let path = std::env::var("PATH")
         .map_err(|_| OnyxError::ChromeNotFound("PATH env not set".to_string()))?;

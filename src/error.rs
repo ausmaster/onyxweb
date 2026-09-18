@@ -120,10 +120,17 @@ impl From<chromiumoxide::error::CdpError> for OnyxError {
         // chromiumoxide's command timeout should surface as a timeout, not a
         // generic CDP error, so it maps to the builtin TimeoutError.
         if matches!(e, chromiumoxide::error::CdpError::Timeout) {
-            OnyxError::Timeout(e.to_string())
-        } else {
-            OnyxError::Cdp(e.to_string())
+            return OnyxError::Timeout(e.to_string());
         }
+        let msg = e.to_string();
+        // Chrome parses `block_urls` only when a tab applies them, so a pattern the
+        // config check let through fails here; it is the caller's config, not CDP.
+        if msg.contains("failed to parse as a URLPattern") {
+            return OnyxError::InvalidConfig(format!(
+                "block_urls: {msg} Write each entry as a URLPattern, e.g. \"*://*.doubleclick.net/*\"."
+            ));
+        }
+        OnyxError::Cdp(msg)
     }
 }
 

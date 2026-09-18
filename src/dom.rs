@@ -12,11 +12,12 @@
 //! This sidesteps lifetime nightmares (scraper's ElementRef borrows from Html)
 //! and keeps Python code safe: Elements can outlive their Dom freely.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use regex::{Regex, RegexBuilder};
 use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::Value;
@@ -101,6 +102,16 @@ fn url_record(base: Option<&Url>, raw: &str) -> (String, String) {
         .map(String::from)
         .unwrap_or_else(|| raw.to_string());
     (resolved, raw.to_string())
+}
+
+/// True when a `src` makes the browser fetch something. An empty value or an
+/// `about:` URL loads nothing, so it names no resource.
+fn fetches(raw: &str) -> bool {
+    let raw = raw.trim();
+    !raw.is_empty()
+        && !raw
+            .get(..6)
+            .is_some_and(|s| s.eq_ignore_ascii_case("about:"))
 }
 
 fn unknown_bucket(name: &str) -> PyErr {
@@ -260,8 +271,16 @@ impl Buckets {
     ) -> PyResult<Vec<PyObject>> {
         check_request(bucket, where_)?;
         let matchers = compile(queries)?;
-        self.core
-            .with_parsed(|p| rows_for(p, py, bucket, where_, &matchers, usize::MAX, None))
+        self.core.with_parsed(|p| {
+            let mut out = Vec::new();
+            for item in items(p, bucket, where_)? {
+                let record = item.record(p);
+                if matches_all(&matchers, &record) {
+                    out.push(json_to_py(py, &record)?);
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// How many records in `bucket` match every query. Unsearched it builds no
@@ -315,18 +334,26 @@ impl Buckets {
         self.core.with_parsed(|p| {
             let mut rows = Vec::new();
             for bucket in SPLIT_BUCKETS {
-                let (mut inline, mut size, mut external) = (0, 0, 0);
-                for item in items(p, bucket, None)? {
-                    match item.inline_size() {
-                        Some(bytes) => {
-                            inline += 1;
-                            size += bytes;
-                        }
-                        None => external += 1,
-                    }
+                let members = items(p, bucket, None)?;
+                // Only a frame can be blank; the other buckets always pick a side.
+                let sides: &[&'static str] = match *bucket {
+                    "iframes" => &["inline", "external", "blank"],
+                    _ => &["inline", "external"],
+                };
+                for side in sides {
+                    let (count, bytes) = members
+                        .iter()
+                        .filter(|m| m.side() == Some(*side))
+                        .fold((0, 0), |(n, b), m| {
+                            (n + 1, b + m.inline_size().unwrap_or(0))
+                        });
+                    rows.push((
+                        *bucket,
+                        Some(*side),
+                        count,
+                        (*side == "inline").then_some(bytes),
+                    ));
                 }
-                rows.push((*bucket, Some("inline"), inline, Some(size)));
-                rows.push((*bucket, Some("external"), external, None));
             }
             for bucket in ["comments", "forms", "meta", "json_ld", "links", "images"] {
                 let members = items(p, bucket, None)?;
@@ -343,8 +370,14 @@ impl Buckets {
         })
     }
 
-    /// First `n` matching records as `{where, size, preview}` rows, previews
-    /// clipped to `width` characters — the table renderer's input.
+    /// First `n` table rows of the matching records, each
+    /// `{index, where, size, preview, count}` with the preview clipped to `width`
+    /// characters — the table renderer's input.
+    ///
+    /// Identical comments share one row whose `count` says how many there are, so
+    /// a build tool's marker repeated 300 times can't fill the table. When the
+    /// bucket is searched and the hit lies in a string too long to show whole,
+    /// the preview frames the hit rather than the string's start.
     #[pyo3(signature = (bucket, n, width, where_=None, queries=None))]
     fn head(
         &self,
@@ -357,8 +390,114 @@ impl Buckets {
     ) -> PyResult<Vec<PyObject>> {
         check_request(bucket, where_)?;
         let matchers = compile(queries)?;
-        self.core
-            .with_parsed(|p| rows_for(p, py, bucket, where_, &matchers, n, Some(width)))
+        self.core.with_parsed(|p| {
+            let mut rows: Vec<Row> = Vec::new();
+            let mut seen: HashMap<&str, usize> = HashMap::new();
+            let mut index = 0;
+            for item in items(p, bucket, where_)? {
+                let record = (!matchers.is_empty()).then(|| item.record(p));
+                if record.as_ref().is_some_and(|r| !matches_all(&matchers, r)) {
+                    continue;
+                }
+                let at = index;
+                index += 1;
+                if let Item::Comment(text) = &item {
+                    if let Some(&row) = seen.get(text) {
+                        rows[row].count += 1;
+                        continue;
+                    }
+                    // Past the head a new comment is never shown, but its repeats
+                    // still walk by, so keep going rather than break.
+                    if rows.len() >= n {
+                        continue;
+                    }
+                    seen.insert(text, rows.len());
+                } else if rows.len() >= n {
+                    break;
+                }
+                let (side, size, mut preview) = item.row(p, width);
+                if let Some(window) = record.and_then(|r| match_window(&matchers, &r, width)) {
+                    preview = window;
+                }
+                rows.push(Row {
+                    index: at,
+                    side,
+                    size,
+                    preview,
+                    count: 1,
+                });
+            }
+            rows.into_iter().map(|row| table_row(py, row)).collect()
+        })
+    }
+
+    /// Every match of `query` inside the records of `bucket` that match every
+    /// `queries` term, in record order.
+    ///
+    /// Each is `{index, field, text, groups, start, end}`: `index` is the record's
+    /// position in the searched bucket, `field` the top-level record field holding
+    /// the match, and `start`/`end` character offsets into the matched string.
+    /// With `width`, each is instead a table row whose preview frames the match.
+    /// A text an earlier field of the same record already matched is skipped:
+    /// `url`, `raw` and a `src` attribute repeat one address, which is one place.
+    #[pyo3(signature = (bucket, query, where_=None, queries=None, width=None))]
+    fn matches(
+        &self,
+        py: Python<'_>,
+        bucket: &str,
+        query: Query,
+        where_: Option<&str>,
+        queries: Option<Vec<Query>>,
+        width: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        check_request(bucket, where_)?;
+        let matchers = compile(queries)?;
+        let Some(target) = compile(Some(vec![query]))?.pop() else {
+            return Ok(Vec::new());
+        };
+        self.core.with_parsed(|p| {
+            let mut out = Vec::new();
+            let mut index = 0;
+            for item in items(p, bucket, where_)? {
+                let record = item.record(p);
+                if !matches_all(&matchers, &record) {
+                    continue;
+                }
+                let at = index;
+                index += 1;
+                let hits = hits_in(&target, &record, width);
+                let row = match (width, hits.is_empty()) {
+                    (Some(w), false) => Some(item.row(p, w)),
+                    _ => None,
+                };
+                for hit in hits {
+                    let obj = match &row {
+                        Some((side, size, _)) => table_row(
+                            py,
+                            Row {
+                                index: at,
+                                side,
+                                size: *size,
+                                preview: hit.window.unwrap_or_default(),
+                                count: 1,
+                            },
+                        )?,
+                        None => {
+                            let d = PyDict::new(py);
+                            d.set_item("index", at)?;
+                            d.set_item("field", hit.field)?;
+                            d.set_item("text", hit.text)?;
+                            d.set_item("groups", PyTuple::new(py, hit.groups)?)?;
+                            d.set_item("start", hit.start)?;
+                            d.set_item("end", hit.end)?;
+                            d.into_any().unbind()
+                        }
+                    };
+                    out.push(obj);
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -383,9 +522,10 @@ fn check_request(bucket: &str, where_: Option<&str>) -> PyResult<()> {
     Ok(())
 }
 
-/// Which half of a split bucket `e` falls in, or `None` when the bucket
+/// Which side of a split bucket `e` falls on, or `None` when the bucket
 /// excludes it. `srcdoc` beats `src` — the browser renders it and never
-/// requests the `src` — so only a frame without one is external.
+/// requests the `src`. A frame with neither a `srcdoc` nor a `src` that fetches
+/// is `"blank"`: it holds nothing and loads nothing.
 fn side_of(bucket: &str, e: &ElementRef<'_>) -> Option<&'static str> {
     let v = e.value();
     match bucket {
@@ -394,8 +534,9 @@ fn side_of(bucket: &str, e: &ElementRef<'_>) -> Option<&'static str> {
         "scripts" => Some("inline"),
         "styles" if v.name() == "style" => Some("inline"),
         "styles" => v.attr("href").map(|_| "external"),
-        "iframes" if v.attr("src").is_some() && v.attr("srcdoc").is_none() => Some("external"),
-        "iframes" => Some("inline"),
+        "iframes" if v.attr("srcdoc").is_some() => Some("inline"),
+        "iframes" if v.attr("src").is_some_and(fetches) => Some("external"),
+        "iframes" => Some("blank"),
         _ => None,
     }
 }
@@ -452,7 +593,12 @@ fn items<'a>(p: &'a Parsed, bucket: &str, where_: Option<&str>) -> PyResult<Vec<
             }
         }
         "links" => out.extend(p.html.select(&parse_selector("a[href]")?).map(Item::Link)),
-        "images" => out.extend(p.html.select(&parse_selector("img[src]")?).map(Item::Image)),
+        "images" => out.extend(
+            p.html
+                .select(&parse_selector("img[src]")?)
+                .filter(|e| e.value().attr("src").is_some_and(fetches))
+                .map(Item::Image),
+        ),
         "forms" => out.extend(p.html.select(&parse_selector("form")?).map(Item::Form)),
         "meta" => out.extend(p.html.select(&parse_selector("meta")?).map(Item::Meta)),
         "comments" => out.extend(p.html.tree.nodes().filter_map(|n| match n.value() {
@@ -476,9 +622,14 @@ fn items<'a>(p: &'a Parsed, bucket: &str, where_: Option<&str>) -> PyResult<Vec<
                     "iframe" => ("iframe", Some("iframes")),
                     _ => ("image", None),
                 };
-                // Only what the browser requests: an ld+json script is data, and
-                // a frame whose `srcdoc` wins never loads its `src`.
-                if split.is_some_and(|b| side_of(b, &e) != Some("external")) {
+                // Only what the browser requests: an ld+json script is data, a
+                // frame whose `srcdoc` wins never loads its `src`, and an empty or
+                // `about:` src loads nothing.
+                let requested = match split {
+                    Some(b) => side_of(b, &e) == Some("external"),
+                    None => e.value().attr("src").is_some_and(fetches),
+                };
+                if !requested {
                     continue;
                 }
                 out.push(Item::Loaded(e, kind));
@@ -490,6 +641,14 @@ fn items<'a>(p: &'a Parsed, bucket: &str, where_: Option<&str>) -> PyResult<Vec<
 }
 
 impl Item<'_> {
+    /// The side of a split bucket this member sits on; `None` for any other bucket.
+    fn side(&self) -> Option<&'static str> {
+        match self {
+            Item::Script(_, side) | Item::Style(_, side) | Item::Frame(_, side) => Some(side),
+            _ => None,
+        }
+    }
+
     /// The whole record, keyed to the Python record's fields. Search reads this
     /// too, so what a search matches is exactly what the caller gets back.
     fn record(&self, p: &Parsed) -> Value {
@@ -543,7 +702,12 @@ impl Item<'_> {
             }
             Item::Frame(e, side) => {
                 let v = e.value();
-                let (url, raw) = url(v.attr("src"));
+                let (url, raw) = match (*side, v.attr("src")) {
+                    // A blank frame's src loads nothing, so it stays as authored:
+                    // resolving "" would turn it into the page's own URL.
+                    ("blank", Some(src)) => (Value::from(src), Value::from(src)),
+                    (_, src) => url(src),
+                };
                 object([
                     ("where", Value::from(*side)),
                     ("srcdoc", v.attr("srcdoc").map_or(Value::Null, Value::from)),
@@ -593,13 +757,18 @@ impl Item<'_> {
             Item::Meta(e) => {
                 let v = e.value();
                 // `name`, `property` and `http-equiv` fold into one key, so a
-                // caller looks in one place for what the page declares.
+                // caller looks in one place for what the page declares. A bare
+                // `<meta charset>` reads as `charset` with its value as content.
                 let name = v
                     .attr("name")
                     .or_else(|| v.attr("property"))
                     .or_else(|| v.attr("http-equiv"))
+                    .or_else(|| v.attr("charset").map(|_| "charset"))
                     .unwrap_or_default();
-                let content = v.attr("content").unwrap_or_default();
+                let content = v
+                    .attr("content")
+                    .or_else(|| v.attr("charset"))
+                    .unwrap_or_default();
                 object([
                     ("name", Value::from(name)),
                     ("content", Value::from(content)),
@@ -619,6 +788,15 @@ impl Item<'_> {
     /// copy, so only it is previewed straight from the element; every other row
     /// reads the cheap record.
     fn row(&self, p: &Parsed, width: usize) -> (&'static str, Option<usize>, String) {
+        // `k=v` pairs for an element with no name to show, `skip` left out.
+        let attrs_of = |e: &ElementRef<'_>, skip: &str| {
+            e.value()
+                .attrs()
+                .filter(|(k, _)| *k != skip)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         match self {
             Item::Script(e, "inline") | Item::Style(e, "inline") => {
                 let text = collect_text(*e);
@@ -627,6 +805,19 @@ impl Item<'_> {
             Item::Frame(e, "inline") => {
                 let body = e.value().attr("srcdoc").unwrap_or_default();
                 ("inline", Some(body.len()), preview_of(body, width))
+            }
+            Item::Frame(e, "blank") => {
+                // A blank frame shows what it loads plus its id or name — ad slots
+                // are told apart by those alone.
+                let src = e.value().attr("src").filter(|s| !s.trim().is_empty());
+                let rest = attrs_of(e, "src");
+                let src = src.unwrap_or("about:blank");
+                let shown = if rest.is_empty() {
+                    src.to_string()
+                } else {
+                    format!("{src} · {rest}")
+                };
+                ("blank", None, preview_of(&shown, width))
             }
             Item::Comment(text) => ("", Some(text.len()), preview_of(text, width)),
             Item::JsonLd(value, _) => ("", None, preview_of(&value.to_string(), width)),
@@ -640,14 +831,14 @@ impl Item<'_> {
                 let url = preview_url(str_field(&record, "url"), url_width);
                 ("", None, format!("{lead}{url}"))
             }
-            Item::Meta(_) => {
+            Item::Meta(e) => {
                 let record = self.record(p);
-                let pair = format!(
-                    "{}={}",
-                    str_field(&record, "name"),
-                    str_field(&record, "content")
-                );
-                ("", None, preview_of(&pair, width))
+                let shown = match str_field(&record, "name") {
+                    // Nothing names the tag, so its attributes are what tells it apart.
+                    "" => attrs_of(e, ""),
+                    name => format!("{name}={}", str_field(&record, "content")),
+                };
+                ("", None, preview_of(&shown, width))
             }
             Item::Loaded(_, kind) => {
                 let record = self.record(p);
@@ -730,32 +921,118 @@ fn compile(queries: Option<Vec<Query>>) -> PyResult<Vec<Matcher>> {
         .collect()
 }
 
-/// True when `record` satisfies every matcher. Without a field a matcher scans
-/// every value except onyxweb's own labels; with one it scans only that field.
+/// True when `record` satisfies every matcher.
 fn matches_all(matchers: &[Matcher], record: &Value) -> bool {
-    matchers.iter().all(|m| match &m.field {
-        Some(field) => record.get(field).is_some_and(|v| any_match(&m.re, v)),
-        None => record.as_object().is_some_and(|fields| {
-            fields
-                .iter()
-                .any(|(k, v)| !LABEL_FIELDS.contains(&k.as_str()) && any_match(&m.re, v))
-        }),
+    matchers.iter().all(|m| {
+        let mut hit = false;
+        each_string(record, m.field.as_deref(), &mut |_, s| {
+            hit = m.re.is_match(s);
+            !hit
+        });
+        hit
     })
 }
 
-/// True when `re` matches any string or number in `v`, recursively. Nested
-/// object keys count, so a search for `nonce` finds a script carrying that
-/// attribute.
-fn any_match(re: &Regex, v: &Value) -> bool {
-    match v {
-        Value::String(s) => re.is_match(s),
-        Value::Number(n) => re.is_match(&n.to_string()),
-        Value::Array(items) => items.iter().any(|item| any_match(re, item)),
-        Value::Object(fields) => fields
-            .iter()
-            .any(|(k, val)| re.is_match(k) || any_match(re, val)),
-        _ => false,
+/// Feed `visit` every string a search reads in `record`, with the top-level
+/// field holding it: `field` alone when given, else every field but onyxweb's
+/// labels. Numbers and nested object keys count, so a search for `nonce` finds
+/// a script carrying that attribute. `visit` returns false to stop the walk.
+fn each_string(record: &Value, field: Option<&str>, visit: &mut dyn FnMut(&str, &str) -> bool) {
+    fn walk(top: &str, v: &Value, visit: &mut dyn FnMut(&str, &str) -> bool) -> bool {
+        match v {
+            Value::String(s) => visit(top, s),
+            Value::Number(n) => visit(top, &n.to_string()),
+            Value::Array(items) => items.iter().all(|item| walk(top, item, visit)),
+            Value::Object(fields) => fields
+                .iter()
+                .all(|(k, val)| visit(top, k) && walk(top, val, visit)),
+            _ => true,
+        }
     }
+    let Some(fields) = record.as_object() else {
+        return;
+    };
+    for (k, v) in fields {
+        let wanted = match field {
+            Some(f) => k == f,
+            None => !LABEL_FIELDS.contains(&k.as_str()),
+        };
+        if wanted && !walk(k, v, visit) {
+            return;
+        }
+    }
+}
+
+/// A preview framing the latest query's first hit in `record`, or `None` to keep
+/// the ordinary preview because that hit sits in a string short enough to show
+/// whole. The latest query is the narrowest, so it is the one worth framing.
+fn match_window(matchers: &[Matcher], record: &Value, width: usize) -> Option<String> {
+    for m in matchers.iter().rev() {
+        let mut found = None;
+        each_string(record, m.field.as_deref(), &mut |_, s| {
+            if let Some(hit) = m.re.find(s) {
+                found = Some((s.len() > width).then(|| preview_around(s, hit.start(), width)));
+            }
+            found.is_none()
+        });
+        if let Some(window) = found {
+            return window;
+        }
+    }
+    None
+}
+
+/// One match inside a record, before it crosses to Python.
+struct Hit {
+    field: String,
+    text: String,
+    groups: Vec<Option<String>>,
+    /// Character offsets into the matched string.
+    start: usize,
+    end: usize,
+    /// A preview framing the match; built only for a table.
+    window: Option<String>,
+}
+
+/// Every match of `m` in `record`, in field order. A text an earlier field
+/// already matched is skipped, so one address held in `url`, `raw` and a `src`
+/// attribute is reported once, at `url`.
+fn hits_in(m: &Matcher, record: &Value, width: Option<usize>) -> Vec<Hit> {
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut field_start = 0;
+    each_string(record, m.field.as_deref(), &mut |field, s| {
+        if hits.get(field_start).is_some_and(|h| h.field != field) {
+            claimed.extend(hits[field_start..].iter().map(|h| h.text.clone()));
+            field_start = hits.len();
+        }
+        // Walk the string once, counting characters only between matches.
+        let (mut byte, mut chars) = (0, 0);
+        for caps in m.re.captures_iter(s) {
+            let whole = caps.get(0).expect("group 0 is the whole match");
+            if claimed.contains(whole.as_str()) {
+                continue;
+            }
+            chars += s[byte..whole.start()].chars().count();
+            let start = chars;
+            chars += whole.as_str().chars().count();
+            byte = whole.end();
+            hits.push(Hit {
+                field: field.to_string(),
+                text: whole.as_str().to_string(),
+                groups: caps
+                    .iter()
+                    .skip(1)
+                    .map(|g| g.map(|g| g.as_str().to_string()))
+                    .collect(),
+                start,
+                end: chars,
+                window: width.map(|w| preview_around(s, whole.start(), w)),
+            });
+        }
+        true
+    });
+    hits
 }
 
 /// One-line preview clipped to `width` characters, whitespace collapsed so a
@@ -800,18 +1077,42 @@ fn preview_url(url: &str, width: usize) -> String {
     format!("{start}…{end}")
 }
 
-/// A table row dict. Buckets with no inline/external split pass `""` as `where`.
-fn table_row<'py>(
-    py: Python<'py>,
-    where_: &str,
+/// A one-line preview of `s` starting a third of `width` before byte `start`,
+/// so a match deep in a long body shows with what surrounds it. A cut-off start
+/// is marked `…`.
+fn preview_around(s: &str, start: usize, width: usize) -> String {
+    let from = s[..start]
+        .char_indices()
+        .rev()
+        .nth(width / 3)
+        .map_or(0, |(i, _)| i);
+    if from == 0 {
+        return preview_of(s, width);
+    }
+    format!("…{}", preview_of(&s[from..], width.saturating_sub(1)))
+}
+
+/// One table line, held until its repeat count is final.
+struct Row {
+    /// Position in the searched bucket; a group of identical rows keeps its first.
+    index: usize,
+    /// Side of a split bucket, or `""`.
+    side: &'static str,
     size: Option<usize>,
     preview: String,
-) -> PyResult<Bound<'py, PyDict>> {
+    /// How many identical records the row stands for.
+    count: usize,
+}
+
+/// A table row as the Python renderer reads it.
+fn table_row(py: Python<'_>, row: Row) -> PyResult<PyObject> {
     let d = PyDict::new(py);
-    d.set_item("where", where_)?;
-    d.set_item("size", size)?;
-    d.set_item("preview", preview)?;
-    Ok(d)
+    d.set_item("index", row.index)?;
+    d.set_item("where", row.side)?;
+    d.set_item("size", row.size)?;
+    d.set_item("preview", row.preview)?;
+    d.set_item("count", row.count)?;
+    Ok(d.into_any().unbind())
 }
 
 /// Decode a `serde_json::Value` into Python natives.
@@ -846,44 +1147,6 @@ fn json_to_py(py: Python<'_>, v: &Value) -> PyResult<PyObject> {
     })
 }
 
-/// Matching members of `bucket`, up to `limit`: whole records when `clip` is
-/// `None`, `{where, size, preview}` table rows when it carries a width.
-fn rows_for(
-    p: &Parsed,
-    py: Python<'_>,
-    bucket: &str,
-    where_: Option<&str>,
-    matchers: &[Matcher],
-    limit: usize,
-    clip: Option<usize>,
-) -> PyResult<Vec<PyObject>> {
-    let mut out = Vec::new();
-    for item in items(p, bucket, where_)? {
-        if out.len() >= limit {
-            break;
-        }
-        let obj = match clip {
-            None => {
-                let record = item.record(p);
-                if !matches_all(matchers, &record) {
-                    continue;
-                }
-                json_to_py(py, &record)?
-            }
-            Some(width) => {
-                // A row needs no record unless one must be built to test the match.
-                if !matchers.is_empty() && !matches_all(matchers, &item.record(p)) {
-                    continue;
-                }
-                let (side, size, preview) = item.row(p, width);
-                table_row(py, side, size, preview)?.into_any().unbind()
-            }
-        };
-        out.push(obj);
-    }
-    Ok(out)
-}
-
 // ----------------------------------------------------------------------------
 // Element pyclass (by-value snapshot)
 // ----------------------------------------------------------------------------
@@ -899,8 +1162,10 @@ pub struct Element {
     pub html: String,
     #[pyo3(get)]
     pub inner_html: String,
-    /// Serialized subtree HTML — used for nested queries without re-parsing the whole doc.
-    outer_html_for_reparse: String,
+    /// This element's own attributes, snapshotted at parse time (name, value) —
+    /// a re-parse can't recover them for `<html>`/`<body>` (html5ever merges a
+    /// literal wrapper tag onto its own implicit context instead of keeping it).
+    attrs: Vec<(String, String)>,
 }
 
 impl Element {
@@ -910,12 +1175,16 @@ impl Element {
         let outer = e.html();
         let inner = e.inner_html();
         let text = collect_text(e);
+        let attrs = val
+            .attrs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Self {
             tag,
             text,
-            html: outer.clone(),
+            html: outer,
             inner_html: inner,
-            outer_html_for_reparse: outer,
+            attrs,
         }
     }
 }
@@ -925,39 +1194,29 @@ impl Element {
     #[getter]
     fn attrs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
-        // Parse the outer HTML to extract attrs — we stored outer so we can regenerate.
-        // A fragment parse is cheap for a single element's HTML.
-        let fragment = Html::parse_fragment(&self.outer_html_for_reparse);
-        if let Some(first) = fragment.root_element().children().next()
-            && let Some(el) = ElementRef::wrap(first)
-        {
-            for (k, v) in el.value().attrs() {
-                d.set_item(k, v)?;
-            }
+        for (k, v) in &self.attrs {
+            d.set_item(k, v)?;
         }
         Ok(d)
     }
 
     fn attr(&self, name: &str) -> Option<String> {
-        let fragment = Html::parse_fragment(&self.outer_html_for_reparse);
-        fragment
-            .root_element()
-            .children()
-            .next()
-            .and_then(ElementRef::wrap)
-            .and_then(|e| e.value().attr(name).map(str::to_string))
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
     }
 
-    /// Nested query: parse this element's outer HTML as a fragment and run the selector.
+    /// Nested query: parse this element's inner HTML (excludes self) as a fragment.
     fn query(&self, selector: &str) -> PyResult<Vec<Element>> {
         let sel = parse_selector(selector)?;
-        let fragment = Html::parse_fragment(&self.outer_html_for_reparse);
+        let fragment = Html::parse_fragment(&self.inner_html);
         Ok(fragment.select(&sel).map(Element::from_ref).collect())
     }
 
     fn query_one(&self, selector: &str) -> PyResult<Option<Element>> {
         let sel = parse_selector(selector)?;
-        let fragment = Html::parse_fragment(&self.outer_html_for_reparse);
+        let fragment = Html::parse_fragment(&self.inner_html);
         Ok(fragment.select(&sel).next().map(Element::from_ref))
     }
 
@@ -986,10 +1245,10 @@ impl Element {
     }
 
     fn __repr__(&self) -> String {
-        let short = if self.text.len() > 60 {
-            format!("{}…", &self.text[..60])
-        } else {
-            self.text.clone()
+        // Clip by character: a byte offset can land inside a multibyte one.
+        let short = match self.text.char_indices().nth(60) {
+            Some((cut, _)) => format!("{}…", &self.text[..cut]),
+            None => self.text.clone(),
         };
         format!("<Element tag={:?} text={:?}>", self.tag, short)
     }

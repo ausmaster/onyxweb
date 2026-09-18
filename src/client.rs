@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chromiumoxide::browser::BrowserConfigBuilder;
 use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
@@ -485,9 +486,23 @@ impl Client {
         // flag set; the full engine gets a clean new-headless launch with the
         // automation tells stripped (see build_full_launch).
         let (user_data_dir, ephemeral_profile) = resolve_user_data_dir(&config_rs);
+        // Route through onyxweb_wrapper when bundled, so Chrome dies if this process
+        // is abruptly killed; chromiumoxide has no hook to arrange that protection on
+        // its own spawn. Falls back to launching chrome directly when absent (dev
+        // builds, unsupported platform) — best-effort, not a hard failure.
+        let wrapper_path = chrome::resolve_wrapper();
+        let launch_target = wrapper_path.as_deref().unwrap_or(&chrome_path);
         let mut builder = BrowserConfig::builder()
-            .chrome_executable(&chrome_path)
+            .chrome_executable(launch_target)
             .user_data_dir(&user_data_dir);
+        if wrapper_path.is_some() {
+            builder = builder.env("ONYXWEB_REAL_CHROME_PATH", chrome_display.clone());
+        } else {
+            log::warn!(
+                target: "onyxweb::client",
+                "onyxweb_wrapper not bundled; launching chrome directly (it may survive an abrupt kill of this process)"
+            );
+        }
         builder = match config_rs.chrome.engine {
             ChromeEngine::HeadlessShell => build_shell_launch(builder, &config_rs),
             ChromeEngine::Full => build_full_launch(builder, &config_rs, &chrome_path),
@@ -507,13 +522,21 @@ impl Client {
             .map_err(|e| OnyxError::LaunchFailed(e.to_string()))?;
 
         let concurrency = config_rs.concurrency.max(1);
+        let launch_ms = config_rs.timeout.launch_ms;
         let shared_config = Arc::new(parking_lot::RwLock::new(config_rs));
         let pool_config = shared_config.clone();
         let (browser, handler_task, pool) = py
             .allow_threads(|| {
                 runtime.block_on(async {
-                    let (browser, mut handler) =
-                        Browser::launch(cfg).await.map_err(OnyxError::from)?;
+                    let (browser, mut handler) = tokio::time::timeout(
+                        Duration::from_millis(launch_ms),
+                        Browser::launch(cfg),
+                    )
+                    .await
+                    .map_err(|_| {
+                        OnyxError::Timeout(format!("chrome did not launch within {launch_ms}ms"))
+                    })?
+                    .map_err(OnyxError::from)?;
                     let task = tokio::spawn(async move {
                         while let Some(res) = handler.next().await {
                             if res.is_err() {
@@ -545,20 +568,16 @@ impl Client {
     }
 
     /// Swap in a new config. Launch-only fields are validated Python-side
-    /// before this call — we just replace atomically. Next fetch sees the
-    /// new values.
+    /// before this call, which is only made when something changed. Every
+    /// pooled tab is rebuilt on its next acquire: a tab applies UA, emulation,
+    /// scripts, blocks and headers once, when it is created, so a tab kept
+    /// from before the change would ignore it.
     fn update_config(&self, config: &Bound<'_, PyAny>) -> PyResult<()> {
         self.check_open().map_err(PyErr::from)?;
         let new_cfg = parse_client_config(config).map_err(PyErr::from)?;
-        log::debug!(target: "onyxweb::client", "update_config applied");
-        let mut guard = self.inner.config.write();
-        let ctx_changed = guard.network.proxy != new_cfg.network.proxy
-            || guard.network.proxy_bypass_list != new_cfg.network.proxy_bypass_list;
-        *guard = new_cfg;
-        drop(guard);
-        if ctx_changed {
-            self.inner.pool.bump_generation();
-        }
+        *self.inner.config.write() = new_cfg;
+        self.inner.pool.bump_generation();
+        log::debug!(target: "onyxweb::client", "update_config applied; tabs rebuild on next acquire");
         Ok(())
     }
 
