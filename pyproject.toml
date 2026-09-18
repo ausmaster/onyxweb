@@ -121,6 +121,9 @@ features = ["pyo3/extension-module"]
 # Chrome-headless-shell (~179 MB per platform) is NOT bundled into the wheel.
 # Wheels stay small; end users fetch the pinned binary with `onyxweb --install`
 # after install — mirrors Playwright's `playwright install` pattern.
+# Scoped to just the cdylib — with onyxweb_wrapper's [[bin]] also present, an
+# unscoped build broke macOS's -undefined dynamic_lookup linker flag.
+targets = [{ name = "_onyxweb", kind = "cdylib" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
