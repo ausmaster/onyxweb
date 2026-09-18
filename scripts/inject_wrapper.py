@@ -19,6 +19,7 @@ from pathlib import Path
 
 
 def main(argv: list[str]) -> int:
+    """Splice `WRAPPER_BINARY` into `WHEEL` at `onyxweb/_binaries/PLATFORM_SUBDIR/`."""
     if len(argv) != 4:
         print(
             "usage: inject_wrapper.py WHEEL WRAPPER_BINARY PLATFORM_SUBDIR WRAPPER_NAME",

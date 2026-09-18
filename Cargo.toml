@@ -1,3 +1,6 @@
+[workspace]
+members = ["wrapper"]
+
 [package]
 name = "onyxweb"
 version = "0.2.2"
@@ -7,12 +10,6 @@ publish = false
 [lib]
 name = "_onyxweb"
 crate-type = ["cdylib", "lib"]
-
-# chrome_executable() points here instead of the real binary, so Chrome dies when
-# onyxweb's own process dies abruptly. No pyo3 — must never need libpython.
-[[bin]]
-name = "onyxweb_wrapper"
-path = "src/bin/onyxweb_wrapper.rs"
 
 [dependencies]
 pyo3 = { version = "0.25", features = ["extension-module"] }
@@ -49,23 +46,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Bucket search. Linear-time matching, so no user pattern can hang a scan.
 regex = "1"
-
-# onyxweb_wrapper's Linux self-protection (die_with_parent); macOS/Windows are hand-written.
-[target.'cfg(target_os = "linux")'.dependencies]
-ur-taking-me-with-you = "8"
-
-# onyxweb_wrapper's macOS supervisor: kqueue/EVFILT_PROC has no safe wrapper elsewhere.
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-
-# onyxweb_wrapper's Windows supervisor: process snapshot + job-object plumbing.
-[target.'cfg(target_os = "windows")'.dependencies]
-ur-taking-me-with-you = "8"
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
-] }
 
 [profile.release]
 opt-level = 3
