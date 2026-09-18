@@ -33,6 +33,7 @@ from typing import Any, Literal
 
 import onyxweb
 import onyxweb.download as dl
+import psutil
 import pytest
 
 needs_proc = pytest.mark.skipif(not os.path.isdir("/proc"), reason="reads /proc")
@@ -134,48 +135,32 @@ def test_close_is_bounded_when_chrome_stops_responding(
 
 
 def _chrome_tree(root_pid: int) -> set[int]:
-    """Every live Chrome process descended from `root_pid`, walking `/proc` by ppid.
-
-    Unlike `_chrome_children`, `root_pid` need not be this test process itself — the
-    owning process below is a subprocess two levels removed from pytest.
+    """Every live Chrome process descended from `root_pid` (`psutil`, so this runs on
+    all 3 platforms — unlike `_chrome_children`, `root_pid` also need not be this test
+    process itself; the owning process below is a subprocess two levels removed).
     """
-    by_ppid: dict[int, list[int]] = {}
-    names: dict[int, str] = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat") as f:
-                stat = f.read()
-        except OSError:
-            continue
-        name = stat[stat.index("(") + 1 : stat.rindex(")")]
-        state, ppid = stat[stat.rindex(")") + 2 :].split()[:2]
-        if state == "Z":
-            continue
-        names[int(entry)] = name
-        by_ppid.setdefault(int(ppid), []).append(int(entry))
-
+    try:
+        root = psutil.Process(root_pid)
+        candidates = [root, *root.children(recursive=True)]
+    except psutil.NoSuchProcess:
+        return set()
     tree: set[int] = set()
-    stack = [root_pid]
-    while stack:
-        pid = stack.pop()
-        if "chrome" in names.get(pid, ""):
-            tree.add(pid)
-        stack.extend(by_ppid.get(pid, []))
+    for p in candidates:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            if "chrome" in p.name().lower():
+                tree.add(p.pid)
     return tree
 
 
 def _all_gone(pids: set[int], within_s: float) -> bool:
     deadline = time.monotonic() + within_s
     while time.monotonic() < deadline:
-        if not any(Path(f"/proc/{pid}").exists() for pid in pids):
+        if not any(psutil.pid_exists(pid) for pid in pids):
             return True
         time.sleep(0.05)
     return False
 
 
-@needs_proc
 def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
     tmp_path: Path,
 ) -> None:
@@ -183,7 +168,7 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
     run, unlike closing the process group — must not orphan Chrome's whole tree.
 
     Regression for a real process leak: `Browser`'s own `Drop`/`kill_on_drop` need the
-    owning process's Rust runtime to get a turn, which an abrupt `SIGKILL` never gives.
+    owning process's Rust runtime to get a turn, which an abrupt kill never gives.
     New test — nothing else in this suite kills an *external* process and checks
     OS-level survival of what it spawned.
     """
@@ -205,13 +190,13 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
         time.sleep(0.5)  # let the pool's tab finish opening (zygote/GPU/renderer too)
         tree = _chrome_tree(proc.pid)
         assert tree, "expected the subprocess to have a live Chrome process tree"
-        os.kill(proc.pid, signal.SIGKILL)  # only the owning process — not its children
+        proc.kill()  # only the owning process — SIGKILL on POSIX, TerminateProcess on Windows
         assert _all_gone(tree, within_s=5.0), f"orphaned Chrome survived: {tree}"
     finally:
         proc.wait(timeout=5)
         for pid in _chrome_tree(proc.pid):
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                psutil.Process(pid).kill()
 
 
 # --- installing ----------------------------------------------------------------

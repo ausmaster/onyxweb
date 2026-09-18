@@ -54,6 +54,8 @@ dev = [
     "mypy>=1.11",
     # Parity oracle for the Rust-side header/body hashes (BBOT uses mmh3).
     "mmh3>=4.0",
+    # Cross-platform process tree walk/kill for the C7 parent-death regression test.
+    "psutil>=6.0",
 ]
 bench = [
     "pytest>=8",
