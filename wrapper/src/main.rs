@@ -66,33 +66,15 @@ fn proxy_stderr(mut from: std::process::ChildStderr) {
 mod macos {
     use super::proxy_stderr;
     use std::process::{Command, Stdio};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    /// Blocks until `pid` exits, via `kqueue`/`EVFILT_PROC`/`NOTE_EXIT` — macOS has no
-    /// passive death signal, only this kind of active watch, and only for a PID we can
-    /// still see (a race against the parent exiting between `getppid()` and here is
-    /// treated as "already gone").
-    fn wait_for_exit(pid: libc::pid_t) {
-        unsafe {
-            let kq = libc::kqueue();
-            if kq < 0 {
-                return;
-            }
-            let mut change: libc::kevent = std::mem::zeroed();
-            change.ident = pid as usize;
-            change.filter = libc::EVFILT_PROC;
-            change.flags = libc::EV_ADD | libc::EV_ONESHOT;
-            change.fflags = libc::NOTE_EXIT;
-            if libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
-                libc::close(kq);
-                return;
-            }
-            let mut event: libc::kevent = std::mem::zeroed();
-            libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null());
-            libc::close(kq);
+    /// `kill(pid, 0)` sends no signal, only probes existence. `ESRCH` alone means
+    /// gone; any other errno (e.g. `EPERM`) still means alive.
+    fn alive(pid: libc::pid_t) -> bool {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
         }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     pub fn run(chrome_path: String) -> ! {
@@ -109,19 +91,10 @@ mod macos {
         let chrome_pid = child.id() as libc::pid_t;
         proxy_stderr(child.stderr.take().expect("piped"));
 
-        // A graceful Client.close() talks to Chrome directly over CDP, never to us, so
-        // we watch two ends: our own parent dying (kill Chrome, then exit), and Chrome
-        // exiting on its own (just exit — nothing left to clean up).
-        let parent_died = Arc::new(AtomicBool::new(false));
-        {
-            let parent_died = parent_died.clone();
-            std::thread::spawn(move || {
-                wait_for_exit(parent);
-                parent_died.store(true, Ordering::SeqCst);
-            });
-        }
+        // Polled to dodge kqueue's permission quirks on a non-child PID. Watches
+        // two ends: a graceful Client.close() talks to Chrome directly, not us.
         loop {
-            if parent_died.load(Ordering::SeqCst) {
+            if !alive(parent) {
                 unsafe {
                     libc::kill(chrome_pid, libc::SIGKILL);
                 }
@@ -146,7 +119,8 @@ mod windows {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
     };
 
     /// Windows has no `getppid()`; walking a process snapshot for our own entry's
@@ -201,11 +175,17 @@ mod windows {
             std::process::exit(1);
         });
         proxy_stderr(child.stderr.take().expect("piped"));
+        let chrome_pid = child.id();
 
         if !parent_handle.is_null() {
             std::thread::spawn(move || unsafe {
                 WaitForSingleObject(parent_addr as HANDLE, INFINITE);
-                // The job's kill-on-close does the rest once our handle table closes.
+                // Direct kill too — an inherited handle in Chrome's own tree can
+                // keep the job's last reference open, so don't rely on that alone.
+                let h = OpenProcess(PROCESS_TERMINATE, 0, chrome_pid);
+                if !h.is_null() {
+                    TerminateProcess(h, 1);
+                }
                 std::process::exit(1);
             });
         }
