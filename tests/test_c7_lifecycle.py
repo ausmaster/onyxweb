@@ -336,11 +336,16 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     """A forced shell install bounds its socket and leaves a full Chrome beside it intact.
 
     Both engines share the platform dir (full lives in ``full/``), and an install used
-    to wipe it; a download without a socket timeout could hang forever.
+    to wipe it; a download without a socket timeout could hang forever. onyxweb_wrapper
+    (injected into the wheel post-build, same flat dir as the shell binary) must survive
+    too — CI installs the wheel then runs `onyxweb --install`, and this exact directory
+    sweep once deleted the wrapper it had just unpacked.
     """
     full_chrome = tmp_path / _PLATFORM / "full" / "chrome"
     full_chrome.parent.mkdir(parents=True)
     full_chrome.write_bytes(b"FULL_CHROME")
+    wrapper = tmp_path / _PLATFORM / "onyxweb_wrapper"
+    wrapper.write_bytes(b"WRAPPER")
     rec: dict[str, object] = {}
     archive = _zip_bytes(
         {
@@ -355,6 +360,7 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     assert out.read_bytes() == b"SHELL"
     assert (tmp_path / _PLATFORM / "icudtl.dat").read_bytes() == b"ICU"
     assert full_chrome.read_bytes() == b"FULL_CHROME"
+    assert wrapper.read_bytes() == b"WRAPPER"
 
 
 def test_download_engine_specs() -> None:
