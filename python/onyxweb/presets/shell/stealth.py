@@ -36,7 +36,7 @@ What it does NOT fix (out of scope):
 Usage::
 
     from onyxweb import Client
-    from onyxweb.presets import stealth
+    from onyxweb.presets.shell import stealth
 
     client = Client(**stealth.BASIC)             # UA swap + core JS patches
     client = Client(**stealth.FINGERPRINT)       # + WebGL vendor + canvas noise

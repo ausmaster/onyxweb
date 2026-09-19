@@ -346,7 +346,7 @@ class ChromeConfig(BaseModel):
     engine: Literal["full", "shell"] = "shell"
     """Which Chromium build to drive.
 
-    - ``"shell"`` (current default) — the small bundled
+    - ``"shell"`` (default) — the small bundled
       ``chrome-headless-shell``. Fast and light, but old-headless: anti-bot
       vendors (Akamai etc.) flag it even with a spoofed UA.
     - ``"full"`` — a full Chrome/Chromium in ``--headless=new`` with

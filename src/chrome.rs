@@ -133,13 +133,11 @@ pub fn wrapper_binary_name() -> &'static str {
     "onyxweb_wrapper"
 }
 
-/// Bundled `chrome_executable()` points at instead of the real binary, so Chrome dies
-/// with an abruptly-killed onyxweb process. `None` (dev build, unsupported platform)
-/// means callers fall back to launching Chrome directly, unprotected.
+/// The bundled wrapper `chrome_executable()` points at, so Chrome dies with an
+/// abruptly-killed onyxweb process. `None` means launching Chrome directly, unprotected.
 ///
-/// Lives in its own `wrapper/` subdir, not flat in `_binaries/<platform>/`, so
-/// `onyxweb --install`'s directory sweep (which owns that flat dir and `full/`)
-/// can preserve it as a whole foreign subtree instead of by name.
+/// Its own `wrapper/` subdir, so `onyxweb --install`'s sweep of the flat dir can
+/// preserve it as one foreign subtree instead of by name.
 pub fn resolve_wrapper() -> Option<PathBuf> {
     let rel = format!(
         "_binaries/{}/wrapper/{}",
@@ -162,15 +160,19 @@ pub fn resolve_wrapper() -> Option<PathBuf> {
 }
 
 fn which_on_path(name: &str) -> Result<PathBuf> {
-    let path = std::env::var("PATH")
-        .map_err(|_| OnyxError::ChromeNotFound("PATH env not set".to_string()))?;
-    for dir in path.split(':') {
-        if dir.is_empty() {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| OnyxError::ChromeNotFound("PATH env not set".to_string()))?;
+    // `split_paths` honors the platform separator: `;` on Windows, where `:` sits in `C:\`.
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+        let mut candidates = vec![dir.join(name)];
+        if cfg!(windows) {
+            candidates.push(dir.join(format!("{name}.exe")));
+        }
+        if let Some(found) = candidates.into_iter().find(|c| c.is_file()) {
+            return Ok(found);
         }
     }
     Err(OnyxError::ChromeNotFound(format!("{name} not on PATH")))

@@ -1,12 +1,9 @@
 """Splice the platform's onyxweb_wrapper binary into a just-built wheel.
 
-Maturin can't bundle a second compiled binary alongside the pyo3 cdylib in one wheel
-(see ~/.claude/plans/process-leak-pdeathsig-fix.md). CI builds the wrapper separately;
-this repacks it in via `wheel unpack`/`pack`, which regenerates RECORD hashes.
-
-Lands in its own `wrapper/` subdir (not flat beside chrome-headless-shell) so
-`onyxweb --install`'s directory sweep can preserve it as a whole foreign subtree,
-matching `chrome::resolve_wrapper` in Rust.
+Maturin can't bundle a second compiled binary beside the pyo3 cdylib in one wheel, so
+CI builds the wrapper separately and this repacks it in via `wheel unpack`/`pack`
+(which regenerates RECORD hashes). It lands in its own `wrapper/` subdir, matching
+`chrome::resolve_wrapper` in Rust, so `onyxweb --install` preserves it.
 
 Usage:
     python scripts/inject_wrapper.py WHEEL WRAPPER_BINARY PLATFORM_SUBDIR WRAPPER_NAME

@@ -1,8 +1,8 @@
 //! PyO3-visible output types returned from engine operations.
 //!
 //! `RawRenderOutput` and `RawFetchOutput` are simple data containers. The Python
-//! `__init__.py` wraps them into `RenderResult` (str subclass) and `FetchResult`
-//! (dataclass-ish). We keep the Rust side minimal and let Python shape the UX.
+//! `__init__.py` wraps them into `RenderResult` and `FetchResult`. We keep the Rust
+//! side minimal and let Python shape the UX.
 
 use pyo3::prelude::*;
 
