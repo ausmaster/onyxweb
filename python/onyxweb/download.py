@@ -54,10 +54,6 @@ CHROME_VERSION = "148.0.7778.56"
 # CDN: https://storage.googleapis.com/chrome-for-testing-public/<version>/<cft_plat>/<zip>
 CDN_BASE = "https://storage.googleapis.com/chrome-for-testing-public"
 
-# onyxweb_wrapper (see chrome::resolve_wrapper in Rust) sits flat in the same dir as
-# chrome-headless-shell; a shell install must preserve it like it preserves `full/`.
-WRAPPER_NAMES = {"onyxweb_wrapper", "onyxweb_wrapper.exe"}
-
 # internal_key (matches Rust `chrome::platform_subdir()`) → Chrome-for-Testing slug
 CFT_PLATFORM: dict[str, str] = {
     "linux_x86_64": "linux64",
@@ -225,11 +221,11 @@ def download_for(
             staged_bin.chmod(staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
         # Swap staged files into dest_dir, replacing this engine's files but
-        # PRESERVING the sibling engine: shell and full share the platform dir
-        # (shell flat in it, full in the `full/` subdir), so a (re)install of one
-        # must not delete the other. dest_sub is "" for shell, "full" for full.
-        # onyxweb_wrapper also lives flat in the shell dir (see WRAPPER_NAMES).
-        preserve = set() if dest_sub else {"full", *WRAPPER_NAMES}
+        # PRESERVING sibling subdirs this install doesn't own: `full/` (the other
+        # engine) and `wrapper/` (onyxweb_wrapper, injected into the wheel
+        # post-build; see chrome::resolve_wrapper in Rust). dest_sub is "" for
+        # shell, "full" for full.
+        preserve = set() if dest_sub else {"full", "wrapper"}
         dest_dir.mkdir(parents=True, exist_ok=True)
         for existing in list(dest_dir.iterdir()):
             if existing.name in preserve:

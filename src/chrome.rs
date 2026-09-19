@@ -136,8 +136,16 @@ pub fn wrapper_binary_name() -> &'static str {
 /// Bundled `chrome_executable()` points at instead of the real binary, so Chrome dies
 /// with an abruptly-killed onyxweb process. `None` (dev build, unsupported platform)
 /// means callers fall back to launching Chrome directly, unprotected.
+///
+/// Lives in its own `wrapper/` subdir, not flat in `_binaries/<platform>/`, so
+/// `onyxweb --install`'s directory sweep (which owns that flat dir and `full/`)
+/// can preserve it as a whole foreign subtree instead of by name.
 pub fn resolve_wrapper() -> Option<PathBuf> {
-    let rel = format!("_binaries/{}/{}", platform_subdir(), wrapper_binary_name());
+    let rel = format!(
+        "_binaries/{}/wrapper/{}",
+        platform_subdir(),
+        wrapper_binary_name()
+    );
     if let Ok(pkg) = std::env::var("ONYXWEB_PKG_DIR") {
         let p = Path::new(&pkg).join(&rel);
         if p.is_file() {

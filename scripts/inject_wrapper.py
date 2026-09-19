@@ -4,6 +4,10 @@ Maturin can't bundle a second compiled binary alongside the pyo3 cdylib in one w
 (see ~/.claude/plans/process-leak-pdeathsig-fix.md). CI builds the wrapper separately;
 this repacks it in via `wheel unpack`/`pack`, which regenerates RECORD hashes.
 
+Lands in its own `wrapper/` subdir (not flat beside chrome-headless-shell) so
+`onyxweb --install`'s directory sweep can preserve it as a whole foreign subtree,
+matching `chrome::resolve_wrapper` in Rust.
+
 Usage:
     python scripts/inject_wrapper.py WHEEL WRAPPER_BINARY PLATFORM_SUBDIR WRAPPER_NAME
 """
@@ -19,7 +23,7 @@ from pathlib import Path
 
 
 def main(argv: list[str]) -> int:
-    """Splice `WRAPPER_BINARY` into `WHEEL` at `onyxweb/_binaries/PLATFORM_SUBDIR/`."""
+    """Splice `WRAPPER_BINARY` into `WHEEL` at `onyxweb/_binaries/PLATFORM_SUBDIR/wrapper/`."""
     if len(argv) != 4:
         print(
             "usage: inject_wrapper.py WHEEL WRAPPER_BINARY PLATFORM_SUBDIR WRAPPER_NAME",
@@ -36,7 +40,7 @@ def main(argv: list[str]) -> int:
             check=True,
         )
         (package_dir,) = tmp_path.iterdir()
-        dest_dir = package_dir / "onyxweb" / "_binaries" / platform_subdir
+        dest_dir = package_dir / "onyxweb" / "_binaries" / platform_subdir / "wrapper"
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / wrapper_name
         shutil.copyfile(wrapper_binary, dest)
