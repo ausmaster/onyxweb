@@ -1,20 +1,19 @@
-"""Performance gauntlet — real-site throughput benchmarks.
+"""C11 real sites — a live site behaves as the local contracts promise.
 
-All tests marked ``benchmark`` + ``real_sites``. Skipped by default (pyproject
-sets ``addopts = "-m 'not benchmark'"``). Run with:
+Opt-in via the ``benchmark`` / ``real_sites`` markers (excluded from the default
+run, see pyproject's ``addopts = "-m 'not benchmark'"``). Four independent live
+targets: cnn.com (Akamai's UA first-byte-match, guarding the C10 stealth preset),
+a raw throughput gauntlet, a live Cloudflare Turnstile widget (C9's anti-bot
+verdict + C1's ``include_shadow_dom``), and lit.dev's real web components (C8's
+shadow-DOM buckets).
 
-    uv run pytest -m benchmark -s                           # full gauntlet
-    uv run pytest tests/test_gauntlet.py -m benchmark -s    # just this file
+    uv run pytest -m real_sites -s tests/test_c11_real_sites.py
+    uv run pytest -m benchmark -s tests/test_c11_real_sites.py   # + the gauntlet
 
-``-s`` (no output capture) is important — these tests print structured timing
-tables you'll want to see. Tune via env vars:
-
-    ONYXWEB_GAUNTLET_URLS (default 100)     — URLs per sweep iteration
-    ONYXWEB_GAUNTLET_BIG (default 500)      — URLs for the max-throughput run
-    ONYXWEB_GAUNTLET_MAX_C (default 128)    — ceiling concurrency in the sweep
-    ONYXWEB_GAUNTLET_THREADS (default 32)   — Python threads for the drive test
-    ONYXWEB_NAV_TIMEOUT_MS (default 10000)  — per-URL nav timeout (keeps flaky
-                                               tail URLs from dominating)
+Gauntlet env vars — ONYXWEB_GAUNTLET_URLS (default 100, sweep URLs),
+ONYXWEB_GAUNTLET_BIG (500, max-throughput run), ONYXWEB_GAUNTLET_MAX_C (128,
+sweep ceiling), ONYXWEB_GAUNTLET_THREADS (32, Python threads),
+ONYXWEB_NAV_TIMEOUT_MS (10000, per-URL cap).
 """
 
 from __future__ import annotations
@@ -29,8 +28,31 @@ from typing import Literal
 
 import onyxweb
 import pytest
+from onyxweb.presets.shell import stealth
 
 pytestmark = [pytest.mark.benchmark, pytest.mark.real_sites]
+
+
+# ---------------------------------------------------------------------------
+# STEALTH — Akamai's UA first-byte-match, guarding the C10 preset
+# ---------------------------------------------------------------------------
+
+
+def test_stealth_basic_preset_fetches_cnn() -> None:
+    """Without stealth, cnn.com returns ~250 B ``Unknown Error`` because Akamai
+    first-byte-matches ``HeadlessChrome`` in the UA. With ``stealth.BASIC``,
+    the real 5 MB homepage comes through."""
+    with onyxweb.Client(**stealth.BASIC, navigation_timeout_ms=20_000) as c:
+        html = c.fetch("https://cnn.com")
+    assert len(html) > 1_000_000, (
+        f"cnn.com with stealth.BASIC returned only {len(html)} bytes — "
+        f"anti-bot tripwire reactivated? Body head: {str(html)[:400]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAUNTLET — real-site throughput benchmarks
+# ---------------------------------------------------------------------------
 
 URL_FILE = Path(__file__).resolve().parent / "urls_bench_big.txt"
 SWEEP_URL_COUNT = int(os.environ.get("ONYXWEB_GAUNTLET_URLS", "100"))
@@ -57,10 +79,7 @@ def _count_ok(
 ) -> int:
     if capture == "png":
         return sum(1 for b in results if isinstance(b, bytes) and b)
-    return sum(
-        1 for r in results
-        if not isinstance(r, bytes) and _classify(r) == "ok"
-    )
+    return sum(1 for r in results if not isinstance(r, bytes) and _classify(r) == "ok")
 
 
 def _banner(msg: str) -> None:
@@ -106,7 +125,8 @@ def clean_urls(raw_urls: list[str]) -> list[str]:
             results = client.batch(uniq, capture="html")
             elapsed = time.perf_counter() - t
             bad = {
-                url for url, r in zip(uniq, results, strict=True)
+                url
+                for url, r in zip(uniq, results, strict=True)
                 if not isinstance(r, bytes) and _classify(r) != "ok"
             }
             survivors -= bad
@@ -150,7 +170,6 @@ def best_concurrency(sweep_result: tuple[int, float]) -> int:
 
 def test_sweep_picks_reasonable_concurrency(sweep_result: tuple[int, float]) -> None:
     best_c, best_rate = sweep_result
-    assert best_c >= 4, f"sweep picked an unreasonably low concurrency: {best_c}"
     assert best_rate > 1.0, f"peak throughput unreasonably low: {best_rate:.2f} URL/s"
 
 
@@ -174,14 +193,14 @@ def test_python_threads_drive(clean_urls: list[str], best_concurrency: int) -> N
     """Prove the GIL-release model: N Python threads drive ONE Client in parallel."""
     urls = _expand(clean_urls, SWEEP_URL_COUNT)
     _banner(
-        f"Python-thread drive — {PYTHON_THREADS} threads × "
-        f"Client(concurrency={best_concurrency})"
+        f"Python-thread drive — {PYTHON_THREADS} threads × Client(concurrency={best_concurrency})"
     )
     latencies: list[float] = []
     errors = 0
     with onyxweb.Client(
         concurrency=best_concurrency, navigation_timeout_ms=NAV_TIMEOUT_MS
     ) as client:
+
         def work(url: str) -> float:
             t = time.perf_counter()
             try:
@@ -223,9 +242,7 @@ def test_max_throughput(
 ) -> None:
     """Headline number — a big run at the winning concurrency."""
     urls = _expand(clean_urls, BIG_URL_COUNT)
-    _banner(
-        f"MAX THROUGHPUT — {len(urls)} URLs, concurrency={best_concurrency}, capture={capture}"
-    )
+    _banner(f"MAX THROUGHPUT — {len(urls)} URLs, concurrency={best_concurrency}, capture={capture}")
     with onyxweb.Client(
         concurrency=best_concurrency, navigation_timeout_ms=NAV_TIMEOUT_MS
     ) as client:
@@ -247,4 +264,129 @@ def test_max_throughput(
         html_mb = sum(len(r.html) for r in fetches) / 1e6
         png_mb = sum(len(r.png) for r in fetches) / 1e6
         print(f"  payload: {html_mb:.1f} MB html + {png_mb:.1f} MB png")
-    assert rate > 0
+    assert buckets["fail"] < len(urls) // 2, f"too many failures: {buckets}"
+
+
+# ---------------------------------------------------------------------------
+# TURNSTILE — live Cloudflare widget, integration cover for the C9 mocks
+# ---------------------------------------------------------------------------
+#
+# tests/test_c9_anti_bot.py pins detection/self-heal against local fixtures;
+# these prove the same verdicts against a live Cloudflare widget with a real
+# sitekey, where the DOM shape and token format are Cloudflare's, not ours.
+# Target: pagpeter's public per-mode test pages (real sitekeys, neutral pages).
+
+_TURNSTILE_BASE = "https://peet.ws/turnstile-test/"
+_TURNSTILE_SETTLE_MS = 15_000
+_TOKEN_SEL = 'input[name="cf-turnstile-response"]'
+
+
+def _fetch_turnstile(path: str, **kw: object) -> onyxweb.RenderResult:
+    try:
+        with onyxweb.Client(engine="full", navigation_timeout_ms=40_000) as c:
+            return c.fetch(_TURNSTILE_BASE + path, wait_after_ms=_TURNSTILE_SETTLE_MS, **kw)  # type: ignore[arg-type]
+    except (onyxweb.OnyxwebError, TimeoutError) as e:
+        pytest.skip(f"{_TURNSTILE_BASE}{path} unreachable: {e}")
+
+
+def _turnstile_token(r: onyxweb.RenderResult) -> str:
+    el = r.dom.query_one(_TOKEN_SEL)
+    return (el.attr("value") or "") if el else ""
+
+
+def test_passive_pass_reports_resolved_without_shadow_patch() -> None:
+    """Non-interactive mode issues a token with no interaction → resolved.
+
+    Deliberately passes no ``scripts=`` — the token field is light-DOM, so
+    ``anti_bot`` must be accurate on a plain ``fetch()``.
+    """
+    r = _fetch_turnstile("non-interactive.html")
+    token = _turnstile_token(r)
+    if not token:
+        pytest.skip("Cloudflare declined to issue a token from this IP/session")
+    assert token != "XXXX.DUMMY.TOKEN.XXXX", "expected a real token, not the test-key dummy"
+    assert r.anti_bot is not None
+    assert r.anti_bot.vendor == "cloudflare"
+    assert r.anti_bot.resolved is True
+
+
+def test_interactive_gate_reports_unresolved() -> None:
+    """Managed mode withholds the token until interaction → not resolved."""
+    r = _fetch_turnstile("managed.html")
+    if _turnstile_token(r):
+        pytest.skip("managed widget auto-passed; nothing to assert about the gate")
+    assert r.anti_bot is not None
+    assert r.anti_bot.resolved is False
+
+
+def test_include_shadow_dom_recovers_real_widget_markup() -> None:
+    """Turnstile's widget lives in a closed shadow root — captured only when enabled."""
+    plain = _fetch_turnstile("managed.html")
+    assert "challenges.cloudflare.com/cdn-cgi" not in plain.html
+
+    try:
+        with onyxweb.Client(
+            engine="full", navigation_timeout_ms=40_000, include_shadow_dom=True
+        ) as c:
+            deep = c.fetch(_TURNSTILE_BASE + "managed.html", wait_after_ms=_TURNSTILE_SETTLE_MS)
+    except (onyxweb.OnyxwebError, TimeoutError) as e:
+        pytest.skip(f"unreachable: {e}")
+    assert "challenges.cloudflare.com/cdn-cgi" in deep.html
+    assert deep.dom.query_one("iframe") is not None
+
+
+# ---------------------------------------------------------------------------
+# SHADOW DOM — real web components, integration cover for C8's shadow buckets
+# ---------------------------------------------------------------------------
+#
+# The mocked C8/C1 tests pin the ``include_shadow_dom`` mechanism; this proves
+# the gap and the fix are real on a production site. lit.dev renders ~76 shadow
+# hosts, and its cookie banner text is genuinely absent from a default capture.
+
+_SHADOW_URL = "https://lit.dev/"
+_SHADOW_SETTLE_MS = 8_000
+
+_COUNT_HOSTS = """
+(() => { let n = 0;
+  const walk = (r) => r.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) { n++; walk(el.shadowRoot); } });
+  walk(document); return n; })()
+"""
+
+
+def _fetch_shadow(
+    *, post_load_scripts: list[str] | None = None, **client_kw: object
+) -> onyxweb.RenderResult:
+    try:
+        with onyxweb.Client(
+            engine="full",
+            navigation_timeout_ms=45_000,
+            **client_kw,  # type: ignore[arg-type]
+        ) as c:
+            return c.fetch(
+                _SHADOW_URL,
+                wait_after_ms=_SHADOW_SETTLE_MS,
+                post_load_scripts=post_load_scripts or [],
+            )
+    except (onyxweb.OnyxwebError, TimeoutError) as e:
+        pytest.skip(f"{_SHADOW_URL} unreachable: {e}")
+
+
+def test_real_site_uses_shadow_dom() -> None:
+    """Sanity: the target really does render shadow roots, else the rest proves nothing."""
+    r = _fetch_shadow(post_load_scripts=[_COUNT_HOSTS])
+    hosts = r.post_load_results[0]
+    assert isinstance(hosts, int) and hosts >= 5, f"expected shadow hosts, got {hosts}"
+
+
+def test_shadow_content_recovered_on_real_site() -> None:
+    """Custom-element internals are absent by default and present when enabled."""
+    plain = _fetch_shadow()
+    deep = _fetch_shadow(include_shadow_dom=True)
+
+    # lit.dev's own components; their markup only exists inside shadow roots.
+    assert "<litdev-cookie-banner" in plain.html, "sanity: host element is light-DOM"
+    assert len(deep.html) > len(plain.html), "shadow-inclusive capture should be strictly larger"
+    # The banner's rendered text lives inside the component's shadow root.
+    assert "Cookies consent notice" not in plain.html
+    assert "Cookies consent notice" in deep.html

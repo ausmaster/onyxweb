@@ -125,16 +125,54 @@ fn find_bundled(engine: ChromeEngine) -> Option<PathBuf> {
     None
 }
 
+/// Canonical wrapper binary filename per platform.
+pub fn wrapper_binary_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "onyxweb_wrapper.exe";
+    #[allow(unreachable_code)]
+    "onyxweb_wrapper"
+}
+
+/// The bundled wrapper `chrome_executable()` points at, so Chrome dies with an
+/// abruptly-killed onyxweb process. `None` means launching Chrome directly, unprotected.
+///
+/// Its own `wrapper/` subdir, so `onyxweb --install`'s sweep of the flat dir can
+/// preserve it as one foreign subtree instead of by name.
+pub fn resolve_wrapper() -> Option<PathBuf> {
+    let rel = format!(
+        "_binaries/{}/wrapper/{}",
+        platform_subdir(),
+        wrapper_binary_name()
+    );
+    if let Ok(pkg) = std::env::var("ONYXWEB_PKG_DIR") {
+        let p = Path::new(&pkg).join(&rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let p = Path::new(&manifest_dir).join("python/onyxweb").join(&rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn which_on_path(name: &str) -> Result<PathBuf> {
-    let path = std::env::var("PATH")
-        .map_err(|_| OnyxError::ChromeNotFound("PATH env not set".to_string()))?;
-    for dir in path.split(':') {
-        if dir.is_empty() {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| OnyxError::ChromeNotFound("PATH env not set".to_string()))?;
+    // `split_paths` honors the platform separator: `;` on Windows, where `:` sits in `C:\`.
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+        let mut candidates = vec![dir.join(name)];
+        if cfg!(windows) {
+            candidates.push(dir.join(format!("{name}.exe")));
+        }
+        if let Some(found) = candidates.into_iter().find(|c| c.is_file()) {
+            return Ok(found);
         }
     }
     Err(OnyxError::ChromeNotFound(format!("{name} not on PATH")))

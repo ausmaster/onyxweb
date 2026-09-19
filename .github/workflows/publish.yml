@@ -85,6 +85,19 @@ jobs:
           manylinux: "2_28"
           args: --release --out dist -i 3.10 3.11 3.12 3.13
           sccache: true
+          # Built in the wheel's manylinux container, so the glibc baselines match.
+          # No sccache there yet, hence RUSTC_WRAPPER=.
+          before-script-linux: |
+            RUSTC_WRAPPER= cargo build --release --bin onyxweb_wrapper --no-default-features
+            # aarch64 cross-compiles land under target/<triple>/release/.
+            mkdir -p python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper
+            cp "$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper/
+      - name: Check the wrapper is in every wheel
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/linux_${{ matrix.target }}/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -105,11 +118,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Build and stage onyxweb_wrapper
+        run: |
+          cargo build --release --bin onyxweb_wrapper --no-default-features
+          mkdir -p python/onyxweb/_binaries/darwin_aarch64/wrapper
+          cp target/release/onyxweb_wrapper python/onyxweb/_binaries/darwin_aarch64/wrapper/
       - uses: PyO3/maturin-action@v1
         with:
           target: aarch64
           args: --release --out dist --find-interpreter
           sccache: true
+      - name: Check the wrapper is in every wheel
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/darwin_aarch64/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-aarch64
@@ -130,11 +154,24 @@ jobs:
         with:
           python-version: "3.x"
           architecture: x64
+      - name: Build and stage onyxweb_wrapper
+        shell: bash
+        run: |
+          cargo build --release --bin onyxweb_wrapper --no-default-features
+          mkdir -p python/onyxweb/_binaries/windows_x86_64/wrapper
+          cp target/release/onyxweb_wrapper.exe python/onyxweb/_binaries/windows_x86_64/wrapper/
       - uses: PyO3/maturin-action@v1
         with:
           target: x64
           args: --release --out dist --find-interpreter
           sccache: true
+      - name: Check the wrapper is in every wheel
+        shell: bash
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/windows_x86_64/wrapper/onyxweb_wrapper.exe" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x86_64
@@ -174,7 +211,8 @@ jobs:
       - name: Install the built wheel
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --pre onyxweb --find-links dist --force-reinstall
+          python -m pip install pydantic pydantic-settings
+          python -m pip install --pre onyxweb --no-index --no-deps --find-links dist --force-reinstall
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
       - name: Smoke test

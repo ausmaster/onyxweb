@@ -3,8 +3,8 @@
 #
 # Platforms target what `onyxweb-download-chrome` can stage a binary for:
 # linux x86_64 / aarch64, darwin x86_64 / arm64, windows x86_64. Adding a
-# platform requires both a matrix entry here AND a PLATFORMS row in
-# python/onyxweb/_download_chrome.py.
+# platform requires both a matrix entry here AND a CFT_PLATFORM row in
+# python/onyxweb/download.py.
 
 name: CI
 
@@ -34,7 +34,7 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt --all -- --check
       - name: Cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   linux:
     runs-on: ubuntu-22.04
@@ -54,6 +54,19 @@ jobs:
           args: --release --out dist --find-interpreter
           manylinux: "2_28"
           sccache: true
+          # Built in the wheel's manylinux container, so the glibc baselines match.
+          # No sccache there yet, hence RUSTC_WRAPPER=.
+          before-script-linux: |
+            RUSTC_WRAPPER= cargo build --release --bin onyxweb_wrapper --no-default-features
+            # aarch64 cross-compiles land under target/<triple>/release/.
+            mkdir -p python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper
+            cp "$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper/
+      - name: Check the wrapper is in every wheel
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/linux_${{ matrix.target }}/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -72,12 +85,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Build and stage onyxweb_wrapper
+        run: |
+          cargo build --release --bin onyxweb_wrapper --no-default-features
+          mkdir -p python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper
+          cp target/release/onyxweb_wrapper python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper/
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
           sccache: true
+      - name: Check the wrapper is in every wheel
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/darwin_${{ matrix.target }}/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -91,12 +115,25 @@ jobs:
         with:
           python-version: "3.11"
           architecture: x64
+      - name: Build and stage onyxweb_wrapper
+        shell: bash
+        run: |
+          cargo build --release --bin onyxweb_wrapper --no-default-features
+          mkdir -p python/onyxweb/_binaries/windows_x86_64/wrapper
+          cp target/release/onyxweb_wrapper.exe python/onyxweb/_binaries/windows_x86_64/wrapper/
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: x64
           args: --release --out dist --find-interpreter
           sccache: true
+      - name: Check the wrapper is in every wheel
+        shell: bash
+        run: |
+          for whl in dist/*.whl; do
+            python -m zipfile -l "$whl" | grep -q "_binaries/windows_x86_64/wrapper/onyxweb_wrapper.exe" \
+              || { echo "wrapper missing from $whl"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x86_64
@@ -117,7 +154,7 @@ jobs:
 
   test:
     # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
-    # fetch chrome-headless-shell via the new `onyxweb --install` path, run
+    # fetch chrome-headless-shell via `onyxweb --install`, run
     # the default pytest suite. Skips the benchmark tests (-m 'not benchmark'
     # from pyproject addopts).
     needs: [linux]
@@ -134,9 +171,63 @@ jobs:
       - name: Install wheel + dev deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install onyxweb --find-links dist --force-reinstall
+          # onyxweb is already published at this exact version, so a bare
+          # `pip install onyxweb` can resolve to PyPI instead of the local build.
+          python -m pip install pydantic pydantic-settings
+          python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
           python -m pip install --group dev
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
       - name: Run default test suite
         run: pytest tests/
+
+  test-macos:
+    # Real-platform check for onyxweb_wrapper: installs
+    # the actual built wheel and runs C7 lifecycle, including the regression test that
+    # kills only the process holding a Client and checks Chrome's whole tree dies too.
+    needs: [macos]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-aarch64
+          path: dist
+      - name: Install wheel + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pydantic pydantic-settings
+          python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
+          python -m pip install --group dev
+      - name: Fetch chrome-headless-shell
+        run: onyxweb --install
+      - name: Run C7 lifecycle tests
+        run: pytest tests/test_c7_lifecycle.py -v
+
+  test-windows:
+    # See test-macos — same real-platform check, on windows-latest.
+    needs: [windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-x86_64
+          path: dist
+      - name: Install wheel + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pydantic pydantic-settings
+          python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
+          python -m pip install --group dev
+      - name: Fetch chrome-headless-shell
+        run: onyxweb --install
+      - name: Run C7 lifecycle tests
+        run: pytest tests/test_c7_lifecycle.py -v

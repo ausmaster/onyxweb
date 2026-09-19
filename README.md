@@ -22,17 +22,19 @@ Embedding onyxweb in another tool? `await onyxweb.aensure_chrome(dest=...)` inst
 ```python
 import onyxweb
 
-html = onyxweb.fetch("https://example.com")       # rendered HTML, post-JS
+r    = onyxweb.fetch("https://example.com")       # rendered HTML, post-JS
 png  = onyxweb.screenshot("https://example.com")  # png / jpeg / webp
 both = onyxweb.fetch_all("https://example.com")   # both, from one page visit
 
+r.title                               # "Example Domain"
+r.text                                # visible text; script and style source left out
+r.links, r.images, r.scripts          # lazy buckets of records (see Page buckets)
+
 # CSS + BeautifulSoup-style queries, parsed and run in Rust
-html.dom.title()                      # "Example Domain"
-html.dom.find_all("a", limit=10)
-html.dom.links(), html.dom.images()
+r.dom.find_all("a", limit=10)
 ```
 
-`RenderResult` subclasses `str`, so regex, lxml, and BS4 all take it directly.
+`RenderResult` is not a `str`. Pass `r.html` to regex, lxml, or BS4. `str(r)`, `"x" in r`, and `len(r)` still work.
 
 ## Examples
 
@@ -43,7 +45,7 @@ with onyxweb.Client(concurrency=16) as c:
     for r in c.batch(urls, capture="html"):
         if isinstance(r, Exception):   # batch never raises; failures land in place
             continue
-        print(r.status_code, r.dom.title())
+        print(r.status_code, r.title)
 ```
 
 #### 2) Async, or N threads on one Client
@@ -78,6 +80,22 @@ r = client.fetch(
 ```
 
 Per-call settings are reverted before the tab returns to the pool, so nothing leaks between fetches.
+
+## Page buckets
+
+A captured page is sorted into 9 lazy buckets: `scripts`, `styles`, `links`, `images`, `iframes`, `forms`, `meta`, `comments`, `json_ld`. Sizing or printing one costs nothing until you read its records.
+
+```python
+r.overview(prnt=True)                 # count and size of every bucket, no records built
+r.content.scripts                     # inline half: source that lives in the document
+r.resources.scripts                   # external half: URLs the page loads
+r.resources.all()                     # everything the browser fetches, in document order
+
+r.scripts.search("apiKey")            # records containing a string, matched in Rust
+r.scripts.matches(r'"apiKey":"(\w+)"', regex=True)[0].value   # just the captured key
+```
+
+Every URL-bearing record carries `url` (absolute) and `raw` (as authored). Search patterns use Rust's `regex` crate: linear time, no lookaround.
 
 ## Anti-bot
 
