@@ -55,9 +55,9 @@ jobs:
           manylinux: "2_28"
           sccache: true
           # Built in the wheel's manylinux container, so the glibc baselines match.
-          # No sccache yet here; aarch64 pyo3-ffi's build script needs a cross Python.
+          # No sccache there yet, hence RUSTC_WRAPPER=.
           before-script-linux: |
-            RUSTC_WRAPPER= PYO3_CROSS_PYTHON_VERSION=3.11 cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+            RUSTC_WRAPPER= cargo build --release --bin onyxweb_wrapper --no-default-features
             # aarch64 cross-compiles land under target/<triple>/release/.
             mkdir -p python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper
             cp "$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper/
@@ -87,7 +87,7 @@ jobs:
           python-version: "3.11"
       - name: Build and stage onyxweb_wrapper
         run: |
-          cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+          cargo build --release --bin onyxweb_wrapper --no-default-features
           mkdir -p python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper
           cp target/release/onyxweb_wrapper python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper/
       - name: Build wheel
@@ -118,7 +118,7 @@ jobs:
       - name: Build and stage onyxweb_wrapper
         shell: bash
         run: |
-          cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+          cargo build --release --bin onyxweb_wrapper --no-default-features
           mkdir -p python/onyxweb/_binaries/windows_x86_64/wrapper
           cp target/release/onyxweb_wrapper.exe python/onyxweb/_binaries/windows_x86_64/wrapper/
       - name: Build wheel
