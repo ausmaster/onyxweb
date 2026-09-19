@@ -337,14 +337,15 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
 
     Both engines share the platform dir (full lives in ``full/``), and an install used
     to wipe it; a download without a socket timeout could hang forever. onyxweb_wrapper
-    (injected into the wheel post-build, same flat dir as the shell binary) must survive
-    too — CI installs the wheel then runs `onyxweb --install`, and this exact directory
-    sweep once deleted the wrapper it had just unpacked.
+    (injected into the wheel post-build, its own subdir beside the shell binary) must
+    survive too — CI installs the wheel then runs `onyxweb --install`, and this exact
+    directory sweep once deleted a flat-placed wrapper it had just unpacked.
     """
     full_chrome = tmp_path / _PLATFORM / "full" / "chrome"
     full_chrome.parent.mkdir(parents=True)
     full_chrome.write_bytes(b"FULL_CHROME")
-    wrapper = tmp_path / _PLATFORM / "onyxweb_wrapper"
+    wrapper = tmp_path / _PLATFORM / "wrapper" / "onyxweb_wrapper"
+    wrapper.parent.mkdir(parents=True)
     wrapper.write_bytes(b"WRAPPER")
     rec: dict[str, object] = {}
     archive = _zip_bytes(
