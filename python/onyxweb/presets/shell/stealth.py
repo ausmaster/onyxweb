@@ -30,13 +30,13 @@ What it does NOT fix (out of scope):
   ``Array``; detectors that check the prototype chain catch this.
 * Patched-accessor ``toString()`` source — real Chrome accessors stringify
   to ``function get foo() { [native code] }``. Our arrow getters
-  (e.g. ``() => undefined`` for ``webdriver``) are detectable via
+  (e.g. ``() => false`` for ``webdriver``) are detectable via
   ``Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver').get.toString()``.
 
 Usage::
 
     from onyxweb import Client
-    from onyxweb.presets import stealth
+    from onyxweb.presets.shell import stealth
 
     client = Client(**stealth.BASIC)             # UA swap + core JS patches
     client = Client(**stealth.FINGERPRINT)       # + WebGL vendor + canvas noise
@@ -56,15 +56,17 @@ BASIC_UA: str = (
 )
 
 BASIC_UA_METADATA: dict[str, Any] = {
+    # GREASE brand: Chrome rotates this placeholder; verify against a live
+    # browser (navigator.userAgentData.brands) rather than trusting this value.
     "brands": [
         {"brand": "Google Chrome", "version": "148"},
         {"brand": "Chromium", "version": "148"},
-        {"brand": "Not_A Brand", "version": "24"},
+        {"brand": "Not/A)Brand", "version": "99"},
     ],
     "full_version_list": [
         {"brand": "Google Chrome", "version": "148.0.7778.56"},
         {"brand": "Chromium", "version": "148.0.7778.56"},
-        {"brand": "Not_A Brand", "version": "24.0.0.0"},
+        {"brand": "Not/A)Brand", "version": "99.0.0.0"},
     ],
     "platform": "Linux",
     "platform_version": "",
@@ -83,7 +85,8 @@ BASIC_UA_METADATA: dict[str, Any] = {
 
 _PATCH_NATIVE_STEALTH = """\
 /* navigator.webdriver — the most-checked automation tell (Akamai/PerimeterX/
-   DataDome/Cloudflare). A patched arrow getter () => undefined is itself a tell
+   DataDome/Cloudflare). Real Chrome reports `false` (enumerable, configurable),
+   not `undefined` — that's its own tell. A patched arrow getter is itself a tell
    via .toString(), so route it (and toString itself) through a
    Function.prototype.toString that reports [native code] for our functions. */
 (() => {
@@ -97,10 +100,10 @@ _PATCH_NATIVE_STEALTH = """\
   Object.defineProperty(Function.prototype, 'toString', {
     value: proxy, configurable: true, writable: true,
   });
-  const g = () => undefined;
+  const g = () => false;
   native.set(g, orig.call(orig).replace('toString', 'get webdriver'));
   Object.defineProperty(Navigator.prototype, 'webdriver', {
-    get: g, configurable: true,
+    get: g, enumerable: true, configurable: true,
   });
 })();
 """
@@ -186,15 +189,12 @@ Object.defineProperty(navigator, 'deviceMemory', {
 """
 
 _PATCH_WEBGL = """\
-/* WebGL UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL — headless Chrome
-   returns 'Google Inc. (Google)' / 'ANGLE (...)' referencing SwiftShader
-   (the software renderer used when no GPU is available). Anti-bot scripts
-   read these via getParameter(37445/37446). Override to a common integrated
-   GPU identity. */
+/* WebGL vendor/renderer — replace SwiftShader's identity with a real GPU's,
+   keeping Chrome's own "Google Inc. (...)"/"ANGLE (...)" wrapper dialect. */
 (() => {
   const spoof = (p) => {
-    if (p === 37445) return 'Intel Inc.';
-    if (p === 37446) return 'Intel(R) UHD Graphics 620';
+    if (p === 37445) return 'Google Inc. (Intel)';
+    if (p === 37446) return 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (CFL GT2), OpenGL 4.6)';
     return null;
   };
   const orig1 = WebGLRenderingContext.prototype.getParameter;
@@ -213,12 +213,11 @@ _PATCH_WEBGL = """\
 """
 
 _PATCH_CANVAS_NOISE = """\
-/* Canvas fingerprint — perturb a fraction of alpha-channel pixels per
-   session so toDataURL hashes differ. We render onto a clone canvas and
-   serialize THAT, leaving the source canvas untouched (pages that reuse
-   the canvas later see their original pixels). */
+/* Canvas fingerprint — perturb a fraction of alpha-channel pixels, stable for
+   this tab's lifetime (window.name survives navigation, unlike a JS global). */
 (() => {
-  const sessionSeed = Math.floor(Math.random() * 1e9);
+  window.name = window.name || String(Math.floor(Math.random() * 1e9));
+  const sessionSeed = parseInt(window.name, 10) || 0;
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function() {
     try {

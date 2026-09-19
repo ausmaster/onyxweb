@@ -9,7 +9,7 @@ on the ``screenshot()`` / ``fetch_all()`` call for ready-to-archive output
 Usage::
 
     from onyxweb import Client
-    from onyxweb.presets import archival
+    from onyxweb.presets.shell import archival
 
     with Client(**archival.FULL_PAGE) as c:
         page = c.fetch_all(url, full_page=True, format="webp", quality=85)

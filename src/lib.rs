@@ -18,7 +18,7 @@ mod result;
 mod runtime;
 
 use client::Client;
-use dom::{Dom, Element};
+use dom::{Buckets, Dom, Element};
 use result::{ConsoleMessageRs, RawFetchOutput, RawRenderOutput};
 
 /// Initialize env_logger. `ONYXWEB_LOG` takes precedence over `RUST_LOG`;
@@ -79,6 +79,7 @@ fn onyxweb_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawFetchOutput>()?;
     m.add_class::<ConsoleMessageRs>()?;
     m.add_class::<Dom>()?;
+    m.add_class::<Buckets>()?;
     m.add_class::<Element>()?;
     m.add("OnyxwebError", m.py().get_type::<error::OnyxwebError>())?;
     m.add_function(wrap_pyfunction!(_set_rust_log_level, m)?)?;

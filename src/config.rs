@@ -44,6 +44,17 @@ pub enum CaptureConsoleLevel {
     All,
 }
 
+/// What a fetch does when its URL differs from the tab's page only by fragment.
+/// Mirrors ``ClientConfig.hash_navigation``.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashNavigation {
+    /// Default. Load the page fresh, like any other fetch.
+    #[default]
+    Reload,
+    /// Move within the loaded document: no request, page state kept.
+    Continue,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientConfigRs {
     pub concurrency: usize,
@@ -63,6 +74,7 @@ pub struct ClientConfigRs {
     pub bypass_anti_bot: bool,
     /// Which console levels populate `RenderResult.console_messages`.
     pub capture_console_level: CaptureConsoleLevel,
+    pub hash_navigation: HashNavigation,
     pub viewport: ViewportRs,
     pub network: NetworkRs,
     pub emulation: EmulationRs,
@@ -209,6 +221,7 @@ impl Default for ClientConfigRs {
             wait_after_post_load_ms: 0,
             bypass_anti_bot: false,
             capture_console_level: CaptureConsoleLevel::default(),
+            hash_navigation: HashNavigation::default(),
             viewport: ViewportRs::default(),
             network: NetworkRs::default(),
             emulation: EmulationRs {
@@ -296,6 +309,8 @@ pub struct FetchConfigRs {
     pub block_navigation: bool,
     /// Per-call override for anti-bot self-heal. None = inherit client default.
     pub bypass_anti_bot: Option<bool>,
+    /// Per-call override. None = inherit client default.
+    pub hash_navigation: Option<HashNavigation>,
     pub timeout_ms: Option<u64>,
     /// Per-call override. None = inherit client default.
     pub wait_until: Option<WaitUntil>,
@@ -377,6 +392,11 @@ pub fn parse_client_config(py_dict: &Bound<'_, PyAny>) -> Result<ClientConfigRs>
                 }
             };
         }
+        if let Some(v) = d.get_item("hash_navigation")?
+            && !v.is_none()
+        {
+            cfg.hash_navigation = parse_hash_navigation(&v)?;
+        }
         if let Some(v) = d.get_item("viewport")? {
             cfg.viewport = parse_viewport(&v)?;
         }
@@ -436,6 +456,11 @@ pub fn parse_fetch_config(py_dict: &Bound<'_, PyAny>) -> Result<FetchConfigRs> {
             && !v.is_none()
         {
             cfg.bypass_anti_bot = Some(v.extract().map_err(to_internal)?);
+        }
+        if let Some(v) = d.get_item("hash_navigation")?
+            && !v.is_none()
+        {
+            cfg.hash_navigation = Some(parse_hash_navigation(&v)?);
         }
         if let Some(v) = d.get_item("timeout_ms")?
             && !v.is_none()
@@ -526,6 +551,17 @@ fn parse_wait_until(v: &Bound<'_, PyAny>) -> Result<WaitUntil> {
         "load" => Ok(WaitUntil::Load),
         other => Err(OnyxError::InvalidConfig(format!(
             "unknown wait_until {other:?}; expected 'domcontentloaded' or 'load'"
+        ))),
+    }
+}
+
+fn parse_hash_navigation(v: &Bound<'_, PyAny>) -> Result<HashNavigation> {
+    let s: String = v.extract().map_err(to_internal)?;
+    match s.as_str() {
+        "reload" => Ok(HashNavigation::Reload),
+        "continue" => Ok(HashNavigation::Continue),
+        other => Err(OnyxError::InvalidConfig(format!(
+            "unknown hash_navigation {other:?}; expected 'reload' or 'continue'"
         ))),
     }
 }

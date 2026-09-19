@@ -1,6 +1,6 @@
 //! Core navigate-and-capture step, running on a page drawn from the pool.
 //!
-//! Driven by `Client` via tokio. All async, all inside `py.allow_threads()`.
+//! Driven by `Client` on the shared tokio runtime; the sync API releases the GIL around it.
 //! One pooled page per fetch: configure (per-call overrides only), navigate,
 //! capture, reset on error. Pool pages keep their base config + console
 //! listeners across fetches.
@@ -23,11 +23,11 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use futures::StreamExt;
 
 use crate::config::{
-    ActionErrorPolicy, ActionRs, ClientConfigRs, FetchConfigRs, ImageFormat, ScreenshotConfigRs,
-    WaitUntil,
+    ActionErrorPolicy, ActionRs, ClientConfigRs, FetchConfigRs, HashNavigation, ImageFormat,
+    ScreenshotConfigRs, WaitUntil,
 };
 use crate::error::{OnyxError, Result};
-use crate::pool::{CertInfoRs, PageGuard, block_patterns};
+use crate::pool::{CertInfoRs, PageGuard, SCREEN_CHROME_PADDING_PX, block_patterns};
 use crate::result::ConsoleMessageRs;
 
 /// True when ``target`` differs from ``prev`` only by URL fragment (the part
@@ -40,10 +40,10 @@ use crate::result::ConsoleMessageRs;
 /// NOT same-doc — chromium does a full reload, the init scripts re-fire, and
 /// the load event fires; we want the normal goto path.
 ///
-/// Used by `capture_page` to route hash-only navs through `Runtime.evaluate`
-/// (which goes through a separate CDP command channel) rather than
-/// `Page.navigate` (which empirically hangs in chromiumoxide for hash-only
-/// URLs after a previous nav on the same pool tab).
+/// Used by `capture_page`: a fetch reloads such a URL from a blank page, or with
+/// `hash_navigation = Continue` moves within the document via `Runtime.evaluate`.
+/// `Page.navigate` can't be used directly — chromiumoxide's future for it never
+/// resolves for a hash-only change on a pooled tab.
 fn is_same_document_change(prev: &str, target: &str) -> bool {
     fn split(s: &str) -> (&str, Option<&str>) {
         match s.split_once('#') {
@@ -54,37 +54,6 @@ fn is_same_document_change(prev: &str, target: &str) -> bool {
     let (prev_prefix, prev_hash) = split(prev);
     let (target_prefix, target_hash) = split(target);
     prev_prefix == target_prefix && prev_hash != target_hash
-}
-
-/// Append a unique nanosecond cache-buster query parameter to ``url``,
-/// preserving any existing fragment. Used to force chromium to treat a
-/// same-document URL as a new document (so per-call init scripts fire).
-///
-/// data: URLs and other URLs without a query slot fall through unchanged
-/// (best-effort — caller will get the chromiumoxide hang for those).
-fn append_cache_buster(url: &str) -> String {
-    let nano = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let suffix = format!("__onyxweb_t={nano}");
-    let (path_query, hash) = match url.split_once('#') {
-        Some((p, h)) => (p, Some(h)),
-        None => (url, None),
-    };
-    // data: URLs / opaque schemes don't have a useful query slot; bail.
-    if path_query.starts_with("data:") || !path_query.contains("://") {
-        return url.to_string();
-    }
-    let with_q = if path_query.contains('?') {
-        format!("{path_query}&{suffix}")
-    } else {
-        format!("{path_query}?{suffix}")
-    };
-    match hash {
-        Some(h) => format!("{with_q}#{h}"),
-        None => with_q,
-    }
 }
 
 /// Apply an action's failure policy. Returns ``Ok(true)`` if the action
@@ -101,7 +70,14 @@ fn handle_action_result(
     match res {
         Ok(()) => Ok(true),
         Err(e) => match policy {
-            ActionErrorPolicy::Abort => Err(e),
+            // Name the action and selector: CDP's own text ("Could not find node
+            // with given id") doesn't say which action failed.
+            ActionErrorPolicy::Abort => Err(match e {
+                OnyxError::Cdp(msg) => {
+                    OnyxError::Cdp(format!("action {action_name}({selector}) failed: {msg}"))
+                }
+                other => other,
+            }),
             ActionErrorPolicy::Continue => {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -193,10 +169,25 @@ pub async fn capture_page(
     let t0 = Instant::now();
     log::debug!(target: "onyxweb::engine", "[{url}] capture_page mode={mode:?}");
 
+    // Reject an unusable URL before touching the tab. Chrome answers its
+    // `Page.navigate` with an error at once, but chromiumoxide holds that error
+    // for a navigation that never starts, so the fetch would sit out its timeout.
+    if let Err(e) = url::Url::parse(url) {
+        return Err(OnyxError::InvalidUrl(format!(
+            "{url:?} ({e}); pass an absolute URL with a scheme, e.g. \"https://example.com/\""
+        )));
+    }
+
+    // A pure screenshot (no HTML) defaults to its own budget; fetch/fetch_all
+    // default to the navigation one, since both dominate their own op.
+    let default_timeout_ms = match mode {
+        CaptureMode::Png => base.timeout.screenshot_ms,
+        CaptureMode::Html | CaptureMode::Both => base.timeout.navigation_ms,
+    };
     let timeout_ms = per_call
         .timeout_ms
         .or(per_shot.timeout_ms)
-        .unwrap_or(base.timeout.navigation_ms);
+        .unwrap_or(default_timeout_ms);
 
     // Hoist wait_until computation before the fut block so the timeout
     // error path (outside the fut) can name which lifecycle event was
@@ -210,6 +201,7 @@ pub async fn capture_page(
         WaitUntil::DomContentLoaded => "domcontentloaded",
     };
     let bypass_anti_bot = per_call.bypass_anti_bot.unwrap_or(base.bypass_anti_bot);
+    let hash_navigation = per_call.hash_navigation.unwrap_or(base.hash_navigation);
 
     let page = guard.page();
 
@@ -235,8 +227,12 @@ pub async fn capture_page(
     // tab's anti-bot cookies (loop body re-runs a fresh navigate+capture).
     let mut healed = false;
     let mut block_hit: Option<&'static str> = None;
+    // Set once the page reaches `wait_until`, so a timeout after it — settle,
+    // anti-bot wait, post_load_scripts, actions — isn't reported as navigation.
+    let reached_lifecycle = std::sync::atomic::AtomicBool::new(false);
     let fut_result = loop {
         let fut = async {
+            reached_lifecycle.store(false, std::sync::atomic::Ordering::Relaxed);
             // Per-call viewport override (e.g. different size just for this screenshot).
             if let Some((w, h)) = per_shot.viewport {
                 log::trace!(target: "onyxweb::engine", "[{url}] override viewport {w}x{h}");
@@ -246,6 +242,8 @@ pub async fn capture_page(
                         .height(h as i64)
                         .device_scale_factor(base.viewport.device_scale_factor)
                         .mobile(base.viewport.mobile)
+                        .screen_width(w as i64)
+                        .screen_height(h as i64 + SCREEN_CHROME_PADDING_PX)
                         .build()
                         .map_err(|e| OnyxError::Cdp(format!("metrics: {e}")))?,
                 )
@@ -312,6 +310,27 @@ pub async fn capture_page(
                     .await?;
             }
 
+            // A URL that differs from the tab's page only by fragment would continue that
+            // document: no request, the earlier fetch's DOM kept. Continue only when
+            // asked and no per-call init script needs a new document.
+            let current_url = guard.current_url();
+            let same_document =
+                matches!(&current_url, Some(prev) if is_same_document_change(prev, url));
+            let continue_document = same_document
+                && hash_navigation == HashNavigation::Continue
+                && per_call.scripts.is_empty();
+            // Every other fetch leaves for a blank page first, so it never depends on
+            // whatever the tab was last showing: not the prior document's DOM, and not
+            // its still-in-flight network activity, whose late DCL/load event would
+            // otherwise land on this fetch's freshly subscribed listeners (no loaderId
+            // on those events to tell it apart from this fetch's own). Skipped only for
+            // a fresh tab's first fetch, which is already at about:blank.
+            if current_url.is_some() && !continue_document {
+                page.goto("about:blank").await?;
+                // The blank page ran the tab's init scripts; what they logged isn't this page's.
+                guard.console_messages().lock().clear();
+            }
+
             // Subscribe before the nav so the race below can't miss an early event.
             let t_goto = Instant::now();
             let mut dcl_stream = page
@@ -327,25 +346,15 @@ pub async fn capture_page(
                 .await
                 .map_err(OnyxError::from)?;
 
-            // chromiumoxide's Page.navigate future hangs on a hash-only nav on a
-            // pooled tab: same-doc navs without init scripts use Runtime.evaluate;
-            // with init scripts, a cache-buster forces a new-document nav so
-            // addScriptToEvaluateOnNewDocument fires.
-            let needs_init_scripts = !per_call.scripts.is_empty();
-            let is_same_doc =
-                matches!(guard.current_url(), Some(prev) if is_same_document_change(&prev, url));
-
-            let nav_params: Option<NavigateParams> = if is_same_doc && !needs_init_scripts {
+            // Continuing moves within the document through Runtime.evaluate, since
+            // chromiumoxide's navigate future never resolves for a hash-only change.
+            let nav_params: Option<NavigateParams> = if continue_document {
                 let escaped = serde_json::to_string(url).unwrap_or_else(|_| "''".to_string());
                 page.evaluate(format!("location.href = {escaped};").as_str())
                     .await?;
                 None
             } else {
-                let target = if is_same_doc {
-                    append_cache_buster(url)
-                } else {
-                    url.to_string()
-                };
+                let target = url.to_string();
                 // ReferrerPolicy::UnsafeUrl passes the full referrer through; the
                 // default strips path/query cross-origin.
                 Some(match referrer.as_ref() {
@@ -399,6 +408,7 @@ pub async fn capture_page(
             if !same_doc_nav && let Some(err) = guard.nav_error() {
                 return Err(OnyxError::Cdp(err));
             }
+            reached_lifecycle.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Optional post-event settle — lets late async JS mutate the DOM on
             // SPAs that render AFTER the chosen lifecycle event fires.
@@ -441,7 +451,7 @@ pub async fn capture_page(
                         last_len = probe.len();
                         if !looks_like_challenge(&probe)
                             && stable
-                            && probe.len() > CHALLENGE_STUB_MAX_BYTES
+                            && probe.len() > RESOLVED_PAGE_MIN_BYTES
                         {
                             break;
                         }
@@ -812,13 +822,20 @@ pub async fn capture_page(
     if matches!(&fut_result, Err(_) | Ok(Err(_))) {
         // Reset the tab; if that fails (wedged by a stuck nav, or the target
         // died) mark it so the pool recreates it before the next fetch.
-        let reset = tokio::time::timeout(Duration::from_secs(2), page.goto("about:blank")).await;
+        let reset = tokio::time::timeout(RESET_TIMEOUT, page.goto("about:blank")).await;
         if !matches!(reset, Ok(Ok(_))) {
             guard.mark_poisoned();
         }
     }
 
     let mut result = fut_result.map_err(|_| {
+        if reached_lifecycle.load(std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(target: "onyxweb::engine", "[{url}] post-{wait_until_label} timeout after {timeout_ms}ms");
+            return OnyxError::Timeout(format!(
+                "{url} reached {wait_until_label}, but the settle, anti-bot wait, \
+                 post_load_scripts or actions after it did not finish within {timeout_ms}ms"
+            ));
+        }
         log::warn!(target: "onyxweb::engine", "[{url}] nav timeout after {timeout_ms}ms");
         OnyxError::NavigationTimeout {
             timeout_ms,
@@ -871,6 +888,11 @@ pub async fn capture_page(
     Ok(result)
 }
 
+/// How long a failed fetch waits for its tab to reset to `about:blank`. A healthy
+/// reset takes about 5 ms; after a stuck navigation it never completes and the tab
+/// is recreated instead (about 23 ms), so a longer wait only delays the error.
+const RESET_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Max time to wait for an anti-bot challenge interstitial to self-resolve.
 const CHALLENGE_MAX_WAIT_MS: u64 = 12_000;
 /// Poll interval while waiting for a challenge to resolve.
@@ -878,7 +900,13 @@ const CHALLENGE_POLL_MS: u64 = 500;
 
 /// A real page behind these WAFs is large; a challenge interstitial is a tiny
 /// stub. Signals that ALSO leak onto normal pages only count below this size.
-const CHALLENGE_STUB_MAX_BYTES: usize = 15_000;
+const CHALLENGE_STUB_MAX_BYTES: usize = 30_720;
+
+/// Smallest page the bypass wait accepts as the resolved one; less after a
+/// challenge reload is still the thin early page. Kept apart from
+/// `CHALLENGE_STUB_MAX_BYTES`, which tunes detection — sharing one constant made
+/// resolved pages of 15-30 KB wait out the whole `CHALLENGE_MAX_WAIT_MS`.
+const RESOLVED_PAGE_MIN_BYTES: usize = 15_000;
 
 /// Anti-bot challenge/interstitial detector — a small "checking your browser /
 /// verify you're human" page a WAF serves before the real one, which typically
@@ -895,14 +923,27 @@ const CHALLENGE_STUB_MAX_BYTES: usize = 15_000;
 /// Extend either list as new vendors appear.
 fn challenge_vendor(html: &str) -> Option<&'static str> {
     let lower = html.to_ascii_lowercase();
+    let has = |m: &str| lower.contains(m);
+    let any = |ms: &[&str]| ms.iter().any(|m| lower.contains(m));
+
+    // AWS WAF: the envelope vars persist on a SOLVED page, so only the live
+    // proof-of-work loader proves the gate is still up. Size-independent.
+    if any(&["gokuprops", "awswafcookiedomainlist"])
+        && any(&["token.awswaf.com", "awswafintegration", "checkforcerefresh"])
+    {
+        return Some("aws");
+    }
+
     // Interstitial-exclusive: absent from real pages. Any size.
     const STRONG_MARKERS: &[(&str, &str)] = &[
         ("akamai", "sec-if-cpt-container"),
+        ("akamai", "sec-cpt-if"),
+        ("akamai", "/_sec/cp_challenge"),
         ("akamai", "scf-akamai"),
         ("cloudflare", "cf-browser-verification"),
         ("cloudflare", "cf_chl_"), // window._cf_chl_opt, cf_chl_opt, ...
         ("datadome", "captcha-delivery.com"),
-        ("perimeterx", "px-captcha"),
+        ("datadome", "ddcaptchaencoded"),
         ("imperva", "incapsula incident"),
     ];
     if let Some((vendor, _)) = STRONG_MARKERS.iter().find(|(_, m)| lower.contains(m)) {
@@ -911,23 +952,68 @@ fn challenge_vendor(html: &str) -> Option<&'static str> {
     if html.len() >= CHALLENGE_STUB_MAX_BYTES {
         return None;
     }
-    // Leaky markers — trusted only on a small stub, above: the passive
-    // Cloudflare beacon, Imperva's `_Incapsula_Resource` rewriting, and the
-    // reCAPTCHA/hCaptcha widget markers (which also appear on normal pages that
-    // merely embed a captcha-protected form).
+
+    // Akamai's sensor bundle loads on every Akamai-fronted page, so `akam/13`
+    // counts only alongside a challenge-specific co-signal.
+    if has("akam/13")
+        && any(&[
+            "sensor_data",
+            "bm-verify",
+            "sec-if-cpt-container",
+            "sec-cpt-if",
+        ])
+    {
+        return Some("akamai");
+    }
+    if has("_abck") {
+        return Some("akamai");
+    }
+    // PerimeterX before the generic captcha rules so attribution wins.
+    if any(&[
+        "press &amp; hold",
+        "press & hold",
+        "press and hold",
+        "px-captcha",
+    ]) {
+        return Some("perimeterx");
+    }
+    if has("pardon our interruption") {
+        return Some("imperva");
+    }
+    if any(&["_kpsdk", "ips.js"]) {
+        return Some("kasada");
+    }
+
     const WEAK_MARKERS: &[(&str, &str)] = &[
         ("cloudflare", "cdn-cgi/challenge-platform"),
         ("cloudflare", "turnstile"),
         ("imperva", "_incapsula_resource"),
         ("imperva", "/_incapsula"),
-        ("recaptcha", "g-recaptcha"),
-        ("recaptcha", "grecaptcha"),
-        ("hcaptcha", "h-captcha"),
-        ("hcaptcha", "hcaptcha"),
     ];
     if let Some((vendor, _)) = WEAK_MARKERS.iter().find(|(_, m)| lower.contains(m)) {
         return Some(vendor);
     }
+
+    // Invisible reCAPTCHA v3 ships on ordinary pages — its badge, response
+    // textarea and gstatic script are not a gate. A rendered widget carries
+    // `data-sitekey`, and an interactive one loads an anchor/bframe iframe.
+    let interactive = has("data-sitekey")
+        || any(&[
+            "api2/anchor",
+            "api2/bframe",
+            "hcaptcha.com/captcha",
+            "i'm not a robot",
+            "i\u{2019}m not a robot",
+            "select all images",
+            "recaptcha challenge",
+        ]);
+    if interactive && any(&["g-recaptcha", "grecaptcha"]) {
+        return Some("recaptcha");
+    }
+    if interactive && any(&["h-captcha", "hcaptcha"]) {
+        return Some("hcaptcha");
+    }
+
     const CHALLENGE_PHRASES: &[&str] = &[
         "checking your browser",
         "checking if the site connection is secure",
@@ -1046,8 +1132,30 @@ fn header_signal(out: &CaptureOutput) -> Option<(&'static str, &'static str)> {
     }
     // Kasada: `x-kpsdk-ct` on a hard block (silent PoW, no interstitial). A recon
     // signal only — not defeatable CDP-only.
-    if matches!(out.status_code, 403 | 429) && header("x-kpsdk-ct").is_some() {
-        return Some(("kasada", "block"));
+    // Kasada also serves 200 shells; match the whole x-kpsdk-* family.
+    if out
+        .headers
+        .iter()
+        .any(|(k, _)| k.to_ascii_lowercase().starts_with("x-kpsdk"))
+    {
+        let kind = if matches!(out.status_code, 403 | 429 | 498) {
+            "block"
+        } else {
+            "challenge"
+        };
+        return Some(("kasada", kind));
+    }
+    // Vendor-attributing headers: precise, and they fire where a generic
+    // `Server` header would leave the vendor unknown.
+    for (name, vendor) in [
+        ("x-datadome", "datadome"),
+        ("x-perimeterx-id", "perimeterx"),
+        ("x-iinfo", "imperva"),
+        ("x-akamai-transformed", "akamai"),
+    ] {
+        if header(name).is_some() && matches!(out.status_code, 403 | 429 | 498 | 503) {
+            return Some((vendor, "block"));
+        }
     }
     None
 }
@@ -1060,7 +1168,7 @@ fn header_signal(out: &CaptureOutput) -> Option<(&'static str, &'static str)> {
 fn block_vendor(out: &CaptureOutput) -> Option<&'static str> {
     // 403/429 are the usual WAF block codes; Fastly / Signal Sciences defaults
     // to 406. A signature is still required, so a plain 406 isn't flagged.
-    if !matches!(out.status_code, 403 | 429 | 406) {
+    if !matches!(out.status_code, 403 | 429 | 406 | 498) {
         return None;
     }
     // Join ALL `Server` header values — a CDN/proxy in front of the origin can
