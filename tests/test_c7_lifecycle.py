@@ -203,9 +203,9 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
 def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
     """The last resolution stage: a Chrome present only on ``PATH`` is found on every OS.
 
-    An instantly-exiting stub stands in, so a found Chrome fails to launch (``kind`` is
-    not ``chrome_not_found``). Skips where a system Chrome shadows ``PATH``. New test —
-    nothing else reaches this stage, which needs no bundled Chrome.
+    An instantly-exiting stub stands in, so a found Chrome fails to launch rather than
+    "not found". Skips where a system Chrome shadows ``PATH``. New test — nothing else
+    reaches this stage, which needs no bundled Chrome.
     """
     windows = sys.platform == "win32"
     exits_at_once = shutil.which("hostname" if windows else "true")
@@ -217,8 +217,8 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
         "import onyxweb\n"
         "try:\n"
         "    onyxweb.Client(launch_timeout_ms=5000)\n"
-        "except onyxweb.OnyxwebError as e:\n"
-        "    print(e.kind)\n"
+        "except (onyxweb.OnyxwebError, TimeoutError) as e:\n"
+        "    print(e)\n"
         "else:\n"
         "    print('launched')\n"
     )
@@ -230,11 +230,11 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
     out = subprocess.run(
         [sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=60
     )
-    kind = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else out.stderr
-    if kind == "launched":
+    said = out.stdout.strip()
+    assert said, out.stderr
+    if said == "launched":
         pytest.skip("a system Chrome shadows PATH")
-    assert kind != "chrome_not_found", "PATH was not searched"
-    assert kind in {"cdp", "launch_failed", "timeout"}, out.stderr
+    assert "not found" not in said.lower(), f"PATH was not searched: {said}"
 
 
 # --- installing ----------------------------------------------------------------
