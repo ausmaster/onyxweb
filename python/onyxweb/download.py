@@ -221,7 +221,7 @@ def download_for(
             staged_bin.chmod(staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
         # Swap staged files in, keeping subdirs this install doesn't own: `full/`
-        # (the other engine) and `wrapper/` (onyxweb_wrapper, injected post-build).
+        # (the other engine) and `wrapper/` (onyxweb_wrapper, bundled into the wheel).
         preserve = set() if dest_sub else {"full", "wrapper"}
         dest_dir.mkdir(parents=True, exist_ok=True)
         for existing in list(dest_dir.iterdir()):

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.8,<2.0"]
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -121,9 +121,11 @@ features = ["pyo3/extension-module"]
 # Chrome-headless-shell (~179 MB per platform) is NOT bundled into the wheel.
 # Wheels stay small; end users fetch the pinned binary with `onyxweb --install`
 # after install — mirrors Playwright's `playwright install` pattern.
-# Scoped to just the cdylib; onyxweb_wrapper is a separate workspace member that
-# CI injects into the wheel (scripts/inject_wrapper.py).
+# Scoped to just the cdylib: maturin cannot build a sibling bin into a pyo3 wheel.
 targets = [{ name = "_onyxweb", kind = "cdylib" }]
+# onyxweb_wrapper is a separate workspace member. CI builds it and stages it here
+# before maturin runs; `include` bundles it despite .gitignore (needs maturin >= 1.12.1).
+include = [{ path = "python/onyxweb/_binaries/*/wrapper/*", format = "wheel" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
