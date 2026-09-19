@@ -65,14 +65,27 @@ fn proxy_stderr(mut from: std::process::ChildStderr) {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::proxy_stderr;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::process::{Child, Command, Stdio};
 
-    /// `kill(pid, 0)` sends no signal, only probes existence — but on macOS an
-    /// exited-not-yet-reaped zombie reports `EPERM` here, not `ESRCH`. Our own
-    /// parent is always same-user, so any error (not just `ESRCH`) means dead.
-    fn alive(pid: libc::pid_t) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
+    /// `kill(pid, 0)` is not a fit here: measured directly, macOS reports an
+    /// exited-not-yet-reaped zombie as alive (success), not `ESRCH`/`EPERM`,
+    /// for as long as it stays unreaped — and our real parent (a grandparent
+    /// two levels up) is never the one to reap it, so this could stay wrong
+    /// indefinitely. `EVFILT_PROC`/`NOTE_EXIT` fires on the kernel's own exit
+    /// notification instead, independent of reaping, and needs no parent-child
+    /// relationship to the watched pid (measured: ~1ms to register, fires
+    /// within a second of a same-user non-child's exit).
+    fn watch_exit(kq: libc::c_int, pid: libc::pid_t) -> std::io::Result<()> {
+        let mut kev: libc::kevent = unsafe { std::mem::zeroed() };
+        kev.ident = pid as usize;
+        kev.filter = libc::EVFILT_PROC;
+        kev.flags = libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT;
+        kev.fflags = libc::NOTE_EXIT;
+        let rc = unsafe { libc::kevent(kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub fn run(chrome_path: String) -> ! {
@@ -89,20 +102,51 @@ mod macos {
         let chrome_pid = child.id() as libc::pid_t;
         proxy_stderr(child.stderr.take().expect("piped"));
 
-        // Polled to dodge kqueue's permission quirks on a non-child PID. Watches
-        // two ends: a graceful Client.close() talks to Chrome directly, not us.
-        loop {
-            if !alive(parent) {
-                unsafe {
-                    libc::kill(chrome_pid, libc::SIGKILL);
-                }
-                std::process::exit(1);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => std::process::exit(status.code().unwrap_or(1)),
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-                Err(_) => std::process::exit(1),
-            }
+        // Watches two ends on one kqueue: our own parent (kill chrome, we're
+        // done) and chrome itself (a graceful Client.close() talks to chrome
+        // directly over CDP, never to us, so we must notice it leaving too).
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 || watch_exit(kq, parent).is_err() || watch_exit(kq, chrome_pid).is_err() {
+            eprintln!(
+                "onyxweb_wrapper: kqueue setup failed ({}); running unprotected",
+                std::io::Error::last_os_error()
+            );
+            exit_with(&mut child);
+        }
+
+        let mut events: [libc::kevent; 1] = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                1,
+                std::ptr::null(),
+            )
+        };
+        if n <= 0 {
+            eprintln!(
+                "onyxweb_wrapper: kevent wait failed ({}); killing chrome defensively",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::kill(chrome_pid, libc::SIGKILL) };
+            std::process::exit(1);
+        }
+        let fired = events[0].ident as libc::pid_t;
+        if fired == chrome_pid {
+            // Chrome exited on its own; match its exit code rather than kill anything.
+            exit_with(&mut child);
+        }
+        // Our own parent exited — chrome has no other reason to live.
+        unsafe { libc::kill(chrome_pid, libc::SIGKILL) };
+        std::process::exit(1);
+    }
+
+    fn exit_with(child: &mut Child) -> ! {
+        match child.wait() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(_) => std::process::exit(1),
         }
     }
 }
