@@ -279,6 +279,7 @@ jobs:
       - name: Create the GitHub release from CHANGELOG.md
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           if gh release view "v$VERSION" >/dev/null 2>&1; then
