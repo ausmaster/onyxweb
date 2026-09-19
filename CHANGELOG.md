@@ -5,6 +5,17 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 
 ## [Unreleased]
 
+### Added
+- `RenderResult.save()` and `RenderResult.load()`: a JSON snapshot that reads back with the same buckets, search, text, headers and metadata, without Chrome or the network.
+- `RenderResult.snapshot()`, the JSON-ready dict that `save()` writes.
+- `onyxweb page` with `overview`, `search` and `text`, to query a snapshot offline.
+- `Dom(html, doc_url)` can be built from Python, and `ResponseHeaders.pairs` lists every header as received.
+- `onyxweb URL --json -o PATH` writes the snapshot to a file.
+
+### Changed
+- `onyxweb URL --json` prints the snapshot: every key it printed before, plus headers, metadata, console messages, script results and the anti-bot verdict. With `-o PATH` it writes there instead of stdout.
+- A `RenderResult` built by hand parses the html it holds, so `.dom` and the buckets work on it instead of raising.
+
 ## [0.2.3] - 2026-09-18
 
 ### Added

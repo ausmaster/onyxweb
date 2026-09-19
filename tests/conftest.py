@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import base64
 import socket
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
 
+import onyxweb
 import pytest
 from pytest_httpserver import HTTPServer
 
@@ -28,6 +31,14 @@ JPEG_MAGIC = b"\xff\xd8\xff"
 def is_webp(data: bytes) -> bool:
     """True if `data` opens with a RIFF/WEBP header."""
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def reloaded(r: onyxweb.RenderResult) -> onyxweb.RenderResult:
+    """The result after a save and a load, as a caller who cached it would see it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "page.json"
+        r.save(path)
+        return onyxweb.RenderResult.load(path)
 
 
 @pytest.fixture

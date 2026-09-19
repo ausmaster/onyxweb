@@ -97,6 +97,72 @@ r.scripts.matches(r'"apiKey":"(\w+)"', regex=True)[0].value   # just the capture
 
 Every URL-bearing record carries `url` (absolute) and `raw` (as authored). Search patterns use Rust's `regex` crate: linear time, no lookaround.
 
+## Snapshots
+
+A snapshot is one JSON file holding a page and its response. Save it once, then read it later with no Chrome and no network.
+
+```python
+r.save("page.json")                          # html, headers, metadata, verdicts
+r = onyxweb.RenderResult.load("page.json")   # same buckets, search and text
+```
+
+```bash
+onyxweb https://example.com --json -o page.json   # fetch once, keep a snapshot
+onyxweb page overview page.json                   # then look, with no re-fetch
+onyxweb page search page.json apiKey
+onyxweb page text page.json scripts 1             # one record, whole
+```
+
+`onyxweb page` reads a snapshot and never fetches:
+
+| Command | Prints |
+|---|---|
+| `overview FILE` | count and size of every bucket |
+| `search FILE QUERY` | each match with its surroundings; `--bucket`, `--field`, `--regex` and `--case-sensitive` narrow it |
+| `text FILE BUCKET INDEX` | one record's whole content; `INDEX` is the `#` column of a table |
+
+A snapshot holds the html, final URL, status, headers, metadata, console messages, script results and anti-bot verdict. It holds no screenshot. The file is JSON, not pickle, so loading one runs no code, and it carries a version: `load` rejects a newer one and says how to fix it. `r.snapshot()` returns the same data as a dict.
+
+<details>
+<summary><code>onyxweb page --help</code></summary>
+
+```text
+usage: python -m onyxweb page [-h] command ...
+
+Query a saved page snapshot offline.
+
+positional arguments:
+  command
+    overview  count and size of every bucket
+    search    show where a query matches
+    text      print one record's whole content
+
+options:
+  -h, --help  show this help message and exit
+```
+
+```text
+usage: python -m onyxweb page search [-h]
+                                     [--bucket {scripts,styles,iframes,comments,forms,meta,json_ld,links,images}]
+                                     [--field FIELD] [--regex]
+                                     [--case-sensitive]
+                                     snapshot query
+
+positional arguments:
+  snapshot              file from --json -o or RenderResult.save
+  query                 text to find, or a pattern with --regex
+
+options:
+  -h, --help            show this help message and exit
+  --bucket {scripts,styles,iframes,comments,forms,meta,json_ld,links,images}
+                        search one bucket only
+  --field FIELD         match only inside this record field, e.g. url
+  --regex               treat the query as a pattern
+  --case-sensitive      match letter case exactly
+```
+
+</details>
+
 ## Anti-bot
 
 `r.anti_bot` is populated on **every** fetch, whether or not you try to get past anything, so a plain fetch tells you a host sits behind Akamai.
@@ -149,7 +215,8 @@ Hashes (md5 / mmh3 / sha256) are computed in Rust and match Python's `hashlib` a
 ```bash
 onyxweb https://example.com                  # HTML to stdout
 onyxweb https://example.com -o page.html -s shot.png
-onyxweb https://example.com --json           # HTML + metadata as JSON
+onyxweb https://example.com --json           # snapshot JSON: page, headers, metadata
+onyxweb https://example.com --json -o page.json   # ... to a file
 onyxweb --help                               # every config knob is a flag
 ```
 

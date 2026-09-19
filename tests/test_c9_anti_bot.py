@@ -23,6 +23,7 @@ from typing import Any
 
 import onyxweb
 import pytest
+from conftest import reloaded
 from onyxweb import AntiBot
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
@@ -332,6 +333,7 @@ def test_verdict(client: onyxweb.Client, httpserver: HTTPServer, row: str) -> No
     if premise is not None:
         assert premise(r), "the capture doesn't meet the row's premise"
     assert r.anti_bot == expected
+    assert reloaded(r).anti_bot == expected  # the verdict survives a snapshot
 
 
 # --- bypass scenarios --------------------------------------------------------

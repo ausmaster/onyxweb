@@ -4,7 +4,9 @@
   python -m onyxweb <URL> -o page.html                 # HTML → file
   python -m onyxweb <URL> -s shot.png                  # HTML → stdout, PNG → file
   python -m onyxweb <URL> --screenshot-only shot.webp  # image-only, HTML silenced
-  python -m onyxweb <URL> --json                       # single-line JSON with metadata
+  python -m onyxweb <URL> --json                       # snapshot JSON: page, headers, metadata
+  python -m onyxweb <URL> --json -o page.json          # same, to a file
+  python -m onyxweb page overview page.json            # query a snapshot offline; see `page --help`
 
 Image format inferred from output extension (``.jpg`` / ``.jpeg`` → jpeg,
 ``.webp`` → webp, else png). Override with ``--format`` / ``--quality``.
@@ -23,6 +25,7 @@ from typing import IO, Any, Literal, NoReturn, cast
 import pydantic
 
 import onyxweb
+from onyxweb.page import main as page_main
 
 
 def _parse_header(s: str) -> tuple[str, str]:
@@ -49,6 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog="python -m onyxweb",
         description="Fetch a URL, return fully-rendered HTML (post-JS) and/or a screenshot.",
+        epilog="to query a saved snapshot offline, run: python -m onyxweb page --help",
     )
     p.add_argument("url", nargs="?", help="URL to fetch")
     p.add_argument("--version", action="store_true", help="print version and exit")
@@ -78,7 +82,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     out.add_argument(
         "--json", action="store_true",
-        help="emit a single JSON object {html, errors, final_url, status_code, elapsed_s}",
+        help=(
+            "emit a snapshot as one JSON object (html, status, headers, metadata, ...) "
+            "instead of the HTML, to --output if given; read it back with "
+            "`onyxweb page` or RenderResult.load"
+        ),
     )
     out.add_argument(
         "--meta", action="store_true",
@@ -273,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     (fetch / screenshot / install / etc.), and returns a process exit code:
     0 success, 1 bad arg, 2 fetch error.
     """
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["page"]:  # not a URL (no scheme), so no clash with the positional
+        return page_main(argv[1:])
     p = _build_parser()
     args = p.parse_args(argv)
 
@@ -314,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     shot_path = args.screenshot or args.screenshot_only
     img_format = _infer_format(shot_path, args.format)
 
-    # HTML destination: file (-o PATH) / stdout ('-' or unset) / suppressed (--screenshot-only).
+    # Destination of the HTML, or of the snapshot with --json: file (-o PATH) / stdout ('-' or
+    # unset) / suppressed (--screenshot-only).
     html_to_file: Path | None = None
     html_to_stdout = True
     if args.screenshot_only:
@@ -323,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         html_to_file = Path(args.output)
         html_to_stdout = False
 
-    def _emit_html(text: str) -> None:
+    def _emit(text: str) -> None:
         if html_to_file is not None:
             html_to_file.write_text(text)
         elif html_to_stdout:
@@ -345,35 +357,23 @@ def main(argv: list[str] | None = None) -> int:
                 Path(shot_path).write_bytes(shot_result.png)
                 if args.json:
                     out = {
+                        **shot_result.html.snapshot(),
                         "url": args.url,
-                        "final_url": shot_result.final_url,
-                        "status_code": shot_result.status_code,
-                        "elapsed_s": shot_result.elapsed_s,
-                        "errors": shot_result.errors,
-                        "html": str(shot_result.html),
                         "image_path": str(Path(shot_path).resolve()),
                         "image_format": img_format,
                         "image_bytes": len(shot_result.png),
                     }
-                    sys.stdout.write(json.dumps(out) + "\n")
+                    _emit(json.dumps(out))
                 else:
-                    _emit_html(str(shot_result.html))
+                    _emit(str(shot_result.html))
                 if args.meta and not args.json:
                     _emit_meta(shot_result.html)
             else:
                 html_only = client.fetch(args.url)
                 if args.json:
-                    out = {
-                        "url": args.url,
-                        "final_url": html_only.final_url,
-                        "status_code": html_only.status_code,
-                        "elapsed_s": html_only.elapsed_s,
-                        "errors": html_only.errors,
-                        "html": str(html_only),
-                    }
-                    sys.stdout.write(json.dumps(out) + "\n")
+                    _emit(json.dumps({**html_only.snapshot(), "url": args.url}))
                 else:
-                    _emit_html(str(html_only))
+                    _emit(str(html_only))
                 if args.meta and not args.json:
                     _emit_meta(html_only)
 

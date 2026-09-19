@@ -12,6 +12,10 @@ Typical usage::
     png  = onyxweb.screenshot("https://example.com")
     both = onyxweb.fetch_all("https://example.com")
 
+    # Keep a page; read it later with no Chrome and no network
+    html.save("page.json")
+    page = onyxweb.RenderResult.load("page.json")
+
     # Explicit Client for batch / tuning
     with onyxweb.Client(concurrency=16) as client:
         for result in client.batch(urls, capture="both"):
@@ -28,10 +32,11 @@ import json
 import os
 import threading
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import cached_property
-from typing import Any, Literal, Protocol, overload
+from pathlib import Path
+from typing import Any, Final, Literal, Protocol, overload
 
 from pydantic import BaseModel as _BaseModel
 
@@ -99,6 +104,9 @@ from onyxweb.records import (
 _configure_logging()
 
 _client_log = logger.getChild("client")
+
+SNAPSHOT_KEY: Final = "onyxweb_snapshot"
+SNAPSHOT_VERSION: Final = 1
 
 __all__ = [
     # Module-level convenience — sync
@@ -380,6 +388,11 @@ class ResponseHeaders(Mapping[str, str]):
         return isinstance(key, str) and key.lower() in self._ci
 
     @property
+    def pairs(self) -> list[tuple[str, str]]:
+        """Every ``(name, value)`` as received, in order, duplicates (Set-Cookie) kept."""
+        return list(self._pairs)
+
+    @property
     def set_cookie(self) -> list[str]:
         """All Set-Cookie header values, one per cookie."""
         return [v for k, v in self._pairs if k.lower() == "set-cookie"]
@@ -501,6 +514,11 @@ class RenderResult:
     ``.iframes`` / ``.forms`` / ``.meta`` / ``.comments`` / ``.json_ld`` — are
     lazy: sizing or printing one costs nothing until records are read.
 
+    Snapshots — ``.save(path)`` writes the page and its response to one JSON file,
+    ``RenderResult.load(path)`` reads it back with the same buckets, search and text,
+    and ``.snapshot()`` returns the same data as a dict. None of them needs Chrome or
+    the network.
+
     Adds:
       - ``.errors`` — list[str] of console errors and load errors
       - ``.console_messages`` — list[ConsoleMessage] captured during the visit
@@ -595,11 +613,12 @@ class RenderResult:
         """Rust-parsed DOM (lazy). First access triggers html5ever parse."""
         dom = self._dom
         if dom is None:
-            if self._raw is None:
-                raise AttributeError(
-                    "this RenderResult was not produced by onyxweb; .dom unavailable"
-                )
-            dom = self._raw.make_dom()
+            # A result never seen by a browser (built by hand, or loaded) parses its own html.
+            dom = (
+                self._raw.make_dom()
+                if self._raw is not None
+                else Dom(self.html, self.final_url or None)
+            )
             object.__setattr__(self, "_dom", dom)
         return dom
 
@@ -733,6 +752,93 @@ class RenderResult:
                 hits[name] = found
         return hits
 
+    def snapshot(self) -> dict[str, Any]:
+        """Return everything but a screenshot as a JSON-ready dict, the form `save` writes.
+
+        Keys: ``html``, ``final_url``, ``status_code``, ``elapsed_s``, ``errors``,
+        ``console_messages``, ``post_load_results``, ``metadata``, ``headers`` and
+        ``anti_bot``, plus an ``onyxweb_snapshot`` version marker. A change an older
+        onyxweb could not read bumps that version, and `load` rejects a newer one.
+        """
+        headers = self.headers
+        return {
+            SNAPSHOT_KEY: SNAPSHOT_VERSION,
+            "html": self.html,
+            "final_url": self.final_url,
+            "status_code": self.status_code,
+            "elapsed_s": self.elapsed_s,
+            "errors": self.errors,
+            "console_messages": [asdict(m) for m in self.console_messages],
+            "post_load_results": self.post_load_results,
+            "metadata": asdict(self.metadata),
+            "headers": {
+                "pairs": [list(pair) for pair in headers.pairs],
+                "raw": headers.raw,
+                "hashes": asdict(headers.hashes),
+            },
+            "anti_bot": asdict(self.anti_bot) if self.anti_bot else None,
+        }
+
+    def save(self, path: str | os.PathLike[str]) -> None:
+        """Write a JSON snapshot that `load` reads back without Chrome or the network.
+
+        Args:
+            path: Destination file, overwritten if it exists.
+        """
+        Path(path).write_text(json.dumps(self.snapshot(), ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str]) -> RenderResult:
+        """Read a result written by `save`; its buckets, search and text work offline.
+
+        Args:
+            path: A file written by `RenderResult.save`.
+
+        Returns:
+            A `RenderResult` that reads like the one saved, with no browser behind it.
+
+        Raises:
+            ValueError: If the file is not a snapshot, or was written by a newer onyxweb.
+        """
+        fix = "write one with RenderResult.save()"
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except ValueError as ve:
+            raise ValueError(f"{path} is not an onyxweb snapshot; {fix}.") from ve
+        if not isinstance(data, dict) or SNAPSHOT_KEY not in data:
+            raise ValueError(f"{path} is not an onyxweb snapshot; {fix}.")
+        if data[SNAPSHOT_KEY] != SNAPSHOT_VERSION:
+            raise ValueError(
+                f"{path} is snapshot version {data[SNAPSHOT_KEY]}, but this onyxweb reads "
+                f"version {SNAPSHOT_VERSION}; upgrade onyxweb, or {fix} again."
+            )
+        meta = data["metadata"]
+        cert = meta["cert_info"]
+        head = data["headers"]
+        return cls(
+            data["html"],
+            errors=data["errors"],
+            console_messages=[ConsoleMessage(**m) for m in data["console_messages"]],
+            final_url=data["final_url"],
+            status_code=data["status_code"],
+            elapsed_s=data["elapsed_s"],
+            post_load_results=data["post_load_results"],
+            metadata=ResponseMetadata(
+                **{
+                    **meta,
+                    "body_hashes": Hashes(**meta["body_hashes"]),
+                    "redirect_chain": [RedirectHop(**hop) for hop in meta["redirect_chain"]],
+                    "cert_info": CertInfo(**cert) if cert else None,
+                }
+            ),
+            headers=ResponseHeaders(
+                [(name, value) for name, value in head["pairs"]],
+                head["raw"],
+                Hashes(**head["hashes"]),
+            ),
+            anti_bot=AntiBot(**data["anti_bot"]) if data["anti_bot"] else None,
+        )
+
     def __str__(self) -> str:
         return self.html
 
@@ -752,8 +858,6 @@ class RenderResult:
         return len(self.html)
 
     def __repr__(self) -> str:
-        if self._raw is None:
-            return f"<RenderResult {size_str(len(self.html.encode()))}>"
         overview = self.overview()
         totals: dict[str, int] = {}
         for row in overview.rows:

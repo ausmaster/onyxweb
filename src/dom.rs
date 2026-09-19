@@ -149,6 +149,13 @@ impl Dom {
 
 #[pymethods]
 impl Dom {
+    /// Lazily parse `html`; relative URLs resolve against `doc_url`.
+    #[new]
+    #[pyo3(signature = (html, doc_url=None))]
+    fn py_new(html: String, doc_url: Option<String>) -> Self {
+        Self::new(html, doc_url)
+    }
+
     // --- CSS-selector primitive ---------------------------------------------
 
     /// Run a CSS selector; return list of matching Elements.

@@ -26,6 +26,7 @@ import http.server
 import json
 import os
 import re
+import tempfile
 import threading
 import urllib.request
 from collections import Counter
@@ -376,9 +377,34 @@ def test_defaults(model: str) -> None:
 # --- invalid and accepted input -----------------------------------------------------
 
 Invalid = tuple[Callable[[Clients], object], type[Exception], tuple[str, ...]]
+
+
+def _load_snapshot(text: str) -> object:
+    """Load a snapshot file holding `text`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bad.json"
+        path.write_text(text)
+        return onyxweb.RenderResult.load(path)
+
+
 _EXTRA = "Extra inputs are not permitted"
 _NO_SCHEME = "has no scheme"
 INVALID: dict[str, Invalid] = {
+    "snapshot_not_json": (
+        lambda c: _load_snapshot("not json at all"),
+        ValueError,
+        ("not an onyxweb snapshot", "RenderResult.save"),
+    ),
+    "snapshot_without_the_marker": (
+        lambda c: _load_snapshot('{"html": "<p>x</p>"}'),
+        ValueError,
+        ("not an onyxweb snapshot", "RenderResult.save"),
+    ),
+    "snapshot_from_a_newer_version": (
+        lambda c: _load_snapshot('{"onyxweb_snapshot": 99}'),
+        ValueError,
+        ("version 99", "RenderResult.save"),
+    ),
     "viewport_zero": (
         lambda c: ViewportConfig(width=0),
         pydantic.ValidationError,

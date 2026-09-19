@@ -6,8 +6,9 @@ module-level functions, ``batch`` and ``fetch_all`` wrap the same capture. So
 to ``Client.fetch``'s: HTML, title, status, headers, cookies, console,
 post-load results, body hashes and anti-bot verdict. A shape that returns a
 ``FetchResult`` must also forward its fields and carry a viewport-sized image.
-The fixture keeps a ``Client``, an ``AsyncClient`` and the module's default
-clients open together, so every row also runs beside other clients.
+A result saved to a snapshot and loaded again is one more shape: it reads the same
+without Chrome. The fixture keeps a ``Client``, an ``AsyncClient`` and the module's
+default clients open together, so every row also runs beside other clients.
 
 ``PARALLEL`` drives one slow page through threads, ``asyncio.gather`` and
 ``batch``; the server counts requests in flight, which must reach, and never
@@ -27,7 +28,8 @@ from typing import Any, Literal
 
 import onyxweb
 import pytest
-from conftest import PNG_MAGIC
+from conftest import PNG_MAGIC, reloaded
+from onyxweb.records import PAGE_BUCKETS
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -121,6 +123,11 @@ def _signature(r: onyxweb.RenderResult) -> dict[str, object]:
         "post_load_results": r.post_load_results,
         "body": (m.content_length, m.body_hashes),
         "anti_bot": r.anti_bot,
+        # What the page holds, read through every bucket, the text and search.
+        "text": r.text,
+        "overview": repr(r.overview()),
+        "buckets": {name: getattr(r, name).asdict() for name in PAGE_BUCKETS},
+        "search": {name: b.asdict() for name, b in r.search("SHAPE").items()},
     }
 
 
@@ -177,6 +184,10 @@ SHAPES: dict[str, tuple[Call, type]] = {
     ),
     "client_batch_tuple": (
         lambda c, url, cfg: _ready(c.sync.batch((url,), config=cfg)[0]),
+        onyxweb.RenderResult,
+    ),
+    "snapshot_round_trip": (
+        lambda c, url, cfg: _ready(reloaded(c.sync.fetch(url, config=cfg))),
         onyxweb.RenderResult,
     ),
     "async_client_fetch": (

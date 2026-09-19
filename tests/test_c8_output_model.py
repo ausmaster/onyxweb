@@ -17,7 +17,7 @@ from typing import Any
 
 import onyxweb
 import pytest
-from conftest import PNG_MAGIC, DataUrl
+from conftest import PNG_MAGIC, DataUrl, reloaded
 from onyxweb.records import HEAD_ROWS, PAGE_BUCKETS, PREVIEW_WIDTH, Overview, size_str
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
@@ -82,9 +82,14 @@ RECORDS: dict[str, tuple[Callable[[onyxweb.RenderResult], Any], dict[str, Any]]]
 }
 
 
-@pytest.fixture
-def page(bucket_page: str) -> onyxweb.RenderResult:
-    return onyxweb.fetch(bucket_page)
+@pytest.fixture(params=["live", "snapshot"])
+def page(bucket_page: str, request: pytest.FixtureRequest) -> onyxweb.RenderResult:
+    """The fixture page as fetched, and as a saved-then-loaded snapshot of it.
+
+    Every read below must agree for both: a snapshot is the same page without a browser.
+    """
+    fetched = onyxweb.fetch(bucket_page)
+    return reloaded(fetched) if request.param == "snapshot" else fetched
 
 
 @pytest.mark.parametrize("name", list(RECORDS))
@@ -105,9 +110,9 @@ def test_record_field(page: onyxweb.RenderResult, name: str) -> None:
 # ----------------------------------------------------------------------------
 
 
-def test_relative_src_resolves_against_the_document_url(bucket_page: str) -> None:
-    app = next(s for s in onyxweb.fetch(bucket_page).scripts if s.raw == "static/app.js")
-    assert app.url == bucket_page.replace("/page.html", "/static/app.js")
+def test_relative_src_resolves_against_the_document_url(page: onyxweb.RenderResult) -> None:
+    app = next(s for s in page.scripts if s.raw == "static/app.js")
+    assert app.url == page.final_url.replace("/page.html", "/static/app.js")
 
 
 def test_base_href_overrides_the_document_url(httpserver: HTTPServer) -> None:
@@ -952,6 +957,7 @@ def test_raw_access_without_a_capture() -> None:
     assert "hello" in r
     assert "absent" not in r
     assert len(r) == len("<p>hello</p>")
+    assert r.text == "hello"  # the buckets read the html it holds
 
 
 # ----------------------------------------------------------------------------

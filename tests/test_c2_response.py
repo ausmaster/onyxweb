@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import mmh3
 import onyxweb
 import pytest
+from conftest import reloaded
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
@@ -159,6 +160,12 @@ def _check_invariants(r: onyxweb.RenderResult) -> None:
         hashlib.sha256(raw_bytes).hexdigest(),
         mmh3.hash(raw_bytes),
     )
+    # A saved and loaded result reports the same response: redirects, cert, cookies too.
+    again = reloaded(r)
+    assert again.metadata == m
+    assert (again.headers.raw, again.headers.hashes) == (r.headers.raw, r.headers.hashes)
+    assert dict(again.headers) == dict(r.headers)
+    assert again.headers.set_cookie == r.headers.set_cookie
 
 
 @pytest.mark.parametrize("name", list(ROWS))
