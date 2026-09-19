@@ -154,15 +154,18 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::proxy_stderr;
+    use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+        GetCurrentProcessId, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, TerminateProcess,
+        WaitForMultipleObjects,
     };
 
     /// Windows has no `getppid()`; walking a process snapshot for our own entry's
@@ -202,9 +205,6 @@ mod windows {
                 "onyxweb_wrapper: could not resolve/open parent process; running unprotected"
             );
         }
-        // HANDLE (*mut c_void) isn't Send; carry it across the thread boundary as the
-        // plain address it is and rebuild the pointer inside the closure.
-        let parent_addr = parent_handle as usize;
 
         let mut cmd = Command::new(&chrome_path);
         cmd.args(std::env::args_os().skip(1))
@@ -217,21 +217,31 @@ mod windows {
             std::process::exit(1);
         });
         proxy_stderr(child.stderr.take().expect("piped"));
-        let chrome_pid = child.id();
+        // CreateProcess's own handle already carries full rights (we created it),
+        // unlike the parent's, which needs its own OpenProcess to become waitable.
+        let chrome_handle = child.as_raw_handle() as HANDLE;
 
-        if !parent_handle.is_null() {
-            std::thread::spawn(move || unsafe {
-                WaitForSingleObject(parent_addr as HANDLE, INFINITE);
-                // Direct kill too — an inherited handle in Chrome's own tree can
-                // keep the job's last reference open, so don't rely on that alone.
-                let h = OpenProcess(PROCESS_TERMINATE, 0, chrome_pid);
-                if !h.is_null() {
-                    TerminateProcess(h, 1);
-                }
-                std::process::exit(1);
-            });
+        if parent_handle.is_null() {
+            let status = child.wait().unwrap_or_else(|_| std::process::exit(1));
+            std::process::exit(status.code().unwrap_or(1));
         }
-        let status = child.wait().unwrap_or_else(|_| std::process::exit(1));
-        std::process::exit(status.code().unwrap_or(1));
+
+        // One wait, two ends — mirrors the macOS kqueue design: our own parent
+        // (kill chrome, we're done) and chrome itself (a graceful Client.close()
+        // talks to chrome directly over CDP, never to us, so we must notice it
+        // leaving too), on one call instead of a thread apiece.
+        let handles = [parent_handle, chrome_handle];
+        let rc = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        if rc == WAIT_OBJECT_0 + 1 {
+            // Chrome exited on its own; match its exit code rather than kill anything.
+            let status = child.wait().unwrap_or_else(|_| std::process::exit(1));
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        // Our own parent exited (or the wait itself failed) — chrome has no other
+        // reason to live. Direct kill, not just the job object: an inherited
+        // handle in Chrome's own tree can keep the job's last reference open, so
+        // don't rely on that alone.
+        unsafe { TerminateProcess(chrome_handle, 1) };
+        std::process::exit(1);
     }
 }
