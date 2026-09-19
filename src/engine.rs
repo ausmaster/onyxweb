@@ -1,6 +1,6 @@
 //! Core navigate-and-capture step, running on a page drawn from the pool.
 //!
-//! Driven by `Client` via tokio. All async, all inside `py.allow_threads()`.
+//! Driven by `Client` on the shared tokio runtime; the sync API releases the GIL around it.
 //! One pooled page per fetch: configure (per-call overrides only), navigate,
 //! capture, reset on error. Pool pages keep their base config + console
 //! listeners across fetches.

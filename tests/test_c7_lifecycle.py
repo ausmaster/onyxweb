@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -199,6 +200,43 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
                 psutil.Process(pid).kill()
 
 
+def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
+    """The last resolution stage: a Chrome present only on ``PATH`` is found on every OS.
+
+    An instantly-exiting stub stands in, so a found Chrome fails to launch (``kind`` is
+    not ``chrome_not_found``). Skips where a system Chrome shadows ``PATH``. New test —
+    nothing else reaches this stage, which needs no bundled Chrome.
+    """
+    windows = sys.platform == "win32"
+    exits_at_once = shutil.which("hostname" if windows else "true")
+    assert exits_at_once, "no stub binary to copy"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shutil.copy(exits_at_once, bin_dir / ("chrome.exe" if windows else "chrome"))
+    probe = (
+        "import onyxweb\n"
+        "try:\n"
+        "    onyxweb.Client(launch_timeout_ms=5000)\n"
+        "except onyxweb.OnyxwebError as e:\n"
+        "    print(e.kind)\n"
+        "else:\n"
+        "    print('launched')\n"
+    )
+    env = {
+        **os.environ,
+        "ONYXWEB_PKG_DIR": str(tmp_path / "no-bundle"),
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=60
+    )
+    kind = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else out.stderr
+    if kind == "launched":
+        pytest.skip("a system Chrome shadows PATH")
+    assert kind != "chrome_not_found", "PATH was not searched"
+    assert kind in {"cdp", "launch_failed", "timeout"}, out.stderr
+
+
 # --- installing ----------------------------------------------------------------
 
 _PLATFORM = "linux_x86_64"
@@ -336,10 +374,8 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     """A forced shell install bounds its socket and leaves a full Chrome beside it intact.
 
     Both engines share the platform dir (full lives in ``full/``), and an install used
-    to wipe it; a download without a socket timeout could hang forever. onyxweb_wrapper
-    (injected into the wheel post-build, its own subdir beside the shell binary) must
-    survive too — CI installs the wheel then runs `onyxweb --install`, and this exact
-    directory sweep once deleted a flat-placed wrapper it had just unpacked.
+    to wipe it; a download without a socket timeout could hang forever. The injected
+    ``wrapper/`` subdir must survive too: this sweep once deleted a flat-placed wrapper.
     """
     full_chrome = tmp_path / _PLATFORM / "full" / "chrome"
     full_chrome.parent.mkdir(parents=True)

@@ -7,7 +7,7 @@ network layer so pages drop a big chunk of tail requests.
 Usage::
 
     from onyxweb import Client
-    from onyxweb.presets import recon
+    from onyxweb.presets.shell import recon
 
     with Client(**recon.FAST) as c:
         for url in urls:

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "onyxweb"
-version = "0.2.2"
+version = "0.2.3"
 description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -121,8 +121,8 @@ features = ["pyo3/extension-module"]
 # Chrome-headless-shell (~179 MB per platform) is NOT bundled into the wheel.
 # Wheels stay small; end users fetch the pinned binary with `onyxweb --install`
 # after install — mirrors Playwright's `playwright install` pattern.
-# Scoped to just the cdylib — with onyxweb_wrapper's [[bin]] also present, an
-# unscoped build broke macOS's -undefined dynamic_lookup linker flag.
+# Scoped to just the cdylib; onyxweb_wrapper is a separate workspace member that
+# CI injects into the wheel (scripts/inject_wrapper.py).
 targets = [{ name = "_onyxweb", kind = "cdylib" }]
 
 [tool.pytest.ini_options]

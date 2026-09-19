@@ -220,11 +220,8 @@ def download_for(
         if staged_bin.is_file():
             staged_bin.chmod(staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-        # Swap staged files into dest_dir, replacing this engine's files but
-        # PRESERVING sibling subdirs this install doesn't own: `full/` (the other
-        # engine) and `wrapper/` (onyxweb_wrapper, injected into the wheel
-        # post-build; see chrome::resolve_wrapper in Rust). dest_sub is "" for
-        # shell, "full" for full.
+        # Swap staged files in, keeping subdirs this install doesn't own: `full/`
+        # (the other engine) and `wrapper/` (onyxweb_wrapper, injected post-build).
         preserve = set() if dest_sub else {"full", "wrapper"}
         dest_dir.mkdir(parents=True, exist_ok=True)
         for existing in list(dest_dir.iterdir()):

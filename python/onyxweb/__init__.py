@@ -832,16 +832,6 @@ class FetchResult:
         )
 
 
-class _RenderOutputShim:
-    """Bridges FetchResult's raw into RenderResult.dom — both types have make_dom()."""
-
-    def __init__(self, raw: _FetchOutput) -> None:
-        self._raw = raw
-
-    def make_dom(self) -> Dom:
-        return self._raw.make_dom()
-
-
 # ----------------------------------------------------------------------------
 # Client
 # ----------------------------------------------------------------------------
@@ -1293,9 +1283,9 @@ class AsyncClient:
                 ``wait_after_ms``).
 
         Returns:
-            ``RenderResult`` — a ``str`` subclass holding the rendered HTML
-            plus ``.errors`` / ``.final_url`` / ``.status_code`` /
-            ``.elapsed_s`` / ``.dom``.
+            ``RenderResult`` — the page sorted into buckets, with ``.html``,
+            ``.title``, ``.text``, ``.errors``, ``.final_url``, ``.status_code``,
+            ``.elapsed_s`` and ``.dom``.
 
         Raises:
             RuntimeError: On CDP / navigation failures.

@@ -3,8 +3,8 @@
 #
 # Platforms target what `onyxweb-download-chrome` can stage a binary for:
 # linux x86_64 / aarch64, darwin x86_64 / arm64, windows x86_64. Adding a
-# platform requires both a matrix entry here AND a PLATFORMS row in
-# python/onyxweb/_download_chrome.py.
+# platform requires both a matrix entry here AND a CFT_PLATFORM row in
+# python/onyxweb/download.py.
 
 name: CI
 
@@ -54,10 +54,8 @@ jobs:
           args: --release --out dist --find-interpreter
           manylinux: "2_28"
           sccache: true
-          # Built inside the same manylinux container as the wheel, so its glibc
-          # baseline matches what the wheel's own tag promises.
-          # sccache isn't installed yet here; pyo3-ffi's build script needs a
-          # cross Python version on aarch64, though the wrapper never touches pyo3.
+          # Built in the wheel's manylinux container, so the glibc baselines match.
+          # No sccache yet here; aarch64 pyo3-ffi's build script needs a cross Python.
           before-script-linux: RUSTC_WRAPPER= PYO3_CROSS_PYTHON_VERSION=3.11 cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
       - name: Inject onyxweb_wrapper into the wheel
         run: |
@@ -149,7 +147,7 @@ jobs:
 
   test:
     # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
-    # fetch chrome-headless-shell via the new `onyxweb --install` path, run
+    # fetch chrome-headless-shell via `onyxweb --install`, run
     # the default pytest suite. Skips the benchmark tests (-m 'not benchmark'
     # from pyproject addopts).
     needs: [linux]
@@ -177,7 +175,7 @@ jobs:
         run: pytest tests/
 
   test-macos:
-    # Real-platform check for onyxweb_wrapper (process-leak-pdeathsig-fix): installs
+    # Real-platform check for onyxweb_wrapper: installs
     # the actual built wheel and runs C7 lifecycle, including the regression test that
     # kills only the process holding a Client and checks Chrome's whole tree dies too.
     needs: [macos]

@@ -486,10 +486,8 @@ impl Client {
         // flag set; the full engine gets a clean new-headless launch with the
         // automation tells stripped (see build_full_launch).
         let (user_data_dir, ephemeral_profile) = resolve_user_data_dir(&config_rs);
-        // Route through onyxweb_wrapper when bundled, so Chrome dies if this process
-        // is abruptly killed; chromiumoxide has no hook to arrange that protection on
-        // its own spawn. Falls back to launching chrome directly when absent (dev
-        // builds, unsupported platform) — best-effort, not a hard failure.
+        // The wrapper makes Chrome die with an abruptly-killed process; absent (dev
+        // build, unsupported platform), Chrome launches directly and unprotected.
         let wrapper_path = chrome::resolve_wrapper();
         let launch_target = wrapper_path.as_deref().unwrap_or(&chrome_path);
         let mut builder = BrowserConfig::builder()
@@ -670,7 +668,7 @@ impl Client {
         Ok(results)
     }
 
-    /// Explicit shutdown. Closes pooled pages, drops the Browser (chromium
+    /// Explicit shutdown. Closes pooled pages, tells Chrome to exit (chromium
     /// quits), and joins the handler task.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         if self.inner.is_closed() {

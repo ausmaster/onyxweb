@@ -85,10 +85,8 @@ jobs:
           manylinux: "2_28"
           args: --release --out dist -i 3.10 3.11 3.12 3.13
           sccache: true
-          # Built inside the same manylinux container as the wheel, so its glibc
-          # baseline matches what the wheel's own tag promises.
-          # sccache isn't installed yet here; pyo3-ffi's build script needs a
-          # cross Python version on aarch64, though the wrapper never touches pyo3.
+          # Built in the wheel's manylinux container, so the glibc baselines match.
+          # No sccache yet here; aarch64 pyo3-ffi's build script needs a cross Python.
           before-script-linux: RUSTC_WRAPPER= PYO3_CROSS_PYTHON_VERSION=3.11 cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
       - name: Inject onyxweb_wrapper into the wheel
         run: |
