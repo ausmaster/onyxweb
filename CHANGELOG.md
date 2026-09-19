@@ -5,6 +5,8 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-18
+
 ### Added
 - Page buckets: `scripts`, `styles`, `links`, `images`, `iframes`, `forms`, `meta`, `comments` and `json_ld`. Each is lazy and Rust-backed.
 - `r.content` (inline) and `r.resources` (external) views, plus `r.resources.all()` for everything the browser fetches.
@@ -39,4 +41,5 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb --install` keeps the bundled wrapper.
 - A Chrome found only on `PATH` is resolved on Windows.
 
-[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/ausmaster/onyxweb/compare/v0.2.2...v0.2.3
