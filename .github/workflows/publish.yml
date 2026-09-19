@@ -87,14 +87,16 @@ jobs:
           sccache: true
           # Built in the wheel's manylinux container, so the glibc baselines match.
           # No sccache yet here; aarch64 pyo3-ffi's build script needs a cross Python.
-          before-script-linux: RUSTC_WRAPPER= PYO3_CROSS_PYTHON_VERSION=3.11 cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
-      - name: Inject onyxweb_wrapper into the wheel
+          before-script-linux: |
+            RUSTC_WRAPPER= PYO3_CROSS_PYTHON_VERSION=3.11 cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+            # aarch64 cross-compiles land under target/<triple>/release/.
+            mkdir -p python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper
+            cp "$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper/
+      - name: Check the wrapper is in every wheel
         run: |
-          python -m pip install --quiet wheel
-          # Cross-compiled aarch64 lands under target/<triple>/release/, not target/release/.
-          wrapper=$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)
           for whl in dist/*.whl; do
-            python scripts/inject_wrapper.py "$whl" "$wrapper" linux_${{ matrix.target }} onyxweb_wrapper
+            python -m zipfile -l "$whl" | grep -q "_binaries/linux_${{ matrix.target }}/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -116,19 +118,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Build and stage onyxweb_wrapper
+        run: |
+          cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+          mkdir -p python/onyxweb/_binaries/darwin_aarch64/wrapper
+          cp target/release/onyxweb_wrapper python/onyxweb/_binaries/darwin_aarch64/wrapper/
       - uses: PyO3/maturin-action@v1
         with:
           target: aarch64
           args: --release --out dist --find-interpreter
           sccache: true
-      - name: Build onyxweb_wrapper
-        run: cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
-      - name: Inject onyxweb_wrapper into the wheel
+      - name: Check the wrapper is in every wheel
         run: |
-          python -m pip install --quiet wheel
-          wrapper=$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)
           for whl in dist/*.whl; do
-            python scripts/inject_wrapper.py "$whl" "$wrapper" darwin_aarch64 onyxweb_wrapper
+            python -m zipfile -l "$whl" | grep -q "_binaries/darwin_aarch64/wrapper/onyxweb_wrapper" \
+              || { echo "wrapper missing from $whl"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -150,20 +154,23 @@ jobs:
         with:
           python-version: "3.x"
           architecture: x64
+      - name: Build and stage onyxweb_wrapper
+        shell: bash
+        run: |
+          cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
+          mkdir -p python/onyxweb/_binaries/windows_x86_64/wrapper
+          cp target/release/onyxweb_wrapper.exe python/onyxweb/_binaries/windows_x86_64/wrapper/
       - uses: PyO3/maturin-action@v1
         with:
           target: x64
           args: --release --out dist --find-interpreter
           sccache: true
-      - name: Build onyxweb_wrapper
-        run: cargo build --release -p onyxweb_wrapper --bin onyxweb_wrapper
-      - name: Inject onyxweb_wrapper into the wheel
+      - name: Check the wrapper is in every wheel
         shell: bash
         run: |
-          python -m pip install --quiet wheel
-          wrapper=$(find target -type f -name onyxweb_wrapper.exe -path '*/release/*' | head -1)
           for whl in dist/*.whl; do
-            python scripts/inject_wrapper.py "$whl" "$wrapper" windows_x86_64 onyxweb_wrapper.exe
+            python -m zipfile -l "$whl" | grep -q "_binaries/windows_x86_64/wrapper/onyxweb_wrapper.exe" \
+              || { echo "wrapper missing from $whl"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
         with:

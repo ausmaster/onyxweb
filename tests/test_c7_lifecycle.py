@@ -374,7 +374,7 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     """A forced shell install bounds its socket and leaves a full Chrome beside it intact.
 
     Both engines share the platform dir (full lives in ``full/``), and an install used
-    to wipe it; a download without a socket timeout could hang forever. The injected
+    to wipe it; a download without a socket timeout could hang forever. The bundled
     ``wrapper/`` subdir must survive too: this sweep once deleted a flat-placed wrapper.
     """
     full_chrome = tmp_path / _PLATFORM / "full" / "chrome"
