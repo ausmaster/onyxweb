@@ -49,6 +49,11 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION to ${{ inputs.repository }}"
+      - name: Require a CHANGELOG section (pypi only)
+        if: inputs.repository == 'pypi'
+        run: |
+          grep -q "^## \[${{ steps.calc.outputs.version }}\]" CHANGELOG.md \
+            || { echo "CHANGELOG.md has no '## [${{ steps.calc.outputs.version }}]' section; rename [Unreleased] first."; exit 1; }
       - name: Pin version into pyproject.toml
         env:
           V: ${{ steps.calc.outputs.version }}
@@ -271,3 +276,15 @@ jobs:
             git tag -a "$V" -m "Release $V"
             git push origin "$V"
           fi
+      - name: Create the GitHub release from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists, skipping."
+            exit 0
+          fi
+          # The section body: everything after its heading, up to the next release heading.
+          notes=$(awk -v v="$VERSION" '/^## \[/ { on = index($0, "## [" v "]") == 1; next } on && !/^\[[^]]+\]: /' CHANGELOG.md)
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes "$notes"
