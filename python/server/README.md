@@ -14,11 +14,31 @@ onyxweb-server http --port 8000              # binds 127.0.0.1; there is no auth
 | Route | Returns |
 |---|---|
 | `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it |
-| `GET /health` | `{"status": "ok", "engines": {"shell": true}}`: each engine built so far and whether its Chrome is alive |
+| `GET /health` | `{"status": "ok", "engines": {"shell": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
 
 The body of `POST /fetch` is `{"url": ..., "engine": "shell" | "full", "wait_ms": 0}`. Send `Accept-Encoding: zstd` to get the snapshot compressed (about 9x on a 7 MB page). `scripts`, `post_load_scripts` and `actions` are refused by name with a 400, because the server never runs caller-supplied JavaScript, and a private, loopback or link-local address is refused too. The server holds nothing between requests.
 
-A failure is `{"error": {"kind": ..., "message": ..., "url": ...}}` with a status from the kind: 400 for `invalid_url`, `invalid_config`, `post_load_script` and a refused request; 502 for `cdp` and `io`; 503 for `chrome_exited`, `queue_timeout`, `launch_failed` and `chrome_not_found`; 504 for `navigation_timeout` and `timeout`; 500 for `internal`. Put a reverse proxy in front before exposing it beyond loopback.
+A failure is `{"error": {"kind": ..., "message": ..., "url": ...}}` with a status from the kind: 400 for `invalid_url`, `invalid_config`, `post_load_script` and a refused request; 413 for `too_large`; 502 for `cdp` and `io`; 503 for `chrome_exited`, `queue_timeout`, `launch_failed` and `chrome_not_found`; 504 for `navigation_timeout` and `timeout`; 500 for `internal`. Put a reverse proxy in front before exposing it beyond loopback.
+
+## Limits and egress
+
+Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_*` variables set the limits:
+
+| Variable | Default | Sets |
+|---|---:|---|
+| `MAX_PAGES` | 50 | pages held per session |
+| `MAX_STORE_BYTES` | 268435456 | bytes of html held; the least recently used page goes first |
+| `MAX_PAGE_BYTES` | 20971520 | largest page or image one call may return |
+| `MAX_BATCH` | 50 | URLs in one batch |
+| `MAX_WAIT_MS` | 30000 | longest settle after the page loads |
+| `MAX_TIMEOUT_MS` | 60000 | longest navigation budget |
+| `QUEUE_MS` | 10000 | longest a request waits for a free tab, then `queue_timeout` |
+| `CONCURRENCY` | 4 | tabs per engine |
+| `EGRESS` | 1 | `0` turns the egress proxy off |
+
+A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling. A Chrome that dies mid-call is replaced and the call retried once.
+
+The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A refused navigation is a `refused_url` error. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
 
 ## MCP
 

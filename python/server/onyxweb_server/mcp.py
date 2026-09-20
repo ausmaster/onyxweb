@@ -31,7 +31,7 @@ except ImportError as ie:
 from onyxweb import RenderResult
 from onyxweb.records import PAGE_BUCKETS, count_str, size_str
 
-from onyxweb_server.core import BrowserClient, ServerCore, check_url
+from onyxweb_server.core import BrowserClient, FetchOptions, ServerCore, check_url
 
 TOOL_CAP: Final = 4000  # characters of body from find
 READ_CAP: Final = 6000  # characters of body from read and page_text
@@ -402,7 +402,7 @@ def build_server(
             engine: "shell" is fast; "full" is a real Chrome that gets past more bot checks.
             wait_ms: Milliseconds to wait after the page loads, for content added late.
         """
-        page = await core.fetch(url, engine=engine, wait_ms=wait_ms)
+        page = await core.fetch(url, FetchOptions(engine=engine, wait_ms=wait_ms))
         page_id = core.hold(page)
         verdict = ""
         if page.anti_bot is not None:

@@ -15,7 +15,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb page` with `overview`, `search` and `text`, to query a snapshot offline.
 - `Dom(html, doc_url)` can be built from Python, and `ResponseHeaders.pairs` lists every header as received.
 - `onyxweb URL --json -o PATH` writes the snapshot to a file.
-- `onyxweb.testing` with `FakeClient` and `FakeClientFactory`: an `AsyncClient` stand-in that serves canned pages, records its calls and can be told to fail or die, so code that fetches pages tests without Chrome.
+- `onyxweb.testing` with `FakeClient` and `FakeClientFactory`: an `AsyncClient` stand-in that serves canned pages for `fetch`, `screenshot`, `fetch_all` and `batch`, records its calls and can be told to fail or die, so code that fetches pages tests without Chrome.
 
 ### Changed
 - **Breaking:** `RenderResult.text` and `Element.text` now read as the page displays them. Block elements break lines, a table row stays on one line with tabs between cells, `<pre>` keeps its spacing, and runs of whitespace collapse elsewhere. Previously adjacent blocks ran together, so `<div>Alice</div><div>30</div>` read as `Alice30`. Response hashes are unaffected: they cover the HTML, not the text.

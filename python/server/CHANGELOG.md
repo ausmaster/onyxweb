@@ -5,6 +5,11 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 ## [Unreleased]
 
 ### Added
+- The core owns every policy, so MCP and HTTP refuse the same things: `FetchOptions` and `ShotOptions` allow only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, headers, `block_urls`, `bypass_anti_bot` and the image options, each within a ceiling; `ServerCore.screenshot`, `fetch_all` and `batch` join `fetch`; every refusal is a `Refused` with a `code` (`refused_url`, `refused_option`, `too_large`).
+- `ONYXWEB_SERVER_*` limits: pages and bytes held, the largest page or image, batch size, wait and timeout ceilings, tabs per engine, and a queue timeout (10 s), so a saturated server answers `queue_timeout` instead of waiting forever.
+- An egress proxy on 127.0.0.1 that the browser is pointed at. It refuses any private, loopback or link-local address at connect time, so a redirect, a DNS rebinding host or a page's own script cannot reach one. `ONYXWEB_SERVER_EGRESS=0` turns it off.
+- A Chrome that dies mid-call is replaced and the call retried once. `ServerCore.stats()` and `GET /health` report requests, failures by kind, retries, restarts, pages held and egress refusals, and each call logs one line to the `onyxweb_server` logger without its query string.
+- `POST /fetch` answers 413 with kind `too_large` for a page over the size limit.
 - `onyxweb-server http`, an HTTP front-end: `POST /fetch` returns the page as a snapshot (zstd when the caller accepts it), `GET /health` reports each engine's Chrome. It holds nothing between requests, refuses `scripts`, `post_load_scripts` and `actions` by name, and binds loopback by default with no authentication. Install it with `pip install "onyxweb-server[http]"`.
 - `onyxweb-server mcp`, an MCP server that lets an agent fetch a page, ask several questions of it in one `query` call, then find and read the details. Install it with `pip install "onyxweb-server[mcp]"`.
   Pages stay in memory for the session, and every tool caps its output. It runs no caller-supplied scripts and never fetches a private, loopback or link-local address.

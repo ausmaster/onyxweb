@@ -23,7 +23,7 @@ import zstandard
 from conftest import PUBLIC
 from fastapi.testclient import TestClient
 from onyxweb.testing import FakeClientFactory
-from onyxweb_server.core import ServerCore
+from onyxweb_server.core import CoreConfig, ServerCore
 from onyxweb_server.http import build_app
 
 OK = {"url": PUBLIC + "ok"}
@@ -40,6 +40,8 @@ class Request:
     says: tuple[str, ...] = ()  # fragments of the body (snapshot JSON or error message)
     engines: tuple[str, ...] = ("shell",)  # engines the fake browser was built for
     headers: dict[str, str] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)  # CoreConfig overrides
+    then: int = 200  # the status of an ordinary request right after, on the same server
 
 
 REQUESTS: dict[str, Request] = {
@@ -72,14 +74,24 @@ REQUESTS: dict[str, Request] = {
     "an_unknown_engine": Request(
         {**OK, "engine": "turbo"}, 400, "invalid_request", ("'shell'",), ()
     ),
+    # The core's size limit is a 413 with its own kind, so a caller can tell it from a bad request.
+    "a_page_over_the_size_cap": Request(
+        OK,
+        413,
+        "too_large",
+        ("bytes", "ONYXWEB_SERVER_MAX_PAGE_BYTES"),
+        ("shell",),  # the page was fetched before it was refused
+        config={"max_page_bytes": 10},
+        then=413,  # the cap still applies; what matters is that the server answers
+    ),
 }
 
 
 def _client(
-    factory: FakeClientFactory | None = None,
+    factory: FakeClientFactory | None = None, config: dict[str, Any] | None = None
 ) -> tuple[TestClient, ServerCore, FakeClientFactory]:
     factory = factory or FakeClientFactory()
-    core = ServerCore(factory)
+    core = ServerCore(factory, config=CoreConfig(**(config or {})))
     return TestClient(build_app(core)), core, factory
 
 
@@ -96,7 +108,7 @@ def _post(
 @pytest.mark.parametrize("name", list(REQUESTS))
 def test_request(name: str) -> None:
     row = REQUESTS[name]
-    client, core, factory = _client()
+    client, core, factory = _client(config=row.config)
     with client:
         r = _post(client, row.body, headers=row.headers)
         assert r.status_code == row.status, r.text
@@ -108,9 +120,9 @@ def test_request(name: str) -> None:
             assert factory.engines == list(row.engines)
         else:
             assert r.json()["error"]["kind"] == row.kind
-            assert factory.built == [], "a client was built for a request the server refuses"
+            assert factory.engines == list(row.engines), "clients built beyond what the row says"
         assert core.pages() == [], "the server held a page between requests"
-        assert _post(client, OK).status_code == 200  # a refusal never wedges the server
+        assert _post(client, OK).status_code == row.then  # a refusal never wedges the server
 
 
 def _failure(kind: str | None, cls: type[BaseException] = onyxweb.OnyxwebError) -> BaseException:
@@ -188,18 +200,24 @@ def test_zstd_actually_compresses() -> None:
     assert len(raw) < len(plain)
 
 
-def test_health_reports_each_built_engine() -> None:
-    """``/health`` lists the engines built so far and whether each one's Chrome is alive.
+def test_health_reports_each_built_engine_and_the_counters() -> None:
+    """``/health`` lists the engines built so far, whether each Chrome is alive, and the counters.
 
     New test: it is a second route, and no request table above reaches it.
     """
     client, _, factory = _client()
     with client:
-        assert client.get("/health").json() == {"status": "ok", "engines": {}}
+        first = client.get("/health").json()
+        assert (first["status"], first["engines"]) == ("ok", {})
+        assert first["stats"]["requests"] == 0
         _post(client, OK)
-        assert client.get("/health").json() == {"status": "ok", "engines": {"shell": True}}
+        _post(client, {"url": "http://127.0.0.1/"})  # refused by the guard
+        second = client.get("/health").json()
+        assert second["engines"] == {"shell": True}
+        assert second["stats"]["requests"] == 2
+        assert second["stats"]["failures"] == {"refused_url": 1}
         factory.built[0][1].die()
-        assert client.get("/health").json() == {"status": "ok", "engines": {"shell": False}}
+        assert client.get("/health").json()["engines"] == {"shell": False}
 
 
 def test_a_snapshot_over_http_rebuilds_the_page(bucket_page: str) -> None:
@@ -207,7 +225,8 @@ def test_a_snapshot_over_http_rebuilds_the_page(bucket_page: str) -> None:
 
     New test: every row above runs on a fake browser, and this one needs the real one.
     """
-    core = ServerCore(url_guard=lambda url: None)  # the test server listens on 127.0.0.1
+    # The test server listens on 127.0.0.1, which the guard and the egress proxy both refuse.
+    core = ServerCore(url_guard=lambda url: None, config=CoreConfig(egress=False))
     with TestClient(build_app(core)) as client:
         r = client.post("/fetch", json={"url": bucket_page}, headers={"accept-encoding": "zstd"})
     assert r.status_code == 200

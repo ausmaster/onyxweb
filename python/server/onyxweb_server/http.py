@@ -32,7 +32,7 @@ except ImportError as ie:
 
 import onyxweb
 
-from onyxweb_server.core import ServerCore
+from onyxweb_server.core import FetchOptions, Refused, ServerCore
 
 REFUSED_FIELDS: Final = ("scripts", "post_load_scripts", "actions")
 ZSTD_LEVEL: Final = 3  # 9.2x on a 7 MB page in 11 ms; higher levels cost 100x the time for 20% more
@@ -129,8 +129,14 @@ def build_app(core: ServerCore | None = None) -> FastAPI:
             )
             return _error(422, "invalid_request", problems)
         try:
-            page = await core.fetch(wanted.url, engine=wanted.engine, wait_ms=wanted.wait_ms)
-        except ValueError as ve:  # the guard or a ceiling refused it
+            page = await core.fetch(
+                wanted.url, FetchOptions(engine=wanted.engine, wait_ms=wanted.wait_ms)
+            )
+        except Refused as refusal:
+            if refusal.code == "too_large":
+                return _error(413, "too_large", str(refusal), wanted.url)
+            return _error(400, "invalid_request", str(refusal), wanted.url)
+        except ValueError as ve:
             return _error(400, "invalid_request", str(ve), wanted.url)
         except (onyxweb.OnyxwebError, TimeoutError) as err:
             # A launch error has no kind: no URL to attach one to.
@@ -147,6 +153,6 @@ def build_app(core: ServerCore | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "engines": core.health()}
+        return {"status": "ok", "engines": core.health(), "stats": core.stats()}
 
     return app

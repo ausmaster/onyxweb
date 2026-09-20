@@ -285,7 +285,7 @@ fake.fetched                                      # [("https://example.com/", {}
 fake.die()                                        # every later fetch raises ChromeExitedError
 ```
 
-A page is html or a ready-made `RenderResult`, `error=` makes every fetch raise, and `fake.fetch` checks its keyword arguments as the real client does. `FakeClientFactory` builds one fake per engine for code that takes a `make_client(engine)` callable.
+A page is html or a ready-made `RenderResult`, `error=` makes every call raise, and each call checks its keyword arguments as the real client does. `screenshot`, `fetch_all` and `batch` work the same way and return a fake image of the format asked for. `FakeClientFactory` builds one fake per engine for code that takes a `make_client(engine)` callable.
 
 ## Development
 
