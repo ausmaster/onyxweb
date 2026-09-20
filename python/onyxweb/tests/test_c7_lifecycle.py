@@ -77,6 +77,31 @@ def _gone(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
     return False
 
 
+def _reapable(pids: set[int], within_s: float) -> bool:
+    """Whether every pid is gone or waitable: a zombie whose other threads have all exited.
+
+    A SIGKILLed leader shows `Z` while its threads still unwind, and `waitpid` (so `alive`)
+    only succeeds after the last one; that took up to 22 ms on a loaded CI runner.
+    """
+
+    def waitable(pid: int) -> bool:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            return (
+                stat[stat.rindex(")") + 2 :][0] == "Z" and len(os.listdir(f"/proc/{pid}/task")) <= 1
+            )
+        except OSError:
+            return True
+
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        if all(waitable(pid) for pid in pids):
+            return True
+        time.sleep(0.001)
+    return False
+
+
 async def _close(shape: Shape, client: onyxweb.Client | onyxweb.AsyncClient) -> None:
     if isinstance(client, onyxweb.AsyncClient):
         await client.aclose()
@@ -104,7 +129,7 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
             os.kill(pid, signal.SIGKILL)
-        assert _gone(launched, within_s=5.0), "Chrome survived SIGKILL"
+        assert _reapable(launched, within_s=5.0), "Chrome survived SIGKILL"
         assert not client.alive
         await _assert_dead_chrome_is_named(client)
 
