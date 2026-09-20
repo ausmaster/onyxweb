@@ -17,11 +17,16 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb URL --json -o PATH` writes the snapshot to a file.
 
 ### Changed
+- **Breaking:** onyxweb requires Python 3.11 or later. The 0.2.3 wheels for Python 3.10 fail on import.
 - **Breaking:** Chrome runs with its sandbox by default on the full engine, which always passed `--no-sandbox` before. Where the sandbox cannot start (root, Docker's default container profile, restricted user namespaces), pass `sandbox=False` or set `ONYXWEB_CHROME__SANDBOX=false`. Docker and BBOT users need this. See "Docker and BBOT" in the README.
 - `onyxweb URL --json` prints the snapshot: every key it printed before, plus headers, metadata, console messages, script results and the anti-bot verdict. With `-o PATH` it writes there instead of stdout.
 - A `RenderResult` built by hand parses the html it holds, so `.dom` and the buckets work on it instead of raising.
 
+### Removed
+- The private `Client._render` helper, which no code called.
+
 ### Fixed
+- The package docstring example read `result.html.title`, a `str` method. It now reads `result.title`.
 - The shell engine's `--no-sandbox` reached Chrome as `----no-sandbox`, which Chrome ignores, so the default engine failed to launch in Docker with no working switch except `chrome_args=["no-sandbox"]`. `sandbox=False` now works on both engines.
 - A launch that fails while the sandbox is on now says how to fix it, instead of `CDP: Input/Output error while resolving websocket URL`.
 - `ONYXWEB_CHROME__*` environment variables apply when the caller also passes another chrome option such as `engine="full"`. Before, that option dropped every environment value of its section.

@@ -19,7 +19,7 @@ Typical usage::
     # Explicit Client for batch / tuning
     with onyxweb.Client(concurrency=16) as client:
         for result in client.batch(urls, capture="both"):
-            title = result.html.title
+            title = result.title
             ...
 
 All HTML search (``.dom.query()``, ``.dom.find()``, etc.) runs in Rust for
@@ -1150,29 +1150,6 @@ class Client:
             results = [r if isinstance(r, Exception) else FetchResult(r) for r in raws]
         _client_log.debug("batch done: %d results returned", len(results))
         return results
-
-    # --- Private / experimental -------------------------------------------
-
-    def _render(
-        self,
-        html: bytes | str,
-        *,
-        base_url: str | None = None,
-        config: FetchConfig | None = None,
-    ) -> RenderResult:
-        """NOT public. Inject raw HTML into chromium via data: URL.
-
-        Niche: most users want ``.fetch(url)``. This is kept because it's cheap
-        to implement (data: URL) and might be useful for unit tests.
-        """
-        if isinstance(html, str):
-            html = html.encode("utf-8")
-        import base64 as _b64
-
-        data_url = "data:text/html;base64," + _b64.b64encode(html).decode("ascii")
-        # base_url is not honored — would need document.write or a <base> tag.
-        del base_url
-        return self.fetch(data_url, config=config)
 
     # --- Lifecycle ---------------------------------------------------------
 

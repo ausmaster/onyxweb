@@ -7,7 +7,7 @@ name = "onyxweb"
 version = "0.2.3"
 description = "Fast URL → fully-rendered HTML + optional screenshot for Python, powered by Chromium via CDP"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "AusMaster", email = "ausmasterproductions@gmail.com" }]
 keywords = [
@@ -19,7 +19,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

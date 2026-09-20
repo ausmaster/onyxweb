@@ -5,7 +5,7 @@ BBOT-scale subdomain screenshot pumping. One workload, multiple engines, honest 
 ## Test setup
 
 - **Host**: Linux 6.19.10-203.nobara.fc43 (Nobara 43 / Fedora 43), 16 CPU cores, 24 GB free RAM
-- **URLs**: 48–50 URLs from `servo_spike/urls_bench_big.txt` (mixed public sites; `gnu.org` and `google.com` excluded from `/tmp/urls_stable.txt` for the CDP/CEF head-to-head — the first due to network flakiness, the second due to headless anti-bot variance)
+- **URLs**: 48–50 URLs from `tests/urls_bench_big.txt` (mixed public sites; `gnu.org` and `google.com` excluded from `/tmp/urls_stable.txt` for the CDP/CEF head-to-head — the first due to network flakiness, the second due to headless anti-bot variance)
 - **Viewport**: 1200×800
 - **Timeout**: 30–45s per URL
 - **Build**: all release-mode with `lto = "thin"`, `codegen-units = 1`
@@ -88,6 +88,8 @@ Option A (CEF) has NO win that matters for BBOT-scale headless screenshot pumpin
 
 ## Reproduction
 
+The spike crates (`cef_spike`, `chromiumoxide_spike`, `servo_spike`) and their raw artifacts live in the previous `blazeweb` repo, not in this one. The commands below run from a checkout of that repo. To measure onyxweb itself, run `uv run pytest -m benchmark -s tests/test_c11_real_sites.py`.
+
 ```bash
 # Option A — CEF
 cd experiments/cef_spike
@@ -103,4 +105,4 @@ HS=/tmp/chrome-headless-shell-linux64/chrome-headless-shell
 ./target/release/chromiumoxide_spike --chrome $HS --out-dir /tmp/shots --concurrency 16 --mode both < urls.txt
 ```
 
-All raw benchmark artifacts under `experiments/{cef_spike,chromiumoxide_spike,servo_spike}/bench_*/`.
+Raw benchmark artifacts sit under `experiments/{cef_spike,chromiumoxide_spike,servo_spike}/bench_*/` in the `blazeweb` repo.

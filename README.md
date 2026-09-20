@@ -1,6 +1,6 @@
 # onyxweb
 
-[![PyPI](https://img.shields.io/pypi/v/onyxweb)](https://pypi.org/project/onyxweb/) [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org) [![License](https://img.shields.io/badge/license-BSD--3--Clause-green)](LICENSE) [![Tests](https://github.com/ausmaster/onyxweb/actions/workflows/ci.yml/badge.svg)](https://github.com/ausmaster/onyxweb/actions)
+[![PyPI](https://img.shields.io/pypi/v/onyxweb)](https://pypi.org/project/onyxweb/) [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org) [![License](https://img.shields.io/badge/license-BSD--3--Clause-green)](LICENSE) [![Tests](https://github.com/ausmaster/onyxweb/actions/workflows/ci.yml/badge.svg)](https://github.com/ausmaster/onyxweb/actions)
 
 ### **URL in, fully-rendered HTML out.** A Rust + Chromium (CDP) engine with a typed Python API, built for high-throughput **recon**, **scraping**, and **change detection**.
 
@@ -13,7 +13,7 @@ uv add onyxweb              # or: pip install onyxweb
 uv run onyxweb --install    # one-time: fetch the pinned chrome-headless-shell (~180 MB)
 ```
 
-Python 3.10+. Wheels for linux (x86_64, aarch64), macOS (arm64), Windows x64. Anything else builds from source and needs [rustup](https://rustup.rs).
+Python 3.11+. Wheels for linux (x86_64, aarch64), macOS (arm64), Windows x64. Anything else builds from source and needs [rustup](https://rustup.rs).
 
 Embedding onyxweb in another tool? `await onyxweb.aensure_chrome(dest=...)` installs the browser wherever you want and returns the path for `Client(chrome_path=...)`; `find_chrome()` is a no-network "is it installed?" check.
 
