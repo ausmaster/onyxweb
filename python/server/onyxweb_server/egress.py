@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 log = logging.getLogger("onyxweb_server")
 
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+Streams = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 REFUSED_HEADER: Final = "X-Onyxweb-Egress"
 MAX_HEAD: Final = 16 * 1024  # bytes of request line and headers
@@ -75,10 +76,6 @@ def resolve_host(host: str) -> list[Address]:
     return [ipaddress.ip_address(str(info[4][0]).split("%")[0]) for info in found]
 
 
-async def _open(host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    return await asyncio.open_connection(host, port)
-
-
 class _Bad(Exception):
     """A request the proxy answers with `status` and closes."""
 
@@ -100,8 +97,7 @@ class EgressProxy:
         *,
         is_allowed: Callable[[Address], bool] = is_public,
         resolve: Callable[[str], list[Address]] = resolve_host,
-        connect: Callable[[str, int], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]]
-        | None = None,
+        connect: Callable[[str, int], Awaitable[Streams]] | None = None,
         host: str = "127.0.0.1",
     ) -> None:
         """Build a proxy that is not yet listening.
@@ -113,15 +109,15 @@ class EgressProxy:
             connect: Opens an outbound connection to an address. Default: asyncio's.
             host: The address to listen on.
         """
-        self._is_allowed = is_allowed
-        self._resolve = resolve
-        self._connect = connect or _open
+        self.is_allowed = is_allowed
+        self.resolve = resolve
+        self.connect = connect or asyncio.open_connection
+        self.refusals = 0  # requests refused since it started
         self._host = host
         self._server: asyncio.Server | None = None
         self._url = ""
         self._slots = asyncio.Semaphore(MAX_CONNECTIONS)
         self._tasks: set[asyncio.Task[None]] = set()
-        self.refusals = 0  # requests refused since it started
 
     @property
     def url(self) -> str:
@@ -147,15 +143,14 @@ class EgressProxy:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await server.wait_closed()
 
-    # --- one connection -----------------------------------------------------------------------
-
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Serve one accepted connection, counted against `MAX_CONNECTIONS`."""
         task = asyncio.current_task()
         assert task is not None
         self._tasks.add(task)
         try:
             async with self._slots:
-                await self._serve(reader, writer)
+                await _Connection(self, reader, writer).serve()
         except asyncio.CancelledError:
             pass
         except (ConnectionError, OSError):
@@ -164,34 +159,47 @@ class EgressProxy:
             self._tasks.discard(task)
             writer.close()
 
-    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+
+class _Connection:
+    """One connection from the browser: its request, the address check, and the relay.
+
+    It holds the browser's own streams for its whole life, and the proxy for the address
+    policy, so nothing below passes them along.
+    """
+
+    def __init__(
+        self, proxy: EgressProxy, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self._proxy = proxy
+        self._reader = reader
+        self._writer = writer
+
+    async def serve(self) -> None:
+        """Read the request, connect where it is allowed to, and relay; else answer the refusal."""
         try:
-            method, target, headers = await self._read_head(reader)
+            method, target, headers = await self._head()
             if method == "CONNECT":
-                host, port = self._split_authority(target)
-                out = await self._dial(host, port)
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await writer.drain()
-                await _relay(reader, writer, *out)
+                host, port = self._authority(target)
+                origin_r, origin_w = await self._dial(host, port)
+                self._writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await self._writer.drain()
+                await self._relay(origin_r, origin_w)
                 return
             parts = urlsplit(target)
             if parts.scheme != "http" or not parts.hostname:
                 raise _Bad(400, "send an absolute http:// URI, or CONNECT host:port")
-            port = parts.port or 80
-            out = await self._dial(parts.hostname, port)
+            origin_r, origin_w = await self._dial(parts.hostname, parts.port or 80)
             path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-            out[1].write(_origin_head(method, path, headers))
-            await out[1].drain()
-            await _relay(reader, writer, *out)
+            origin_w.write(self._origin_head(method, path, headers))
+            await origin_w.drain()
+            await self._relay(origin_r, origin_w)
         except _Bad as bad:
-            await _reply(writer, bad.status, str(bad), refused=bad.status == 403)
+            await self._reply(bad.status, str(bad), refused=bad.status == 403)
 
-    async def _read_head(
-        self, reader: asyncio.StreamReader
-    ) -> tuple[str, str, list[tuple[str, str]]]:
+    async def _head(self) -> tuple[str, str, list[tuple[str, str]]]:
         """The request line and headers, as (method, target, [(name, value)])."""
         try:
-            raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT_S)
+            raw = await asyncio.wait_for(self._reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT_S)
         except asyncio.LimitOverrunError as lo:
             raise _Bad(431, "the request head is too long") from lo
         except (asyncio.IncompleteReadError, TimeoutError) as err:
@@ -209,7 +217,8 @@ class EgressProxy:
         return pieces[0], pieces[1], headers
 
     @staticmethod
-    def _split_authority(target: str) -> tuple[str, int]:
+    def _authority(target: str) -> tuple[str, int]:
+        """The host and port of a ``CONNECT host:port`` target."""
         parts = urlsplit(f"//{target}")
         try:
             port = parts.port
@@ -219,18 +228,17 @@ class EgressProxy:
             raise _Bad(400, "CONNECT needs host:port with a valid port")
         return parts.hostname, port
 
-    async def _dial(
-        self, host: str, port: int
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def _dial(self, host: str, port: int) -> Streams:
         """Resolve `host` once, refuse unless every answer is allowed, connect to one that is."""
+        proxy = self._proxy
         try:
-            addresses = await asyncio.to_thread(self._resolve, host)
+            addresses = await asyncio.to_thread(proxy.resolve, host)
         except OSError as oe:
             raise _Bad(502, f"cannot resolve {host}") from oe
         if not addresses:
             raise _Bad(502, f"cannot resolve {host}")
-        if not all(self._is_allowed(a) for a in addresses):
-            self.refusals += 1
+        if not all(proxy.is_allowed(a) for a in addresses):
+            proxy.refusals += 1
             log.warning(f"egress refused {host}:{port}")
             raise _Bad(
                 403, f"{host} is a private or internal address; only public addresses are fetched."
@@ -238,73 +246,65 @@ class EgressProxy:
         for address in addresses:
             # Connect to the address that was checked, never to the name again.
             try:
-                return await asyncio.wait_for(self._connect(str(address), port), CONNECT_TIMEOUT_S)
+                return await asyncio.wait_for(proxy.connect(str(address), port), CONNECT_TIMEOUT_S)
             except (OSError, TimeoutError):
                 continue
         raise _Bad(502, f"cannot connect to {host}:{port}")
 
+    @staticmethod
+    def _origin_head(method: str, path: str, headers: list[tuple[str, str]]) -> bytes:
+        """The request as the origin should see it: origin form, one request per connection."""
+        upgrade = any(name.lower() == "upgrade" for name, _ in headers)
+        kept = [
+            f"{name}: {value}"
+            for name, value in headers
+            if name.lower() not in ("proxy-connection", "proxy-authorization")
+            and not (name.lower() == "connection" and not upgrade)
+        ]
+        if not upgrade:
+            kept.append("Connection: close")
+        return "\r\n".join([f"{method} {path} HTTP/1.1", *kept, "", ""]).encode("latin-1")
 
-def _origin_head(method: str, path: str, headers: list[tuple[str, str]]) -> bytes:
-    """The request as the origin should see it: origin form, one request per connection."""
-    upgrade = any(name.lower() == "upgrade" for name, _ in headers)
-    kept = [
-        f"{name}: {value}"
-        for name, value in headers
-        if name.lower() not in ("proxy-connection", "proxy-authorization")
-        and not (name.lower() == "connection" and not upgrade)
-    ]
-    if not upgrade:
-        kept.append("Connection: close")
-    return "\r\n".join([f"{method} {path} HTTP/1.1", *kept, "", ""]).encode("latin-1")
+    async def _relay(self, origin_r: asyncio.StreamReader, origin_w: asyncio.StreamWriter) -> None:
+        """Copy both ways until one side ends and the other has had `GRACE_S` to drain."""
 
+        async def pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+            """Copy `source` to `sink` until it ends, then tell the sink nothing more is coming."""
+            try:
+                while data := await source.read(CHUNK):
+                    sink.write(data)
+                    await sink.drain()
+                if sink.can_write_eof():
+                    sink.write_eof()
+            except (ConnectionError, OSError):
+                pass
 
-async def _reply(
-    writer: asyncio.StreamWriter, status: int, message: str, *, refused: bool = False
-) -> None:
-    body = f"{message}\n".encode()
-    marker = f"{REFUSED_HEADER}: refused\r\n" if refused else ""
-    head = (
-        f"HTTP/1.1 {status} {REASONS[status]}\r\nContent-Type: text/plain; charset=utf-8\r\n"
-        f"Content-Length: {len(body)}\r\n{marker}Connection: close\r\n\r\n"
-    )
-    try:
-        writer.write(head.encode() + body)
-        await writer.drain()
-    except (ConnectionError, OSError):
-        pass
+        up = asyncio.create_task(pipe(self._reader, origin_w))
+        down = asyncio.create_task(pipe(origin_r, self._writer))
+        try:
+            _, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=GRACE_S)
+            for task in pending:
+                task.cancel()
+        finally:
+            up.cancel()
+            down.cancel()
+            origin_w.close()
 
-
-async def _pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
-    """Copy `source` to `sink` until it ends, then tell the sink nothing more is coming."""
-    try:
-        while data := await source.read(CHUNK):
-            sink.write(data)
-            await sink.drain()
-        if sink.can_write_eof():
-            sink.write_eof()
-    except (ConnectionError, OSError):
-        pass
-
-
-async def _relay(
-    client_r: asyncio.StreamReader,
-    client_w: asyncio.StreamWriter,
-    origin_r: asyncio.StreamReader,
-    origin_w: asyncio.StreamWriter,
-) -> None:
-    """Copy both ways until one side ends and the other has had `GRACE_S` to drain."""
-    up = asyncio.create_task(_pipe(client_r, origin_w))
-    down = asyncio.create_task(_pipe(origin_r, client_w))
-    try:
-        _, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-        if pending:
-            _, pending = await asyncio.wait(pending, timeout=GRACE_S)
-        for task in pending:
-            task.cancel()
-    finally:
-        up.cancel()
-        down.cancel()
-        origin_w.close()
+    async def _reply(self, status: int, message: str, *, refused: bool = False) -> None:
+        """Answer the browser with `status` and close; a refusal carries `REFUSED_HEADER`."""
+        body = f"{message}\n".encode()
+        marker = f"{REFUSED_HEADER}: refused\r\n" if refused else ""
+        head = (
+            f"HTTP/1.1 {status} {REASONS[status]}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n{marker}Connection: close\r\n\r\n"
+        )
+        try:
+            self._writer.write(head.encode() + body)
+            await self._writer.drain()
+        except (ConnectionError, OSError):
+            pass
 
 
 __all__ = ["REFUSED_HEADER", "EgressProxy", "is_public", "resolve_host"]
