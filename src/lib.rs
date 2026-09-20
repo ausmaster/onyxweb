@@ -82,6 +82,14 @@ fn onyxweb_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Buckets>()?;
     m.add_class::<Element>()?;
     m.add("OnyxwebError", m.py().get_type::<error::OnyxwebError>())?;
+    m.add(
+        "ChromeExitedError",
+        m.py().get_type::<error::ChromeExitedError>(),
+    )?;
+    m.add(
+        "QueueTimeoutError",
+        m.py().get_type::<error::QueueTimeoutError>(),
+    )?;
     m.add_function(wrap_pyfunction!(_set_rust_log_level, m)?)?;
     Ok(())
 }

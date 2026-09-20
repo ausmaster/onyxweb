@@ -170,6 +170,8 @@ pub struct TimeoutRs {
     pub navigation_ms: u64,
     pub launch_ms: u64,
     pub screenshot_ms: u64,
+    /// Longest a call waits for a free tab; `None` waits as long as it takes.
+    pub queue_ms: Option<u64>,
 }
 
 /// Which Chromium build the Client drives.
@@ -208,6 +210,7 @@ impl Default for TimeoutRs {
             navigation_ms: 30_000,
             launch_ms: 15_000,
             screenshot_ms: 5_000,
+            queue_ms: None,
         }
     }
 }
@@ -800,6 +803,11 @@ fn parse_timeout(v: &Bound<'_, PyAny>) -> Result<TimeoutRs> {
         }
         if let Some(x) = d.get_item("screenshot_ms")? {
             out.screenshot_ms = x.extract().map_err(to_internal)?;
+        }
+        if let Some(x) = d.get_item("queue_ms")?
+            && !x.is_none()
+        {
+            out.queue_ms = Some(x.extract().map_err(to_internal)?);
         }
     }
     Ok(out)

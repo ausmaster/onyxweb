@@ -262,8 +262,11 @@ fn derive_chrome_ua(chrome_path: &Path) -> Option<String> {
 /// `update_config` can swap atomically without blocking in-flight fetches.
 struct ClientState {
     runtime: Arc<tokio::runtime::Runtime>,
-    /// Keeps the browser process alive while the pool exists; `close` shuts it down.
-    browser: Arc<Browser>,
+    /// Keeps the browser process alive while the pool exists; `close` shuts it down. The lock
+    /// is for `try_wait` and `wait`, which need `&mut`; every other call takes it shared.
+    browser: Arc<tokio::sync::RwLock<Browser>>,
+    /// How Chrome ended, once it has; set by the first call that finds it gone.
+    exit: parking_lot::Mutex<Option<String>>,
     pool: Arc<PagePool>,
     handler_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     config: Arc<parking_lot::RwLock<ClientConfigRs>>,
@@ -275,6 +278,40 @@ struct ClientState {
 impl ClientState {
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reaps Chrome if it has exited and returns how; `None` while it runs. Never waits for
+    /// the lock: a Chrome so wedged that a request holds it is not known to be dead.
+    fn chrome_exit(&self) -> Option<String> {
+        if let Some(seen) = self.exit.lock().clone() {
+            return Some(seen);
+        }
+        let status = self.browser.try_write().ok()?.try_wait().ok()??;
+        let text = status.to_string();
+        *self.exit.lock() = Some(text.clone());
+        Some(text)
+    }
+
+    /// How long a single call may wait for a free tab, if the client bounds it.
+    fn queue_wait(&self) -> Option<Duration> {
+        self.config
+            .read()
+            .timeout
+            .queue_ms
+            .map(Duration::from_millis)
+    }
+
+    /// Runs one call's work. A Chrome already known dead fails it at once; a failure from a
+    /// Chrome that has since died is reported as that, not as the CDP error it caused.
+    async fn guarded<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        if let Some(status) = self.exit.lock().clone() {
+            return Err(OnyxError::ChromeExited(status));
+        }
+        match work.await {
+            Err(e @ (OnyxError::InvalidUrl(_) | OnyxError::InvalidConfig(_))) => Err(e),
+            Err(e) => Err(self.chrome_exit().map_or(e, OnyxError::ChromeExited)),
+            ok => ok,
+        }
     }
 }
 
@@ -305,18 +342,22 @@ async fn do_fetch_inner(
     fetch_cfg: FetchConfigRs,
 ) -> Result<RawRenderOutput> {
     let shot_cfg = ScreenshotConfigRs::default();
-    let guard = state.pool.acquire().await?;
-    let base_cfg = state.config.read().clone();
-    let out = capture_page(
-        &guard,
-        &url,
-        &base_cfg,
-        &fetch_cfg,
-        &shot_cfg,
-        CaptureMode::Html,
-    )
-    .await?;
-    Ok(out.into())
+    state
+        .guarded(async {
+            let guard = state.pool.acquire(state.queue_wait()).await?;
+            let base_cfg = state.config.read().clone();
+            let out = capture_page(
+                &guard,
+                &url,
+                &base_cfg,
+                &fetch_cfg,
+                &shot_cfg,
+                CaptureMode::Html,
+            )
+            .await?;
+            Ok(out.into())
+        })
+        .await
 }
 
 async fn do_screenshot_inner(
@@ -325,18 +366,22 @@ async fn do_screenshot_inner(
     shot_cfg: ScreenshotConfigRs,
 ) -> Result<Vec<u8>> {
     let fetch_cfg = FetchConfigRs::default();
-    let guard = state.pool.acquire().await?;
-    let base_cfg = state.config.read().clone();
-    let out = capture_page(
-        &guard,
-        &url,
-        &base_cfg,
-        &fetch_cfg,
-        &shot_cfg,
-        CaptureMode::Png,
-    )
-    .await?;
-    Ok(out.png.unwrap_or_default())
+    state
+        .guarded(async {
+            let guard = state.pool.acquire(state.queue_wait()).await?;
+            let base_cfg = state.config.read().clone();
+            let out = capture_page(
+                &guard,
+                &url,
+                &base_cfg,
+                &fetch_cfg,
+                &shot_cfg,
+                CaptureMode::Png,
+            )
+            .await?;
+            Ok(out.png.unwrap_or_default())
+        })
+        .await
 }
 
 async fn do_fetch_all_inner(
@@ -345,18 +390,22 @@ async fn do_fetch_all_inner(
     fetch_cfg: FetchConfigRs,
     shot_cfg: ScreenshotConfigRs,
 ) -> Result<RawFetchOutput> {
-    let guard = state.pool.acquire().await?;
-    let base_cfg = state.config.read().clone();
-    let out = capture_page(
-        &guard,
-        &url,
-        &base_cfg,
-        &fetch_cfg,
-        &shot_cfg,
-        CaptureMode::Both,
-    )
-    .await?;
-    Ok(out.into())
+    state
+        .guarded(async {
+            let guard = state.pool.acquire(state.queue_wait()).await?;
+            let base_cfg = state.config.read().clone();
+            let out = capture_page(
+                &guard,
+                &url,
+                &base_cfg,
+                &fetch_cfg,
+                &shot_cfg,
+                CaptureMode::Both,
+            )
+            .await?;
+            Ok(out.into())
+        })
+        .await
 }
 
 /// Run a batch of URLs in parallel. Returns `(url, Result)` per URL, in input
@@ -374,17 +423,18 @@ async fn do_batch_inner(
     let tasks: Vec<_> = urls
         .into_iter()
         .map(|url| {
-            let pool = state.pool.clone();
+            let state = state.clone();
             let base = base_cfg.clone();
             let fc = fetch_cfg.clone();
             let sc = shot_cfg.clone();
             // The URL travels with its task so the result pairs back to it.
             tokio::spawn(async move {
-                let r = async {
-                    let guard = pool.acquire().await?;
-                    capture_page(&guard, &url, &base, &fc, &sc, mode).await
-                }
-                .await;
+                let r = state
+                    .guarded(async {
+                        let guard = state.pool.acquire(None).await?;
+                        capture_page(&guard, &url, &base, &fc, &sc, mode).await
+                    })
+                    .await;
                 (url, r)
             })
         })
@@ -414,12 +464,19 @@ async fn do_close_inner(state: Arc<ClientState>) {
         state.pool.close_all().await;
         // The handler task ends only once the browser goes away, so tell Chrome
         // to exit before joining it.
-        let _ = state.browser.execute(CloseParams::default()).await;
+        let _ = state
+            .browser
+            .read()
+            .await
+            .execute(CloseParams::default())
+            .await;
         // `take()` detaches the JoinHandle so the lock isn't held across the join.
         let task = state.handler_task.lock().take();
         if let Some(task) = task {
             let _ = task.await;
         }
+        // Collect the exited process now, or it stays a zombie until the Client is freed.
+        let _ = state.browser.write().await.wait().await;
     };
     if tokio::time::timeout(CLOSE_TIMEOUT, shutdown).await.is_err() {
         log::warn!(
@@ -543,7 +600,7 @@ impl Client {
                             }
                         }
                     });
-                    let browser = Arc::new(browser);
+                    let browser = Arc::new(tokio::sync::RwLock::new(browser));
                     let pool = PagePool::new(browser.clone(), concurrency, pool_config).await?;
                     Ok::<_, OnyxError>((browser, task, pool))
                 })
@@ -553,6 +610,7 @@ impl Client {
         let state = ClientState {
             runtime: runtime.clone(),
             browser,
+            exit: parking_lot::Mutex::new(None),
             pool,
             handler_task: parking_lot::Mutex::new(Some(handler_task)),
             config: shared_config,

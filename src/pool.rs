@@ -32,7 +32,7 @@ use chromiumoxide::cdp::browser_protocol::target::{
 use chromiumoxide::{Browser, Page};
 use futures::StreamExt;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock as BrowserLock, Semaphore};
 
 use crate::config::{CaptureConsoleLevel, ClientConfigRs, UserAgentMetadataRs};
 use crate::error::{OnyxError, Result};
@@ -244,8 +244,9 @@ pub struct PooledPage {
 /// together; excess callers queue on the semaphore.
 pub struct PagePool {
     /// For per-tab context create/dispose + context-scoped cookie clears.
-    browser: Arc<Browser>,
-    pages: Mutex<Vec<PooledPage>>,
+    browser: Arc<BrowserLock<Browser>>,
+    /// One slot per permit; `None` is a tab that failed to recreate and is retried on acquire.
+    pages: Mutex<Vec<Option<PooledPage>>>,
     sem: Arc<Semaphore>,
     /// Live config, shared with the Client, read when a tab is (re)created so
     /// runtime changes apply to fresh tabs.
@@ -261,7 +262,7 @@ impl PagePool {
     /// Create `size` pages in parallel, each with base config applied and
     /// console/exception listeners wired up.
     pub async fn new(
-        browser: Arc<Browser>,
+        browser: Arc<BrowserLock<Browser>>,
         size: usize,
         config: Arc<RwLock<ClientConfigRs>>,
     ) -> Result<Arc<Self>> {
@@ -277,7 +278,7 @@ impl PagePool {
         );
         Ok(Arc::new(Self {
             browser,
-            pages: Mutex::new(created),
+            pages: Mutex::new(created.into_iter().map(Some).collect()),
             sem: Arc::new(Semaphore::new(size)),
             config,
             generation: AtomicU64::new(0),
@@ -297,31 +298,48 @@ impl PagePool {
         self.size
     }
 
-    /// Acquire a page (waits on Semaphore if pool is saturated).
-    pub async fn acquire(self: &Arc<Self>) -> Result<PageGuard> {
+    /// Acquire a page, waiting on the semaphore while the pool is saturated: as long as it
+    /// takes for `None`, else at most `wait`.
+    pub async fn acquire(self: &Arc<Self>, wait: Option<Duration>) -> Result<PageGuard> {
         let t0 = std::time::Instant::now();
-        let permit = self
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
+        let queued = self.sem.clone().acquire_owned();
+        let permit =
+            match wait {
+                None => queued.await,
+                Some(limit) => tokio::time::timeout(limit, queued).await.map_err(|_| {
+                    OnyxError::QueueTimeout {
+                        timeout_ms: limit.as_millis() as u64,
+                    }
+                })?,
+            }
             .map_err(|e| OnyxError::Internal(format!("pool sem: {e}")))?;
-        let mut pooled = self
+        let slot = self
             .pages
             .lock()
             .pop()
             .expect("semaphore permitted but pool is empty");
+        // Drops back as an empty slot unless disarmed: an error or a cancelled future must not
+        // leave a permit without a tab.
+        let mut lost = LostSlot(Some(self));
         let generation = self.generation.load(Ordering::Acquire);
-        if pooled.poisoned.load(Ordering::Acquire) || pooled.generation != generation {
-            log::debug!(target: "onyxweb::pool", "recreating pooled tab (poisoned or stale config)");
-            let _ = tokio::time::timeout(Duration::from_secs(5), pooled.page.close()).await;
-            let _ = self
-                .browser
-                .dispose_browser_context(pooled.browser_context_id.clone())
-                .await;
-            let base = self.config.read().clone();
-            pooled = create_pooled_page(&self.browser, &base, generation).await?;
-        }
+        let pooled = match slot {
+            Some(p) if !p.poisoned.load(Ordering::Acquire) && p.generation == generation => p,
+            stale => {
+                log::debug!(target: "onyxweb::pool", "recreating pooled tab (missing, poisoned or stale config)");
+                if let Some(p) = stale {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), p.page.close()).await;
+                    let _ = self
+                        .browser
+                        .read()
+                        .await
+                        .dispose_browser_context(p.browser_context_id)
+                        .await;
+                }
+                let base = self.config.read().clone();
+                create_pooled_page(&self.browser, &base, generation).await?
+            }
+        };
+        lost.0 = None;
         pooled.console_messages.lock().clear();
         // Snapshot previous response before clearing — same-doc navs (no new
         // HTTP response) propagate the prior document's metadata. Only shift
@@ -353,7 +371,7 @@ impl PagePool {
     }
 
     fn return_page(&self, p: PooledPage) {
-        self.pages.lock().push(p);
+        self.pages.lock().push(Some(p));
         log::trace!(target: "onyxweb::pool", "page returned to pool");
     }
 
@@ -362,13 +380,26 @@ impl PagePool {
     pub async fn close_all(&self) {
         let pages = std::mem::take(&mut *self.pages.lock());
         log::debug!(target: "onyxweb::pool", "closing {} pooled pages", pages.len());
-        for p in pages {
+        for p in pages.into_iter().flatten() {
             let _ = p.page.close().await;
             // Disposing the context frees its cookie jar + storage partition.
             let _ = self
                 .browser
+                .read()
+                .await
                 .dispose_browser_context(p.browser_context_id)
                 .await;
+        }
+    }
+}
+
+/// Pushes an empty slot back to its pool when dropped while armed.
+struct LostSlot<'a>(Option<&'a PagePool>);
+
+impl Drop for LostSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0 {
+            pool.pages.lock().push(None);
         }
     }
 }
@@ -510,7 +541,7 @@ fn accept_language_for(locale: &str) -> String {
 
 /// Create one page, apply base config, wire up persistent listeners.
 async fn create_pooled_page(
-    browser: &Browser,
+    browser: &BrowserLock<Browser>,
     base: &ClientConfigRs,
     generation: u64,
 ) -> Result<PooledPage> {
@@ -529,12 +560,19 @@ async fn create_pooled_page(
         None
     };
     let browser_context_id = browser
+        .read()
+        .await
         .create_browser_context(ctx_params)
         .await
         .map_err(OnyxError::from)?;
     let mut target = CreateTargetParams::new("about:blank");
     target.browser_context_id = Some(browser_context_id.clone());
-    let page = browser.new_page(target).await.map_err(OnyxError::from)?;
+    let page = browser
+        .read()
+        .await
+        .new_page(target)
+        .await
+        .map_err(OnyxError::from)?;
     log::trace!(target: "onyxweb::pool", "new_page in {:?}", t0.elapsed());
 
     // Chrome's screen also defaults to 800×600; without an override a taller

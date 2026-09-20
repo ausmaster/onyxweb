@@ -19,6 +19,21 @@ pyo3::create_exception!(
      the builtin TimeoutError instead."
 );
 
+pyo3::create_exception!(
+    _onyxweb,
+    ChromeExitedError,
+    OnyxwebError,
+    "Chrome has exited; every later call on that client fails. Create a new client."
+);
+
+// A TimeoutError subclass, so `except TimeoutError` still catches it.
+pyo3::create_exception!(
+    _onyxweb,
+    QueueTimeoutError,
+    PyTimeoutError,
+    "No pooled tab became free within `queue_timeout_ms`."
+);
+
 #[derive(Debug, Error)]
 pub enum OnyxError {
     #[error(
@@ -28,6 +43,14 @@ pub enum OnyxError {
 
     #[error("browser launch failed: {0}")]
     LaunchFailed(String),
+
+    #[error(
+        "Chrome exited ({0}); every later call on this client fails, create a new Client (or AsyncClient) to continue"
+    )]
+    ChromeExited(String),
+
+    #[error("no tab was free within {timeout_ms}ms; raise queue_timeout_ms or lower the load")]
+    QueueTimeout { timeout_ms: u64 },
 
     #[error("navigation to {url} did not reach lifecycle event {wait_until} within {timeout_ms}ms")]
     NavigationTimeout {
@@ -76,6 +99,8 @@ impl OnyxError {
         match self {
             OnyxError::ChromeNotFound(_) => "chrome_not_found",
             OnyxError::LaunchFailed(_) => "launch_failed",
+            OnyxError::ChromeExited(_) => "chrome_exited",
+            OnyxError::QueueTimeout { .. } => "queue_timeout",
             OnyxError::NavigationTimeout { .. } => "navigation_timeout",
             OnyxError::PostLoadScript { .. } => "post_load_script",
             OnyxError::Timeout(_) => "timeout",
@@ -109,6 +134,8 @@ impl From<OnyxError> for PyErr {
             OnyxError::NavigationTimeout { .. } | OnyxError::Timeout(_) => {
                 PyTimeoutError::new_err(msg)
             }
+            OnyxError::QueueTimeout { .. } => QueueTimeoutError::new_err(msg),
+            OnyxError::ChromeExited(_) => ChromeExitedError::new_err(msg),
             // Everything else → onyxweb.OnyxwebError (a RuntimeError subclass).
             _ => OnyxwebError::new_err(msg),
         }

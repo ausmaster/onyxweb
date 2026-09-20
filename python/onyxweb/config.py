@@ -328,6 +328,11 @@ class TimeoutConfig(BaseModel):
     """Default budget for a screenshot-only call (``Client.screenshot``);
     ``ScreenshotConfig.timeout_ms`` overrides per call."""
 
+    queue_ms: int | None = Field(None, ge=1)
+    """Longest a ``fetch``, ``screenshot`` or ``fetch_all`` waits for a free tab before it
+    raises ``QueueTimeoutError``. ``None`` (default) waits as long as it takes. ``batch``
+    ignores it: it queues every URL on purpose."""
+
 
 class ChromeConfig(BaseModel):
     """Chrome launch options."""
@@ -381,6 +386,7 @@ _FLAT_KWARG_PATHS: Final[dict[str, tuple[str, str]]] = {
     "navigation_timeout_ms": ("timeout", "navigation_ms"),
     "launch_timeout_ms": ("timeout", "launch_ms"),
     "screenshot_timeout_ms": ("timeout", "screenshot_ms"),
+    "queue_timeout_ms": ("timeout", "queue_ms"),
     "chrome_path": ("chrome", "path"),
     "chrome_args": ("chrome", "args"),
     "user_data_dir": ("chrome", "user_data_dir"),

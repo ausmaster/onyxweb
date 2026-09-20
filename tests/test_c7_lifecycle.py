@@ -2,9 +2,11 @@
 
 Closing: the CDP handler task ends only once the browser goes away, so close tells
 Chrome to exit rather than waiting out the handler's timeout. Every close shape must
-return within ``CLOSE_BUDGET_S``, stop the Chrome it started while the client is still
-referenced, ignore a second close, and refuse a fetch afterwards. A frozen Chrome can't
-answer shutdown at all, so its close is bounded by ``CLOSE_TIMEOUT_S`` instead.
+return within ``CLOSE_BUDGET_S``, stop and reap the Chrome it started while the client is
+still referenced, ignore a second close, and refuse a fetch afterwards. The same holds when
+Chrome was killed first, and then every call must also raise ``ChromeExitedError`` at once.
+A frozen Chrome can't answer shutdown at all, so its close is bounded by
+``CLOSE_TIMEOUT_S`` instead.
 
 Installing: ``ensure_chrome`` / ``aensure_chrome`` are the public installer a host app
 such as BBOT hooks into. ``ENSURE_ARGS`` checks each argument reaches ``download_for``
@@ -17,6 +19,7 @@ bad network, a bad archive or an unsupported platform: each raises
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import os
 import shutil
@@ -46,8 +49,8 @@ CLOSE_TIMEOUT_S = 3.0  # mirrors CLOSE_TIMEOUT in src/client.rs
 Shape = Literal["close", "context_manager", "aclose"]
 
 
-def _chrome_children() -> set[int]:
-    """Live (non-zombie) Chrome processes started by this test process."""
+def _chrome_children(*, zombies: bool = False) -> set[int]:
+    """Chrome processes started by this test process; zombies (unreaped) only when asked."""
     pids: set[int] = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -59,7 +62,7 @@ def _chrome_children() -> set[int]:
             continue
         name = stat[stat.index("(") + 1 : stat.rindex(")")]
         state, ppid = stat[stat.rindex(")") + 2 :].split()[:2]
-        if int(ppid) == os.getpid() and "chrome" in name and state != "Z":
+        if int(ppid) == os.getpid() and "chrome" in name and (zombies or state != "Z"):
             pids.add(int(entry))
     return pids
 
@@ -83,8 +86,9 @@ async def _close(shape: Shape, client: onyxweb.Client | onyxweb.AsyncClient) -> 
 
 
 @needs_proc
+@pytest.mark.parametrize("killed", [False, True], ids=["running", "killed"])
 @pytest.mark.parametrize("shape", ["close", "context_manager", "aclose"])
-async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape) -> None:
+async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: bool) -> None:
     before = _chrome_children()
     client: onyxweb.Client | onyxweb.AsyncClient
     if shape == "aclose":
@@ -95,11 +99,17 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape) -> None:
             client.__enter__()
     launched = _chrome_children() - before
     assert launched, "expected this client to start a Chrome process"
+    if killed:  # a Chrome that died under a live client is named on every call, then still closes
+        for pid in launched:
+            os.kill(pid, signal.SIGKILL)
+        assert _gone(launched, within_s=5.0), "Chrome survived SIGKILL"
+        await _assert_dead_chrome_is_named(client)
 
     started = time.perf_counter()
     await _close(shape, client)
     assert time.perf_counter() - started < CLOSE_BUDGET_S
     assert _gone(launched), "Chrome still running after close, though the client is referenced"
+    assert not launched & _chrome_children(zombies=True), "Chrome left unreaped after close"
 
     await _close(shape, client)  # a second close is a no-op
     with pytest.raises(RuntimeError, match="closed"):
@@ -133,6 +143,49 @@ def test_close_is_bounded_when_chrome_stops_responding(
     assert finished, f"close() still running {CLOSE_TIMEOUT_S + 1.0} s after Chrome froze"
     # The warning proves the budget was actually hit, so the bound above isn't vacuous.
     assert "did not shut down" in capfd.readouterr().err
+
+
+DEAD_CALL_S = 1.0  # a call on a dead Chrome must fail at once, not wait out a timeout
+URL = "data:text/html,x"
+
+
+async def _ready(value: object) -> object:
+    """Await a call's result when it is awaitable, so sync and async clients read alike."""
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _batch_failure(client: Any, url: str) -> object:
+    """``batch`` returns a failure in place; raise it so every row reads alike."""
+    items: Any = await _ready(client.batch([url]))
+    if isinstance(items[0], Exception):
+        raise items[0]
+    return items[0]
+
+
+# Every call shape, on either client class. All must name a dead Chrome.
+DEAD_CALLS: dict[str, Callable[[Any, str], object]] = {
+    "fetch": lambda c, u: c.fetch(u),
+    "screenshot": lambda c, u: c.screenshot(u),
+    "fetch_all": lambda c, u: c.fetch_all(u),
+    "batch": _batch_failure,
+}
+
+
+async def _assert_dead_chrome_is_named(client: Any) -> None:
+    """Each call shape, three times over, raises ``ChromeExitedError`` at once.
+
+    Repeats matter: a failed tab recreation once left the pool empty, so the third call panicked.
+    """
+    for call in DEAD_CALLS.values():
+        for _ in range(3):
+            started = time.perf_counter()
+            with pytest.raises(BaseException) as exc:  # a panic is a BaseException, so it shows
+                await _ready(call(client, URL))
+            assert time.perf_counter() - started < DEAD_CALL_S
+            err = exc.value
+            assert isinstance(err, onyxweb.ChromeExitedError), f"{type(err).__name__}: {err}"
+            assert (err.kind, err.url) == ("chrome_exited", URL)
+            assert "exited" in str(err) and "create a new" in str(err), str(err)
 
 
 def _chrome_tree(root_pid: int) -> set[int]:

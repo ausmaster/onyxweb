@@ -147,6 +147,7 @@ FLAT_KWARGS: dict[str, tuple[tuple[str, ...], Any]] = {
     "navigation_timeout_ms": (("timeout", "navigation_ms"), 1234),
     "launch_timeout_ms": (("timeout", "launch_ms"), 1234),
     "screenshot_timeout_ms": (("timeout", "screenshot_ms"), 1234),
+    "queue_timeout_ms": (("timeout", "queue_ms"), 1234),
     "chrome_path": (("chrome", "path"), "/nonexistent/chrome"),
     "chrome_args": (("chrome", "args"), ["--table"]),
     "user_data_dir": (("chrome", "user_data_dir"), "/tmp/onyxweb-table"),
@@ -310,7 +311,12 @@ _CLIENT_DEFAULTS: dict[str, Any] = {
         "url_scoped": {},
     },
     "include": {"shadow_dom": False, "iframes": False},
-    "timeout": {"navigation_ms": 30_000, "launch_ms": 15_000, "screenshot_ms": 5_000},
+    "timeout": {
+        "navigation_ms": 30_000,
+        "launch_ms": 15_000,
+        "screenshot_ms": 5_000,
+        "queue_ms": None,  # off unless set: a call waits for a free tab as long as it takes
+    },
     "chrome": {
         "path": None,
         "args": [],
@@ -454,6 +460,11 @@ INVALID: dict[str, Invalid] = {
         lambda c: FetchConfig(hash_navigation="sideways"),  # type: ignore[arg-type]
         pydantic.ValidationError,
         ("'reload' or 'continue'",),
+    ),
+    "queue_timeout_zero": (
+        lambda c: ClientConfig.from_flat(queue_timeout_ms=0),
+        pydantic.ValidationError,
+        ("greater than or equal to 1",),
     ),
     "screenshot_format_unknown": (
         lambda c: ScreenshotConfig(format="tiff"),  # type: ignore[arg-type]

@@ -42,10 +42,12 @@ from pydantic import BaseModel as _BaseModel
 
 from onyxweb._logging import configure as _configure_logging, logger, set_log_level
 from onyxweb._onyxweb import (
+    ChromeExitedError as ChromeExitedError,
     Client as _RustClient,
     Dom as Dom,
     Element as Element,
     OnyxwebError as OnyxwebError,
+    QueueTimeoutError as QueueTimeoutError,
     _FetchOutput,
     _RenderOutput,
 )
@@ -120,7 +122,9 @@ __all__ = [
     # Classes
     "AntiBot",
     "AsyncClient",
+    "ChromeExitedError",
     "OnyxwebError",
+    "QueueTimeoutError",
     "CertInfo",
     "Click",
     "Client",

@@ -16,6 +16,12 @@ class OnyxwebError(RuntimeError):
     url: str  # injected on fetch/batch failures (error.rs into_py_err)
     kind: str
 
+class ChromeExitedError(OnyxwebError): ...
+
+class QueueTimeoutError(TimeoutError):
+    url: str
+    kind: str
+
 class Element:
     tag: str
     text: str

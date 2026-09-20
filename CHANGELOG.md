@@ -6,6 +6,8 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 ## [Unreleased]
 
 ### Added
+- `ChromeExitedError`, an `OnyxwebError` subclass with `.kind == "chrome_exited"`: once Chrome has died, every call on that client raises it at once, with the exit status and a note to create a new client.
+- `queue_timeout_ms` (`timeout.queue_ms`), off by default: when set, `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError` subclass, `.kind == "queue_timeout"`) after waiting that long for a free tab. `batch` ignores it.
 - `RenderResult.save()` and `RenderResult.load()`: a JSON snapshot that reads back with the same buckets, search, text, headers and metadata, without Chrome or the network.
 - `RenderResult.snapshot()`, the JSON-ready dict that `save()` writes.
 - `onyxweb page` with `overview`, `search` and `text`, to query a snapshot offline.
@@ -15,6 +17,10 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 ### Changed
 - `onyxweb URL --json` prints the snapshot: every key it printed before, plus headers, metadata, console messages, script results and the anti-bot verdict. With `-o PATH` it writes there instead of stdout.
 - A `RenderResult` built by hand parses the html it holds, so `.dom` and the buckets work on it instead of raising.
+
+### Fixed
+- A tab that fails to recreate no longer costs the pool a slot. Before, the next fetch panicked with `semaphore permitted but pool is empty`, a `BaseException` that `except Exception` missed.
+- `Client.close()` collects the exited Chrome instead of leaving a zombie until the `Client` is freed.
 
 ## [0.2.3] - 2026-09-18
 

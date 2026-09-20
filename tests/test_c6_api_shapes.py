@@ -291,6 +291,7 @@ class Parallel:
     concurrency: int = DEFAULT_CONCURRENCY
     workers: int = 0  # Python threads, for the "threads" drive
     one_fails: bool = False  # one call goes to a refused port
+    queue_ms: int | None = None  # the client's queue timeout, well under the wait a URL queues for
 
     @property
     def peak(self) -> int:
@@ -311,6 +312,9 @@ PARALLEL: dict[str, Parallel] = {
     "abatch_4": Parallel("abatch", calls=4, concurrency=4),
     "abatch_8_capped_at_4": Parallel("abatch", calls=8, concurrency=4),
     "module_afetch_gather_3": Parallel("module_gather", calls=3),
+    # A batch queues every URL on purpose, so a queue timeout must not fail its tail.
+    "batch_ignores_the_queue_timeout": Parallel("batch", calls=8, concurrency=2, queue_ms=100),
+    "abatch_ignores_the_queue_timeout": Parallel("abatch", calls=8, concurrency=2, queue_ms=100),
 }
 
 
@@ -325,11 +329,13 @@ async def _drive(row: Parallel, urls: list[str]) -> list[Any]:
     if row.drive == "module_gather":
         return list(await asyncio.gather(*map(onyxweb.afetch, urls), return_exceptions=True))
     if row.drive in ("gather", "abatch"):
-        async with onyxweb.AsyncClient(concurrency=row.concurrency) as ac:
+        async with onyxweb.AsyncClient(
+            concurrency=row.concurrency, queue_timeout_ms=row.queue_ms
+        ) as ac:
             if row.drive == "abatch":
                 return await ac.batch(urls)
             return list(await asyncio.gather(*map(ac.fetch, urls), return_exceptions=True))
-    with onyxweb.Client(concurrency=row.concurrency) as c:
+    with onyxweb.Client(concurrency=row.concurrency, queue_timeout_ms=row.queue_ms) as c:
         if row.drive == "batch":
             return c.batch(urls)
         with ThreadPoolExecutor(max_workers=row.workers) as pool:

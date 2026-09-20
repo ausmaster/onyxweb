@@ -12,6 +12,7 @@ that fails is not the page failing.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -68,6 +69,8 @@ class Failure:
     says: tuple[str, ...] = ()  # message fragments; "{url}" is the fetched URL
     within_s: float = FAST_S
     kwargs: dict[str, Any] = field(default_factory=dict)
+    client: dict[str, Any] = field(default_factory=dict)  # update_config kwargs, undone after
+    busy_ms: int = 0  # another thread holds the only tab this long while the fetch waits
 
 
 _STUCK = {"timeout_ms": TIMEOUT_MS}
@@ -139,6 +142,24 @@ FAILURES: dict[str, Failure] = {
         ("block_urls", "(\\d+)", "*://*.doubleclick.net/*"),
         kwargs={"block_urls": ["*://*/(\\d+)"]},
     ),
+    # A client-level change forces the tab to be recreated, and Chrome refuses the pattern then.
+    "tab_cannot_be_recreated": Failure(
+        "/ok",
+        onyxweb.OnyxwebError,
+        "invalid_config",
+        ("block_urls", "(\\d+)", "*://*.doubleclick.net/*"),
+        client={"block_urls": ["*://*/(\\d+)"]},
+    ),
+    # The one tab is held longer than the queue timeout, so the fetch gives up waiting for it.
+    "queue_wait_exceeds_the_timeout": Failure(
+        "/ok",
+        onyxweb.QueueTimeoutError,
+        "queue_timeout",
+        ("no tab was free", "300", "queue_timeout_ms"),
+        within_s=0.3 + SLACK_S,
+        client={"queue_timeout_ms": 300},
+        busy_ms=1500,
+    ),
 }
 
 
@@ -146,7 +167,7 @@ def _check_failure(err: BaseException, row: Failure, url: str) -> None:
     """The exception a failure must be, whichever API surfaced it."""
     assert isinstance(err, row.error), f"{type(err).__name__}: {err}"
     # A timeout is its own builtin, so `except RuntimeError` doesn't swallow it.
-    assert isinstance(err, RuntimeError) == (row.error is not TimeoutError)
+    assert isinstance(err, RuntimeError) == (not issubclass(row.error, TimeoutError))
     assert err.url == url  # type: ignore[attr-defined]
     assert err.kind == row.kind  # type: ignore[attr-defined]
     for fragment in row.says:
@@ -160,10 +181,28 @@ def test_fetch_failure(
     """Each cause raises its exception in time, and the tab serves the next fetch."""
     row = FAILURES[name]
     url = _url(row.target, server, refused_url)
+    before = client.config.snapshot()
+    client.update_config(**row.client)
+    holder: threading.Thread | None = None
+    if row.busy_ms:
+        seen = len(server.log)
+        holder = threading.Thread(
+            target=client.fetch,
+            args=(server.url_for("/ok"),),
+            kwargs={"post_load_scripts": [f"new Promise(r => setTimeout(r, {row.busy_ms}))"]},
+        )
+        holder.start()
+        while len(server.log) == seen:  # its request has arrived, so it holds the tab
+            time.sleep(0.01)
     started = time.perf_counter()
-    with pytest.raises(BaseException) as exc:
-        client.fetch(url, **row.kwargs)
-    elapsed = time.perf_counter() - started
+    try:
+        with pytest.raises(BaseException) as exc:
+            client.fetch(url, **row.kwargs)
+        elapsed = time.perf_counter() - started
+    finally:
+        if holder is not None:
+            holder.join()
+        client.update_config(config=before)  # a no-op when the row changed nothing
     _check_failure(exc.value, row, url)
     assert elapsed < row.within_s, f"failed after {elapsed:.2f} s"
     started = time.perf_counter()
