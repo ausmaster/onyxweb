@@ -1271,23 +1271,85 @@ fn parse_selector(s: &str) -> PyResult<Selector> {
     })
 }
 
+/// Text as the page displays it: block edges break lines, table cells keep a row together,
+/// `<pre>` keeps its spacing, and runs of whitespace collapse elsewhere.
 fn collect_text(e: ElementRef<'_>) -> String {
-    // Text inside these is code or inert markup, not page content. Including it
-    // buries the words: script contents run 77-99% of the characters on a real
-    // page (cnn.com: 20 KB of text inside 2.15 MB).
-    const SKIP: &[&str] = &["script", "style", "noscript", "template"];
     let mut out = String::new();
-    let mut stack: Vec<_> = e.children().rev().collect();
-    while let Some(node) = stack.pop() {
+    walk_text(e, &mut out, 0);
+    out.trim().to_string()
+}
+
+/// Append `e`'s descendant text to `out`; `pre` counts the enclosing `<pre>` elements.
+fn walk_text(e: ElementRef<'_>, out: &mut String, pre: usize) {
+    // Script and style bodies are code, not content — 77-99% of a real page's characters.
+    const SKIP: &[&str] = &["script", "style", "noscript", "template"];
+    for node in e.children() {
         match node.value() {
-            Node::Text(t) => out.push_str(t),
+            Node::Text(t) => push_text(out, &t.text, pre > 0),
             Node::Element(el) if !SKIP.contains(&el.name()) => {
-                stack.extend(node.children().rev());
+                let Some(child) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                let sep = separator(el.name());
+                push_sep(out, sep);
+                walk_text(child, out, pre + usize::from(el.name() == "pre"));
+                push_sep(out, sep);
             }
             _ => {}
         }
     }
-    out
+}
+
+/// What a tag contributes at its edges: a row separator for cells, a line break for blocks.
+fn separator(tag: &str) -> &'static str {
+    match tag {
+        "td" | "th" => "\t",
+        "address" | "article" | "aside" | "blockquote" | "body" | "br" | "dd" | "details"
+        | "div" | "dl" | "dt" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1"
+        | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hr" | "li" | "main" | "nav" | "ol"
+        | "option" | "p" | "pre" | "section" | "summary" | "table" | "tbody" | "tfoot"
+        | "thead" | "tr" | "ul" => "\n",
+        _ => "",
+    }
+}
+
+/// Append `sep` unless `out` already ends with one at least as strong; a stronger
+/// separator replaces a weaker one, so edges never stack up.
+fn push_sep(out: &mut String, sep: &str) {
+    if sep.is_empty() || out.is_empty() {
+        return;
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    let strength = if sep == "\n" { 2 } else { 1 };
+    let trailing = if out.ends_with('\n') {
+        2
+    } else {
+        usize::from(out.ends_with('\t'))
+    };
+    if trailing >= strength {
+        return;
+    }
+    if trailing > 0 {
+        out.pop();
+    }
+    out.push_str(sep);
+}
+
+/// Append a text node, collapsing runs of whitespace unless it sits inside `<pre>`.
+fn push_text(out: &mut String, text: &str, raw: bool) {
+    if raw {
+        out.push_str(text);
+        return;
+    }
+    for ch in text.chars() {
+        if !ch.is_whitespace() {
+            out.push(ch);
+        } else if !out.is_empty() && !out.ends_with([' ', '\n', '\t']) {
+            out.push(' ');
+        }
+    }
 }
 
 /// Translate BS4-style kwargs into a single CSS selector.

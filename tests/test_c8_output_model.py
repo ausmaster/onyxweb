@@ -865,6 +865,40 @@ _TEXT_NOISE = (
 )
 
 
+# HTML -> the text it displays. Block edges break lines, cells keep a row together,
+# `<pre>` keeps its spacing, and whitespace collapses elsewhere, as a browser renders it.
+TEXT_SHAPES: dict[str, tuple[str, str]] = {
+    "blocks_break_lines": ("<p>First.</p><p>Second.</p>", "First.\nSecond."),
+    "inline_stays_joined": ("<span>inline</span><span>pieces</span>", "inlinepieces"),
+    "text_before_a_block": ("Hello<div>World</div>", "Hello\nWorld"),
+    "heading_then_body": ("<h1>Title</h1><p>Body</p>", "Title\nBody"),
+    "list_items_each_on_a_line": ("<ul><li>one</li><li>two</li></ul>", "one\ntwo"),
+    "br_breaks_a_line": ("<p>one<br>two</p>", "one\ntwo"),
+    "nested_blocks_break_once": ("<div><div><p>only</p></div></div>", "only"),
+    "a_row_stays_one_line": (
+        "<table><tr><td>Alice</td><td>30</td></tr><tr><td>Bob</td><td>41</td></tr></table>",
+        "Alice\t30\nBob\t41",
+    ),
+    "pre_keeps_its_spacing": ("<pre>def f():\n    return 1</pre>", "def f():\n    return 1"),
+    "whitespace_collapses_outside_pre": ("<p>a     b\n\n   c</p>", "a b c"),
+    "an_inline_tag_inside_a_block": ("<p>a <b>bold</b> word</p>", "a bold word"),
+}
+
+
+@pytest.mark.parametrize("name", list(TEXT_SHAPES))
+def test_text_shape(name: str) -> None:
+    """The text a page displays, built without a browser so the markup is exactly as written."""
+    html, expected = TEXT_SHAPES[name]
+    assert onyxweb.RenderResult(f"<html><body>{html}</body></html>").text == expected
+
+
+def test_text_shape_agrees_with_a_captured_page(data_url: DataUrl) -> None:
+    """A browser normalises markup (it adds `<tbody>`); the captured text must still agree."""
+    for name, (html, expected) in TEXT_SHAPES.items():
+        page = f"<html><body>{html}</body></html>".encode()
+        assert onyxweb.fetch(data_url(page)).text == expected, name
+
+
 def test_result_text_excludes_script_and_style(data_url: DataUrl) -> None:
     r = onyxweb.fetch(data_url(_TEXT_PAGE))
     text = r.text

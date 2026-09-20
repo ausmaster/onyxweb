@@ -17,6 +17,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb URL --json -o PATH` writes the snapshot to a file.
 
 ### Changed
+- **Breaking:** `RenderResult.text` and `Element.text` now read as the page displays them. Block elements break lines, a table row stays on one line with tabs between cells, `<pre>` keeps its spacing, and runs of whitespace collapse elsewhere. Previously adjacent blocks ran together, so `<div>Alice</div><div>30</div>` read as `Alice30`. Response hashes are unaffected: they cover the HTML, not the text.
 - **Breaking:** onyxweb requires Python 3.11 or later. The 0.2.3 wheels for Python 3.10 fail on import.
 - **Breaking:** Chrome runs with its sandbox by default on the full engine, which always passed `--no-sandbox` before. Where the sandbox cannot start (root, Docker's default container profile, restricted user namespaces), pass `sandbox=False` or set `ONYXWEB_CHROME__SANDBOX=false`. Docker and BBOT users need this. See "Docker and BBOT" in the README.
 - `onyxweb URL --json` prints the snapshot: every key it printed before, plus headers, metadata, console messages, script results and the anti-bot verdict. With `-o PATH` it writes there instead of stdout.
