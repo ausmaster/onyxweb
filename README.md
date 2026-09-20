@@ -237,6 +237,22 @@ onyxweb.Client(include_shadow_dom=True)   # web components
 onyxweb.Client(include_iframes=True)      # same-origin iframes
 ```
 
+## Docker and BBOT
+
+Chrome runs with its sandbox on, and the sandbox cannot start as root, under Docker's default container profile, or where the kernel restricts user namespaces (Ubuntu 23.10 and later). The launch then fails with `browser launch failed: ... pass sandbox=False`. In Docker, including BBOT in Docker, turn the sandbox off in one of two ways:
+
+```python
+onyxweb.Client(sandbox=False)
+```
+
+```bash
+docker run -e ONYXWEB_CHROME__SANDBOX=false ...   # any process that builds a Client, BBOT included
+```
+
+Tested: the default Docker seccomp profile, as root and as a non-root user, on both engines. Off adds `--no-sandbox`, so a renderer exploit from a hostile page runs as the container's user. Treat the container as the boundary: mount no host paths and add no capabilities. A seccomp profile that permits Chrome's namespace calls also keeps the sandbox on inside Docker; that route is not tested here.
+
+The variable applies to any `Client`, including one built with `engine=` or `chrome_path=`. Releases up to 0.2.3 ignored it in that case.
+
 ## Errors
 
 ```python

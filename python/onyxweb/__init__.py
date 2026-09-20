@@ -955,6 +955,7 @@ _LAUNCH_ONLY_FIELDS: tuple[tuple[str, ...], ...] = (
     ("chrome", "user_data_dir"),   # Chrome user-data-dir is per-process
     ("chrome", "headless"),        # ditto
     ("chrome", "engine"),          # binary is chosen + exec'd at launch
+    ("chrome", "sandbox"),         # --no-sandbox is a CLI flag
     ("network", "ignore_https_errors"),  # --ignore-certificate-errors is a CLI flag
     ("timeout", "launch_ms"),      # only meaningful before Chrome is up
 )

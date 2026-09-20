@@ -6,6 +6,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 ## [Unreleased]
 
 ### Added
+- `sandbox` (`chrome.sandbox`, env `ONYXWEB_CHROME__SANDBOX`), default `True`: `False` runs Chrome with `--no-sandbox`. Launch-only. See "Docker and BBOT" in the README.
 - `ChromeExitedError`, an `OnyxwebError` subclass with `.kind == "chrome_exited"`: once Chrome has died, every call on that client raises it at once, with the exit status and a note to create a new client.
 - `queue_timeout_ms` (`timeout.queue_ms`), off by default: when set, `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError` subclass, `.kind == "queue_timeout"`) after waiting that long for a free tab. `batch` ignores it.
 - `RenderResult.save()` and `RenderResult.load()`: a JSON snapshot that reads back with the same buckets, search, text, headers and metadata, without Chrome or the network.
@@ -15,10 +16,14 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb URL --json -o PATH` writes the snapshot to a file.
 
 ### Changed
+- **Breaking:** Chrome runs with its sandbox by default on the full engine, which always passed `--no-sandbox` before. Where the sandbox cannot start (root, Docker's default container profile, restricted user namespaces), pass `sandbox=False` or set `ONYXWEB_CHROME__SANDBOX=false`. Docker and BBOT users need this. See "Docker and BBOT" in the README.
 - `onyxweb URL --json` prints the snapshot: every key it printed before, plus headers, metadata, console messages, script results and the anti-bot verdict. With `-o PATH` it writes there instead of stdout.
 - A `RenderResult` built by hand parses the html it holds, so `.dom` and the buckets work on it instead of raising.
 
 ### Fixed
+- The shell engine's `--no-sandbox` reached Chrome as `----no-sandbox`, which Chrome ignores, so the default engine failed to launch in Docker with no working switch except `chrome_args=["no-sandbox"]`. `sandbox=False` now works on both engines.
+- A launch that fails while the sandbox is on now says how to fix it, instead of `CDP: Input/Output error while resolving websocket URL`.
+- `ONYXWEB_CHROME__*` environment variables apply when the caller also passes another chrome option such as `engine="full"`. Before, that option dropped every environment value of its section.
 - A tab that fails to recreate no longer costs the pool a slot. Before, the next fetch panicked with `semaphore permitted but pool is empty`, a `BaseException` that `except Exception` missed.
 - `Client.close()` collects the exited Chrome instead of leaving a zombie until the `Client` is freed.
 

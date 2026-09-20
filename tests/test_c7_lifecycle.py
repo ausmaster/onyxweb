@@ -215,8 +215,13 @@ def _all_gone(pids: set[int], within_s: float) -> bool:
     return False
 
 
+# Engine and sandbox as the owning process launches Chrome: the wrapper must stop every one.
+@pytest.mark.parametrize(
+    ("engine", "sandbox"),
+    [("shell", True), ("full", True), ("shell", False), ("full", False)],
+)
 def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
-    tmp_path: Path,
+    tmp_path: Path, engine: str, sandbox: bool
 ) -> None:
     """Killing only the process holding a Client — no chance for any cleanup code to
     run, unlike closing the process group — must not orphan Chrome's whole tree.
@@ -226,11 +231,13 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
     New test — nothing else in this suite kills an *external* process and checks
     OS-level survival of what it spawned.
     """
+    if engine == "full" and onyxweb.find_chrome(engine="full") is None:
+        pytest.skip("full Chrome is not installed")
     script = tmp_path / "spawn_client.py"
     ready = tmp_path / "ready"
     script.write_text(
         "import onyxweb\n"
-        "c = onyxweb.Client(concurrency=1)\n"
+        f"c = onyxweb.Client(concurrency=1, engine={engine!r}, sandbox={sandbox!r})\n"
         "c.fetch('data:text/html,<html></html>')\n"
         f"open({str(ready)!r}, 'w').close()\n"
         "import time; time.sleep(60)\n"
@@ -251,6 +258,38 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
         for pid in _chrome_tree(proc.pid):
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 psutil.Process(pid).kill()
+
+
+# Client kwargs for a stub Chrome that exits before it is ready -> what the error must carry
+# (`says`) and must not (`silent`). Chrome's stderr may not survive into the error (chromiumoxide
+# races its exit against reading it), so the hint rests on the early exit, not on the text.
+LAUNCH_FAILURES: dict[str, tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]] = {
+    "sandbox_on_names_the_fix": (
+        {},
+        ("sandbox=False", "ONYXWEB_CHROME__SANDBOX", "Docker", "BBOT"),
+        (),
+    ),
+    # The hint would mislead once the sandbox is already off.
+    "sandbox_off_does_not_blame_it": ({"sandbox": False}, (), ("sandbox=False",)),
+}
+
+
+@pytest.mark.parametrize("name", list(LAUNCH_FAILURES))
+def test_a_chrome_that_dies_at_launch_is_explained(tmp_path: Path, name: str) -> None:
+    """A Chrome that exits before it is ready fails the launch, and the error names the sandbox fix.
+
+    New test: nothing else launches a Chrome that dies at startup and reads what it said.
+    """
+    kwargs, says, silent = LAUNCH_FAILURES[name]
+    stub = tmp_path / "dies.sh"
+    stub.write_text("#!/bin/sh\necho 'No usable sandbox!' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    with pytest.raises(onyxweb.OnyxwebError) as exc:
+        onyxweb.Client(chrome_path=str(stub), launch_timeout_ms=5000, **kwargs)
+    for fragment in says:
+        assert fragment in str(exc.value), str(exc.value)
+    for fragment in silent:
+        assert fragment not in str(exc.value), str(exc.value)
 
 
 def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:

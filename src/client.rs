@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use chromiumoxide::browser::BrowserConfigBuilder;
 use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
+use chromiumoxide::error::CdpError;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use pyo3::prelude::*;
@@ -136,7 +137,6 @@ fn build_shell_launch(builder: BrowserConfigBuilder, cfg: &ClientConfigRs) -> Br
     let mut b = builder
         .arg("--headless=new")
         .arg("--disable-gpu")
-        .arg("--no-sandbox")
         .arg("--hide-scrollbars")
         .arg("--disable-dev-shm-usage")
         .arg("--no-first-run")
@@ -194,7 +194,6 @@ fn build_full_launch(
     let mut b = builder
         .new_headless_mode()
         .disable_default_args()
-        .no_sandbox()
         .arg("disable-gpu")
         // Software WebGL: without it --disable-gpu leaves getContext('webgl')
         // === null, itself a headless tell.
@@ -214,6 +213,21 @@ fn build_full_launch(
         b = b.arg(a.to_string());
     }
     b
+}
+
+/// A Chrome that exits before it is ready most often has a sandbox that cannot start: running
+/// as root, in a container, or with restricted user namespaces. Chrome's own stderr may not
+/// reach the error (chromiumoxide races its exit against reading it), so the early exit
+/// itself is what triggers the hint.
+fn launch_error(e: CdpError, sandbox: bool) -> OnyxError {
+    if sandbox && matches!(e, CdpError::LaunchExit(..) | CdpError::LaunchIo(..)) {
+        return OnyxError::LaunchFailed(format!(
+            "{e}. If Chrome's sandbox cannot start here (running as root, in a container such \
+             as Docker or BBOT, or with restricted user namespaces), pass sandbox=False or set \
+             ONYXWEB_CHROME__SANDBOX=false."
+        ));
+    }
+    OnyxError::from(e)
 }
 
 /// Profile dir + whether it's ours to delete. Must go through the builder:
@@ -562,6 +576,10 @@ impl Client {
             ChromeEngine::HeadlessShell => build_shell_launch(builder, &config_rs),
             ChromeEngine::Full => build_full_launch(builder, &config_rs, &chrome_path),
         };
+        if !config_rs.chrome.sandbox {
+            builder = builder.no_sandbox();
+        }
+        let sandbox = config_rs.chrome.sandbox;
 
         log::info!(
             target: "onyxweb::client",
@@ -591,7 +609,7 @@ impl Client {
                     .map_err(|_| {
                         OnyxError::Timeout(format!("chrome did not launch within {launch_ms}ms"))
                     })?
-                    .map_err(OnyxError::from)?;
+                    .map_err(|e| launch_error(e, sandbox))?;
                     let task = tokio::spawn(async move {
                         while let Some(res) = handler.next().await {
                             if res.is_err() {

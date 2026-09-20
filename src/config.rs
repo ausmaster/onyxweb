@@ -191,6 +191,8 @@ pub struct ChromeRs {
     pub user_data_dir: Option<String>,
     pub headless: bool,
     pub engine: ChromeEngine,
+    /// Run Chrome with its sandbox; off adds `--no-sandbox`.
+    pub sandbox: bool,
 }
 
 impl Default for ViewportRs {
@@ -236,6 +238,7 @@ impl Default for ClientConfigRs {
             timeout: TimeoutRs::default(),
             chrome: ChromeRs {
                 headless: true,
+                sandbox: true,
                 ..Default::default()
             },
         }
@@ -816,6 +819,7 @@ fn parse_timeout(v: &Bound<'_, PyAny>) -> Result<TimeoutRs> {
 fn parse_chrome(v: &Bound<'_, PyAny>) -> Result<ChromeRs> {
     let mut out = ChromeRs {
         headless: true,
+        sandbox: true,
         ..Default::default()
     };
     if let Some(d) = as_dict(v)? {
@@ -834,6 +838,9 @@ fn parse_chrome(v: &Bound<'_, PyAny>) -> Result<ChromeRs> {
         }
         if let Some(x) = d.get_item("headless")? {
             out.headless = x.extract().map_err(to_internal)?;
+        }
+        if let Some(x) = d.get_item("sandbox")? {
+            out.sandbox = x.extract().map_err(to_internal)?;
         }
         if let Some(x) = d.get_item("engine")?
             && !x.is_none()

@@ -19,8 +19,8 @@ fn real_chrome_path() -> String {
 fn main() {
     use std::os::unix::process::CommandExt;
     let chrome = real_chrome_path();
-    // Survives the exec below; only a setuid/setgid target clears it, and chrome
-    // never is one here (always launched --no-sandbox).
+    // Survives the exec below; only a setuid/setgid target clears it, and Chrome's own
+    // binary never is one (a sandbox helper would be a separate child).
     ur_taking_me_with_you::die_with_parent();
     let err = std::process::Command::new(&chrome)
         .args(env::args_os().skip(1))

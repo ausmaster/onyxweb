@@ -348,6 +348,16 @@ class ChromeConfig(BaseModel):
 
     headless: bool = True
 
+    sandbox: bool = True
+    """Run Chrome with its sandbox, which contains a renderer exploit from a hostile page.
+
+    On by default. Chrome cannot start its sandbox as root, in a container with Docker's
+    default seccomp profile, or where user namespaces are restricted (Ubuntu 23.10 and
+    later); the launch then fails and the error says so. In Docker, and for BBOT in Docker,
+    pass ``sandbox=False`` or set ``ONYXWEB_CHROME__SANDBOX=false``. Off adds
+    ``--no-sandbox``, so run it only on pages you would trust with your user account, or
+    inside a container that is itself the boundary. Fixed at launch."""
+
     engine: Literal["full", "shell"] = "shell"
     """Which Chromium build to drive.
 
@@ -392,6 +402,7 @@ _FLAT_KWARG_PATHS: Final[dict[str, tuple[str, str]]] = {
     "user_data_dir": ("chrome", "user_data_dir"),
     "headless": ("chrome", "headless"),
     "engine": ("chrome", "engine"),
+    "sandbox": ("chrome", "sandbox"),
     "include_shadow_dom": ("include", "shadow_dom"),
     "include_iframes": ("include", "iframes"),
 }
@@ -544,19 +555,11 @@ class ClientConfig(BaseSettings):
             sub, field = _FLAT_KWARG_PATHS[k]
             nested[sub][field] = val
 
-        # Build sub-configs only for sections the user actually touched; rest
-        # fall through to defaults + env.
-        cls_map = {
-            "viewport": ViewportConfig,
-            "network": NetworkConfig,
-            "emulation": EmulationConfig,
-            "timeout": TimeoutConfig,
-            "chrome": ChromeConfig,
-            "include": IncludeConfig,
-        }
+        # Sections the caller touched go in as dicts, so the environment still fills the fields
+        # they left out; a built sub-model would replace the whole section.
         for sub_name, sub_kw in nested.items():
             if sub_kw and sub_name not in top:
-                top[sub_name] = cls_map[sub_name](**sub_kw)
+                top[sub_name] = sub_kw
 
         return cls(**top)
 

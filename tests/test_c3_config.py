@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import onyxweb
+import psutil
 import pydantic
 import pytest
 from onyxweb import _LAUNCH_ONLY_FIELDS
@@ -153,6 +154,7 @@ FLAT_KWARGS: dict[str, tuple[tuple[str, ...], Any]] = {
     "user_data_dir": (("chrome", "user_data_dir"), "/tmp/onyxweb-table"),
     "headless": (("chrome", "headless"), False),
     "engine": (("chrome", "engine"), "full"),
+    "sandbox": (("chrome", "sandbox"), False),
 }
 # Fixed once Chrome is running: changing one at runtime must raise.
 LAUNCH_ONLY_KWARGS = {
@@ -164,6 +166,7 @@ LAUNCH_ONLY_KWARGS = {
     "user_data_dir",
     "headless",
     "engine",
+    "sandbox",
 }
 BUILD_ENTRIES = ("from_flat", "env")
 RUNTIME_ENTRIES = ("update_config", "setattr")
@@ -247,6 +250,11 @@ def test_explicit_arguments_beat_the_environment(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ONYXWEB_VIEWPORT__WIDTH", "2560")
     config = ClientConfig(concurrency=7)
     assert (config.concurrency, config.viewport.width) == (7, 2560)
+    # A flat kwarg sets its own field; the environment still fills the rest of its section.
+    monkeypatch.setenv("ONYXWEB_CHROME__SANDBOX", "false")
+    chrome = ClientConfig.from_flat(engine="full").chrome
+    assert (chrome.engine, chrome.sandbox) == ("full", False)
+    assert ClientConfig.from_flat(engine="full", sandbox=True).chrome.sandbox is True
 
 
 def test_every_flat_kwarg_round_trips(clients: Clients) -> None:
@@ -323,6 +331,7 @@ _CLIENT_DEFAULTS: dict[str, Any] = {
         "user_data_dir": None,
         "headless": True,
         "engine": "shell",
+        "sandbox": True,  # on unless a container, root or BBOT asks for it off
     },
 }
 _WAITS: dict[str, Any] = {
@@ -988,6 +997,33 @@ def test_explicit_profile_dir_is_used(tmp_path: Path) -> None:
     with onyxweb.Client(concurrency=1, user_data_dir=str(profile)) as client:
         assert client.fetch("data:text/html,<p>x</p>").status_code == 200
     assert profile.is_dir() and any(profile.iterdir())
+
+
+@pytest.mark.parametrize("engine", ["shell", "full"])
+@pytest.mark.parametrize("sandbox", [True, False])
+def test_sandbox_reaches_chrome_as_a_launch_flag(engine: str, sandbox: bool) -> None:
+    """``sandbox=False`` alone puts ``--no-sandbox`` on Chrome's command line, on either engine.
+
+    New test: a launch-only knob can't go through ``EFFECTS``, which changes a running client.
+    The shell engine's own copy of the flag once reached Chrome as ``----no-sandbox``, which
+    Chrome ignores, so its sandbox could not be switched off.
+    """
+    before = {p.pid for p in psutil.Process().children()}
+    try:
+        client = onyxweb.Client(concurrency=1, engine=engine, sandbox=sandbox)
+    except onyxweb.OnyxwebError as e:
+        if "not found" in str(e).lower():
+            pytest.skip(f"{engine} Chrome unavailable: {e}")
+        raise
+    with client:
+        launched = [
+            p
+            for p in psutil.Process().children()
+            if p.pid not in before and "chrome" in p.name().lower()
+        ]
+        assert launched, "expected this client to start a Chrome process"
+        flags = min(launched, key=lambda p: p.pid).cmdline()
+    assert ("--no-sandbox" in flags) == (not sandbox), flags
 
 
 def test_launch_timeout_ms_bounds_the_browser_launch(tmp_path: Path) -> None:
