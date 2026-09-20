@@ -26,11 +26,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - name: Sync dev deps (builds Rust ext via cache-keys)
-        run: uv sync --group dev
+        run: uv sync --all-packages --group dev
       - name: Ruff
-        run: uv run ruff check python/ tests/
+        run: uv run ruff check python/ tests/ server/
       - name: Mypy (strict)
-        run: uv run mypy python/onyxweb/ tests/
+        run: uv run mypy python/onyxweb/ tests/ server/onyxweb_server/
       - name: Cargo fmt
         run: cargo fmt --all -- --check
       - name: Cargo clippy
@@ -176,6 +176,7 @@ jobs:
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
           python -m pip install --group dev
+          python -m pip install ./server --no-deps
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
       - name: Run default test suite

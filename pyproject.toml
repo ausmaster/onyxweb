@@ -55,11 +55,16 @@ dev = [
     "mmh3>=4.0",
     # Cross-platform process tree walk/kill for the C7 parent-death regression test.
     "psutil>=6.0",
+    # C13 and C14 test onyxweb-server, which needs the mcp package for its MCP front-end.
+    "mcp>=1.2,<2",
 ]
 bench = [
     "pytest>=8",
     "playwright>=1.49",
 ]
+
+[tool.uv.workspace]
+members = ["server"]
 
 [tool.uv]
 cache-keys = [

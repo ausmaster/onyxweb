@@ -163,6 +163,10 @@ options:
 
 </details>
 
+## Serving agents
+
+`onyxweb-server`, a separate package in this repository, serves onyxweb's browser to agents over MCP so an agent such as Claude Code can fetch a page once, then look, find and read it in pieces. Install and usage: [`server/README.md`](server/README.md).
+
 ## Anti-bot
 
 `r.anti_bot` is populated on **every** fetch, whether or not you try to get past anything, so a plain fetch tells you a host sits behind Akamai.
