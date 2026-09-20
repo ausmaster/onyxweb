@@ -324,7 +324,12 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
         "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
     }
     out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,  # `-c` puts the cwd on sys.path, and the source package has no extension
     )
     said = out.stdout.strip()
     assert said, out.stderr

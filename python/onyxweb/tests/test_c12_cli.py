@@ -253,14 +253,18 @@ def test_informational_flags(capsys: pytest.CaptureFixture[str]) -> None:
         assert preset in run.out
 
 
-def test_module_entry_point_runs() -> None:
+def test_module_entry_point_runs(tmp_path: Path) -> None:
     """``python -m onyxweb`` starts, and ``page`` reaches its subcommand."""
     for args, usage in (
         (["--help"], "python -m onyxweb ["),
         (["page", "--help"], "python -m onyxweb page"),
     ):
         p = subprocess.run(
-            [sys.executable, "-m", "onyxweb", *args], capture_output=True, text=True, timeout=60
+            [sys.executable, "-m", "onyxweb", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,  # `-m` puts the cwd on sys.path, and the source package has no extension
         )
         assert p.returncode == 0, p.stderr
         assert p.stdout.startswith(f"usage: {usage}")
