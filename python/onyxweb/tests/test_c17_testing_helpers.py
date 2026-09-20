@@ -38,29 +38,6 @@ PAGE_CALLS: dict[str, Callable[[FakeClient, str], Awaitable[Any]]] = {
 }
 
 
-async def _run(op: str, fake: FakeClient) -> Result:
-    """One call's result; a failure a batch returns in place is raised, like the others."""
-    out = await CALLS[op](fake)
-    if isinstance(out, list):
-        [item] = out
-        if isinstance(item, Exception):
-            raise item
-        return item  # type: ignore[no-any-return]
-    return out  # type: ignore[no-any-return]
-
-
-def _is_ok(out: Result) -> bool:
-    if isinstance(out, bytes):
-        return out[:8] == PNG_MAGIC
-    page = out.html if isinstance(out, onyxweb.FetchResult) else out
-    return page.final_url == URL
-
-
-def _shape(fn: Any) -> list[tuple[str, Any, Any]]:
-    """A callable's parameters as (name, kind, default), the part a caller depends on."""
-    return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
-
-
 # --- signatures ---------------------------------------------------------------------------------
 
 
@@ -69,13 +46,17 @@ def _shape(fn: Any) -> list[tuple[str, Any, Any]]:
     ["fetch", "screenshot", "fetch_all", "batch", "aclose", "__aenter__", "__aexit__", "alive"],
 )
 def test_the_fake_matches_the_real_clients_signature(name: str) -> None:
+    def shape(fn: Any) -> list[tuple[str, Any, Any]]:
+        """A callable's parameters as (name, kind, default), the part a caller depends on."""
+        return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+
     real, fake = getattr(onyxweb.AsyncClient, name), getattr(FakeClient, name)
     if name == "alive":  # a read-only property on both
         assert isinstance(real, property) and isinstance(fake, property)
         assert fake.fset is None
         return
     assert inspect.iscoroutinefunction(fake) == inspect.iscoroutinefunction(real)
-    assert _shape(fake) == _shape(real)
+    assert shape(fake) == shape(real)
 
 
 # --- pages ------------------------------------------------------------------------------------
@@ -126,6 +107,16 @@ LIFECYCLES: dict[str, tuple[tuple[str, ...], bool, bool, tuple[type[Exception], 
 @pytest.mark.parametrize("op", list(CALLS))
 @pytest.mark.parametrize("name", list(LIFECYCLES))
 async def test_a_client_in_any_state_answers_every_call(name: str, op: str) -> None:
+    async def run() -> Result:
+        """The call's result; a failure a batch returns in place is raised, like the others."""
+        out = await CALLS[op](fake)
+        if not isinstance(out, list):
+            return out  # type: ignore[no-any-return]
+        [item] = out
+        if isinstance(item, Exception):
+            raise item
+        return item  # type: ignore[no-any-return]
+
     actions, alive, closed, raises = LIFECYCLES[name]
     fake = FakeClient()
     for action in actions:
@@ -142,11 +133,16 @@ async def test_a_client_in_any_state_answers_every_call(name: str, op: str) -> N
             fake.error = None
     assert (fake.alive, fake.closed) == (alive, closed)
     if raises is None:
-        assert _is_ok(await _run(op, fake))
+        out = await run()
+        if isinstance(out, bytes):
+            assert out[:8] == PNG_MAGIC
+        else:
+            page = out.html if isinstance(out, onyxweb.FetchResult) else out
+            assert page.final_url == URL
         return
     error, says = raises
     with pytest.raises(error, match=says) as exc:
-        await _run(op, fake)
+        await run()
     if error is onyxweb.ChromeExitedError:
         # Enriched as the real client's errors are, so callers that read them work unchanged.
         assert (exc.value.kind, exc.value.url) == ("chrome_exited", URL)  # type: ignore[attr-defined]

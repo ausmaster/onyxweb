@@ -18,7 +18,8 @@ import logging
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from functools import partial
+from typing import Any
 
 import onyxweb
 import pytest
@@ -48,10 +49,8 @@ def _body(size: int, char: str = "x") -> str:
     return f"<html><body>{char * size}</body></html>"
 
 
-def _cdp() -> onyxweb.OnyxwebError:
-    err = onyxweb.OnyxwebError("CDP: boom")
-    err.kind = "cdp"
-    return err
+CDP_FAILED = onyxweb.OnyxwebError("CDP: boom")
+CDP_FAILED.kind = "cdp"  # the browser tags its errors; the core counts failures by this
 
 
 @dataclass(frozen=True)
@@ -346,7 +345,7 @@ CALLS: dict[str, Call] = {
     },
     # Only a dead Chrome is retried: a page that timed out would only time out again.
     "a_timeout_is_not_retried": Call(error=TimeoutError("slow"), expect="TimeoutError"),
-    "a_browser_failure_is_counted_by_its_kind": Call(error=_cdp(), expect="OnyxwebError"),
+    "a_browser_failure_is_counted_by_its_kind": Call(error=CDP_FAILED, expect="OnyxwebError"),
     # --- the log: one line, its operation, engine and outcome, and never a secret --------------
     "a_good_fetch_is_logged": Call(
         urls=(PUBLIC + "ok",), log=("fetch", "93.184.216.34/ok", "shell", "ok")
@@ -398,15 +397,15 @@ CALLS: dict[str, Call] = {
 
 
 class _Mortal(FakeClient):
-    """A fake whose Chrome dies as it starts serving, while `left[0]` deaths remain."""
+    """A fake whose Chrome dies as it starts serving, while its factory has deaths left."""
 
-    def __init__(self, left: list[int], **kwargs: Any) -> None:
+    def __init__(self, factory: _MortalFactory, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._left = left
+        self._factory = factory
 
     def _maybe_die(self) -> None:
-        if self._left[0] > 0 and not self.fetched:
-            self._left[0] -= 1
+        if self._factory.left > 0 and not self.fetched:
+            self._factory.left -= 1
             self.die()
 
     async def fetch(self, url: str, **kwargs: Any) -> onyxweb.RenderResult:
@@ -432,23 +431,21 @@ class _MortalFactory(FakeClientFactory):
 
     def __init__(self, deaths: int, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._left = [deaths]
+        self.left = deaths  # deaths still to hand out, across every client it builds
 
     def __call__(self, engine: str) -> FakeClient:
-        client = _Mortal(self._left, pages=self.pages, error=self.error)
+        client = _Mortal(self, pages=self.pages, error=self.error)
         self.built.append((engine, client))
         return client
 
 
 class _Recorder(FakeClient):
-    """Stands in for ``onyxweb.AsyncClient`` and remembers how it was built."""
+    """Stands in for ``onyxweb.AsyncClient``, appending itself to `built` with its kwargs."""
 
-    instances: ClassVar[list[_Recorder]] = []
-
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, built: list[_Recorder], **kwargs: Any) -> None:
         super().__init__()
         self.kwargs = kwargs
-        _Recorder.instances.append(self)
+        built.append(self)
 
 
 def _token(item: object) -> str:
@@ -464,27 +461,15 @@ def _token(item: object) -> str:
     }.get(type(item), "list")
 
 
-async def _invoke(core: ServerCore, row: Call) -> Any:
-    options, shot = FetchOptions(**row.options), ShotOptions(**row.shot)
-    try:
-        if row.op == "batch":
-            return await core.batch(list(row.urls), options)
-        return await getattr(core, row.op)(
-            row.urls[0], *([options] if row.op == "fetch" else [options, shot])
-        )
-    except Exception as failure:  # the row says which failure it must be
-        return failure
-
-
 @pytest.mark.parametrize("name", list(CALLS))
 async def test_a_core_call_gives_its_outcome_and_every_effect(
     name: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     row = CALLS[name]
-    _Recorder.instances = []
+    recorded: list[_Recorder] = []
     factory: FakeClientFactory | None = None
     if row.client_kwargs is not None:
-        monkeypatch.setattr(onyxweb, "AsyncClient", _Recorder)
+        monkeypatch.setattr(onyxweb, "AsyncClient", partial(_Recorder, recorded))
     else:
         factory = (
             _MortalFactory(row.dies, pages=row.pages, error=row.error)
@@ -493,12 +478,20 @@ async def test_a_core_call_gives_its_outcome_and_every_effect(
         )
     core = ServerCore(factory, config=CoreConfig(**row.config))
     try:
+        options, shot = FetchOptions(**row.options), ShotOptions(**row.shot)
+        got: Any
         with caplog.at_level(logging.INFO, logger="onyxweb_server"):
-            got = await _invoke(core, row)
+            try:
+                if row.op == "batch":
+                    got = await core.batch(list(row.urls), options)
+                else:
+                    got = await getattr(core, row.op)(
+                        row.urls[0], *([options] if row.op == "fetch" else [options, shot])
+                    )
+            except Exception as failure:  # the row says which failure it must be
+                got = failure
         clients = (
-            factory.built
-            if factory is not None
-            else [(c.kwargs["engine"], c) for c in _Recorder.instances]
+            factory.built if factory is not None else [(c.kwargs["engine"], c) for c in recorded]
         )
 
         # The outcome.

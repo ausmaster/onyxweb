@@ -16,7 +16,7 @@ import asyncio
 import contextlib
 import ipaddress
 import socket
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -121,15 +121,25 @@ HOSTS_PROXY = {
 REFUSED_HEADER = b"X-Onyxweb-Egress: refused"
 
 
-def resolve(host: str) -> list[Any]:
-    """A fake resolver: IP literals as themselves, `HOSTS_PROXY` by name, else unresolvable."""
-    try:
-        return [ipaddress.ip_address(host)]
-    except ValueError:
-        pass
-    if host not in HOSTS_PROXY:
-        raise socket.gaierror(socket.EAI_NONAME, "unknown host")
-    return [ipaddress.ip_address(a) for a in HOSTS_PROXY[host]]
+class Resolves:
+    """The proxy's name lookups, recorded; `HOSTS_PROXY` by name, else unresolvable."""
+
+    def __init__(self, rebinding: bool = False) -> None:
+        self.calls: list[str] = []
+        self._rebinding = rebinding
+
+    def __call__(self, host: str) -> list[Any]:
+        self.calls.append(host)
+        if self._rebinding:  # public the first time, private the second: a DNS rebind
+            answer = "93.184.216.34" if len(self.calls) == 1 else "10.0.0.1"
+            return [ipaddress.ip_address(answer)]
+        try:
+            return [ipaddress.ip_address(host)]
+        except ValueError:
+            pass
+        if host not in HOSTS_PROXY:
+            raise socket.gaierror(socket.EAI_NONAME, "unknown host")
+        return [ipaddress.ip_address(a) for a in HOSTS_PROXY[host]]
 
 
 class Connects:
@@ -154,16 +164,25 @@ class Upstream:
         self.connections = 0
         self.requests: list[bytes] = []
         self.port = 0
-        self._server: asyncio.Server | None = None
 
-    async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
-        self.port = self._server.sockets[0].getsockname()[1]
-
-    async def stop(self) -> None:
-        assert self._server is not None
-        self._server.close()
-        await self._server.wait_closed()
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def serving(cls, kind: str) -> AsyncIterator[Upstream]:
+        """A loopback origin of `kind` ("http", "echo"), or a closed port ("down")."""
+        origin = cls(echo=kind == "echo")
+        if kind == "down":
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                origin.port = sock.getsockname()[1]
+            yield origin
+            return
+        server = await asyncio.start_server(origin._handle, "127.0.0.1", 0)
+        origin.port = server.sockets[0].getsockname()[1]
+        try:
+            yield origin
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connections += 1
@@ -185,30 +204,9 @@ class Upstream:
             writer.close()
 
 
-@contextlib.asynccontextmanager
-async def _origin(kind: str) -> AsyncIterator[Upstream]:
-    """A loopback origin of `kind` ("http", "echo"), or a closed port ("down")."""
-    origin = Upstream(echo=kind == "echo")
-    if kind == "down":
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            origin.port = sock.getsockname()[1]
-        yield origin
-        return
-    await origin.start()
-    try:
-        yield origin
-    finally:
-        await origin.stop()
-
-
-def _local(ip: Any) -> bool:
-    return str(ip) == "127.0.0.1"
-
-
 _ALLOW: dict[str, Callable[[Any], bool]] = {
     "public": is_public,
-    "local": _local,
+    "local": lambda ip: str(ip) == "127.0.0.1",
     "any": lambda ip: True,
 }
 
@@ -344,19 +342,10 @@ REQUESTS: dict[str, Req] = {
 @pytest.mark.parametrize("name", list(REQUESTS))
 async def test_a_request_through_the_proxy_gets_its_answer_and_effects(name: str) -> None:
     row = REQUESTS[name]
-    lookups: list[str] = []
-
-    def rebinding(host: str) -> list[Any]:
-        lookups.append(host)
-        return [ipaddress.ip_address("93.184.216.34" if len(lookups) == 1 else "10.0.0.1")]
-
-    async with _origin(row.origin) as origin:
+    resolves = Resolves(rebinding=row.resolver == "rebinding")
+    async with Upstream.serving(row.origin) as origin:
         connects = Connects(port=origin.port if row.resolver == "rebinding" else None)
-        proxy = EgressProxy(
-            is_allowed=_ALLOW[row.allow],
-            resolve=rebinding if row.resolver == "rebinding" else resolve,
-            connect=connects,
-        )
+        proxy = EgressProxy(is_allowed=_ALLOW[row.allow], resolve=resolves, connect=connects)
         url = await proxy.start()
         host, port = url.removeprefix("http://").rsplit(":", 1)
         reader, writer = await asyncio.open_connection(host, int(port))
@@ -392,7 +381,7 @@ async def test_a_request_through_the_proxy_gets_its_answer_and_effects(name: str
         if row.dialled is not None:
             assert connects.calls == list(row.dialled), "the proxy dialled something else"
         if row.lookups is not None:
-            assert len(lookups) == row.lookups, "the name was resolved more than once"
+            assert len(resolves.calls) == row.lookups, "the name was resolved more than once"
 
 
 async def test_a_closed_proxy_takes_no_more_connections() -> None:
@@ -400,7 +389,7 @@ async def test_a_closed_proxy_takes_no_more_connections() -> None:
 
     New test: nothing else ends a proxy, and a row is one request on a running one.
     """
-    proxy = EgressProxy(resolve=resolve)
+    proxy = EgressProxy(resolve=Resolves())
     url = await proxy.start()
     assert await proxy.start() == url, "starting twice built a second listener"
     await proxy.aclose()
@@ -464,14 +453,6 @@ ATTACKS: dict[str, Attack] = {
 }
 
 
-async def _try(call: Awaitable[Any]) -> Any:
-    """The result of `call`, or the `Refused` or browser error it raised."""
-    try:
-        return await call
-    except (Refused, onyxweb.OnyxwebError) as failure:
-        return failure
-
-
 @pytest.mark.parametrize("op", ["fetch", "batch", "fetch_all"])
 @pytest.mark.parametrize("name", list(ATTACKS))
 async def test_a_browser_cannot_reach_a_private_host_through_the_core(
@@ -499,14 +480,18 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
         start = f"http://127.0.0.1:{httpserver.port}{start}"
     # Only the public origin (127.0.0.1) is reachable; the guard is off because the test server
     # is loopback, so the proxy is what stands between the browser and the secret.
-    proxy = EgressProxy(is_allowed=_local)
+    proxy = EgressProxy(is_allowed=_ALLOW["local"])
     core = ServerCore(egress=proxy, url_guard=lambda url: None, config=CoreConfig(egress=True))
     options = FetchOptions(wait_ms=row.wait_ms)
+    outcome: Any
     try:
         if op == "batch":  # a batch returns the same refusal in the URL's place
             [outcome] = await core.batch([start], options)
         else:
-            outcome = await _try(getattr(core, op)(start, options))
+            try:
+                outcome = await getattr(core, op)(start, options)
+            except (Refused, onyxweb.OnyxwebError) as failure:
+                outcome = failure
         if row.refused:
             assert isinstance(outcome, Refused), outcome
             assert outcome.code == "refused_url"

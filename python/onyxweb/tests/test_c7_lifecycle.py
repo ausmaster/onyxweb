@@ -68,47 +68,28 @@ def _chrome_children(*, zombies: bool = False) -> set[int]:
     return pids
 
 
-def _gone(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
-    deadline = time.monotonic() + within_s
-    while time.monotonic() < deadline:
-        if not pids & _chrome_children():
-            return True
-        time.sleep(0.01)
-    return False
+def _settled(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
+    """Whether every pid has stopped: gone, or a zombie whose last thread has exited.
 
-
-def _reapable(pids: set[int], within_s: float) -> bool:
-    """Whether every pid is gone or waitable: a zombie whose other threads have all exited.
-
-    A SIGKILLed leader shows `Z` while its threads still unwind, and `waitpid` (so `alive`)
-    only succeeds after the last one; that took up to 22 ms on a loaded CI runner.
+    A SIGKILLed leader shows `Z` while its other threads unwind, and `waitpid` — so
+    `client.alive` — succeeds only after the last one; that took up to 22 ms on a CI runner.
     """
-
-    def waitable(pid: int) -> bool:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                stat = f.read()
-            return (
-                stat[stat.rindex(")") + 2 :][0] == "Z" and len(os.listdir(f"/proc/{pid}/task")) <= 1
-            )
-        except OSError:
-            return True
-
     deadline = time.monotonic() + within_s
     while time.monotonic() < deadline:
-        if all(waitable(pid) for pid in pids):
+        busy = set()
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    stat = f.read()
+                threads = len(os.listdir(f"/proc/{pid}/task"))
+            except OSError:
+                continue  # already reaped
+            if stat[stat.rindex(")") + 2 :].split()[0] != "Z" or threads > 1:
+                busy.add(pid)
+        if not busy:
             return True
         time.sleep(0.001)
     return False
-
-
-async def _close(shape: Shape, client: onyxweb.Client | onyxweb.AsyncClient) -> None:
-    if isinstance(client, onyxweb.AsyncClient):
-        await client.aclose()
-    elif shape == "context_manager":
-        client.__exit__(None, None, None)
-    else:
-        client.close()
 
 
 @needs_proc
@@ -123,24 +104,33 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
         client = onyxweb.Client(concurrency=1)
         if shape == "context_manager":
             client.__enter__()
+
+    async def close() -> None:
+        if isinstance(client, onyxweb.AsyncClient):
+            await client.aclose()
+        elif shape == "context_manager":
+            client.__exit__(None, None, None)
+        else:
+            client.close()
+
     launched = _chrome_children() - before
     assert launched, "expected this client to start a Chrome process"
     assert client.alive
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
             os.kill(pid, signal.SIGKILL)
-        assert _reapable(launched, within_s=5.0), "Chrome survived SIGKILL"
+        assert _settled(launched, within_s=5.0), "Chrome survived SIGKILL"
         assert not client.alive
         await _assert_dead_chrome_is_named(client)
 
     started = time.perf_counter()
-    await _close(shape, client)
+    await close()
     assert time.perf_counter() - started < CLOSE_BUDGET_S
     assert not client.alive
-    assert _gone(launched), "Chrome still running after close, though the client is referenced"
+    assert _settled(launched), "Chrome still running after close, though the client is referenced"
     assert not launched & _chrome_children(zombies=True), "Chrome left unreaped after close"
 
-    await _close(shape, client)  # a second close is a no-op
+    await close()  # a second close is a no-op
     with pytest.raises(RuntimeError, match="closed"):
         if isinstance(client, onyxweb.AsyncClient):
             await client.fetch("data:text/html,x")
@@ -235,15 +225,6 @@ def _chrome_tree(root_pid: int) -> set[int]:
     return tree
 
 
-def _all_gone(pids: set[int], within_s: float) -> bool:
-    deadline = time.monotonic() + within_s
-    while time.monotonic() < deadline:
-        if not any(psutil.pid_exists(pid) for pid in pids):
-            return True
-        time.sleep(0.05)
-    return False
-
-
 # Engine and sandbox as the owning process launches Chrome: the wrapper must stop every one.
 @pytest.mark.parametrize(
     ("engine", "sandbox"),
@@ -281,7 +262,10 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
         tree = _chrome_tree(proc.pid)
         assert tree, "expected the subprocess to have a live Chrome process tree"
         proc.kill()  # only the owning process — SIGKILL on POSIX, TerminateProcess on Windows
-        assert _all_gone(tree, within_s=5.0), f"orphaned Chrome survived: {tree}"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and any(psutil.pid_exists(pid) for pid in tree):
+            time.sleep(0.05)
+        assert not any(psutil.pid_exists(pid) for pid in tree), f"orphaned Chrome survived: {tree}"
     finally:
         proc.wait(timeout=5)
         for pid in _chrome_tree(proc.pid):

@@ -156,7 +156,7 @@ class FakeClient:
         if quality is not None:
             recorded["quality"] = quality
         self.fetched.append((url, recorded))
-        return _fetch_result(self._serve(url), _IMAGES[format])
+        return self._fetch_result(self._serve(url), _IMAGES[format])
 
     async def batch(
         self,
@@ -188,35 +188,35 @@ class FakeClient:
             elif capture == "png":
                 items.append(_IMAGES["png"])
             else:
-                items.append(_fetch_result(page, _IMAGES["png"]))
+                items.append(self._fetch_result(page, _IMAGES["png"]))
         return items
 
     async def aclose(self) -> None:
         """Close the client; closing one whose Chrome died is fine."""
         self.closed = True
 
+    @staticmethod
+    def _fetch_result(page: RenderResult, image: bytes) -> FetchResult:
+        """A `FetchResult` over `page` and `image`, built without the Rust output it usually wraps.
+
+        `FetchResult` forwards three fields to that output, so a stand-in carries just those.
+        """
+        result = FetchResult.__new__(FetchResult)
+        result.html = page
+        result.png = image
+        result._raw = cast(
+            _FetchOutput,
+            SimpleNamespace(
+                final_url=page.final_url, status_code=page.status_code, elapsed_s=page.elapsed_s
+            ),
+        )
+        return result
+
     async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
-
-
-def _fetch_result(page: RenderResult, image: bytes) -> FetchResult:
-    """A `FetchResult` over `page` and `image`, built without the Rust output it usually wraps.
-
-    `FetchResult` forwards three fields to that output, so a stand-in carries just those.
-    """
-    result = FetchResult.__new__(FetchResult)
-    result.html = page
-    result.png = image
-    result._raw = cast(
-        _FetchOutput,
-        SimpleNamespace(
-            final_url=page.final_url, status_code=page.status_code, elapsed_s=page.elapsed_s
-        ),
-    )
-    return result
 
 
 @dataclass
