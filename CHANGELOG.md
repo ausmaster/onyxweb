@@ -6,6 +6,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 ## [Unreleased]
 
 ### Added
+- `Client.alive` and `AsyncClient.alive`: `False` once Chrome has exited or the client is closed, checked without a fetch.
 - `sandbox` (`chrome.sandbox`, env `ONYXWEB_CHROME__SANDBOX`), default `True`: `False` runs Chrome with `--no-sandbox`. Launch-only. See "Docker and BBOT" in the README.
 - `ChromeExitedError`, an `OnyxwebError` subclass with `.kind == "chrome_exited"`: once Chrome has died, every call on that client raises it at once, with the exit status and a note to create a new client.
 - `queue_timeout_ms` (`timeout.queue_ms`), off by default: when set, `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError` subclass, `.kind == "queue_timeout"`) after waiting that long for a free tab. `batch` ignores it.

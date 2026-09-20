@@ -1176,6 +1176,15 @@ class Client:
 
     # --- Lifecycle ---------------------------------------------------------
 
+    @property
+    def alive(self) -> bool:
+        """``True`` while Chrome runs; ``False`` once it has exited or ``close()`` was called.
+
+        Asks the operating system, without a fetch. A Chrome that is frozen but still a
+        process counts as alive, so ``False`` always means it is gone.
+        """
+        return self._rust.alive
+
     def close(self) -> None:
         """Tear down the chromium process and free pool resources."""
         _client_log.info("Client close")
@@ -1520,6 +1529,14 @@ class AsyncClient:
         return results
 
     # --- Lifecycle --------------------------------------------------------
+
+    @property
+    def alive(self) -> bool:
+        """``True`` while Chrome runs; ``False`` once it has exited or ``aclose()`` was called.
+
+        Sync and cheap; see :attr:`Client.alive`.
+        """
+        return self._rust.alive
 
     async def aclose(self) -> None:
         """Tear down the chromium process and free pool resources.

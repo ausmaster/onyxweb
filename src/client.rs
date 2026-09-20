@@ -762,6 +762,13 @@ impl Client {
         Ok(())
     }
 
+    /// False once `close` was called or Chrome has exited. Never waits: a Chrome frozen or
+    /// busy enough that a request holds its lock still reads as alive.
+    #[getter]
+    fn alive(&self) -> bool {
+        !self.inner.is_closed() && self.inner.chrome_exit().is_none()
+    }
+
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }

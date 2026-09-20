@@ -258,11 +258,15 @@ The variable applies to any `Client`, including one built with `engine=` or `chr
 ```python
 try:
     r = client.fetch(url)
-except TimeoutError:            # navigation + CDP timeouts
+except onyxweb.ChromeExitedError:   # Chrome died; every later call fails too, so build a new Client
     ...
-except onyxweb.OnyxwebError:    # subclasses RuntimeError; carries .url and .kind
+except TimeoutError:                # navigation + CDP timeouts, and QueueTimeoutError
+    ...
+except onyxweb.OnyxwebError:        # subclasses RuntimeError; carries .url and .kind
     ...
 ```
+
+`client.alive` is `False` once Chrome has exited or the client is closed, and checking it costs no fetch. `Client(queue_timeout_ms=5000)` makes `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError`) after 5 s without a free tab, instead of waiting; `batch` ignores it.
 
 ## Development
 

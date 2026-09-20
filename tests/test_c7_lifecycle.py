@@ -5,6 +5,7 @@ Chrome to exit rather than waiting out the handler's timeout. Every close shape 
 return within ``CLOSE_BUDGET_S``, stop and reap the Chrome it started while the client is
 still referenced, ignore a second close, and refuse a fetch afterwards. The same holds when
 Chrome was killed first, and then every call must also raise ``ChromeExitedError`` at once.
+``alive`` is true while Chrome runs and false once it exits or the client closes.
 A frozen Chrome can't answer shutdown at all, so its close is bounded by
 ``CLOSE_TIMEOUT_S`` instead.
 
@@ -99,15 +100,18 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
             client.__enter__()
     launched = _chrome_children() - before
     assert launched, "expected this client to start a Chrome process"
+    assert client.alive
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
             os.kill(pid, signal.SIGKILL)
         assert _gone(launched, within_s=5.0), "Chrome survived SIGKILL"
+        assert not client.alive
         await _assert_dead_chrome_is_named(client)
 
     started = time.perf_counter()
     await _close(shape, client)
     assert time.perf_counter() - started < CLOSE_BUDGET_S
+    assert not client.alive
     assert _gone(launched), "Chrome still running after close, though the client is referenced"
     assert not launched & _chrome_children(zombies=True), "Chrome left unreaped after close"
 
