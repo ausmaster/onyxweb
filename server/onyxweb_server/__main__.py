@@ -1,6 +1,7 @@
-"""``onyxweb-server`` — serve onyxweb's browser to agents. Commands: ``mcp``.
+"""``onyxweb-server`` — serve onyxweb's browser to agents and programs. Commands: ``mcp``, ``http``.
 
-  onyxweb-server mcp            # MCP over stdio, for Claude Code and other agents
+  onyxweb-server mcp                  # MCP over stdio, for Claude Code and other agents
+  onyxweb-server http --port 8000     # HTTP, for programs; loopback unless --host says otherwise
 
 Exit codes: 0 after a clean stop, 1 for a bad argument or a missing extra.
 """
@@ -32,6 +33,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         epilog="ONYXWEB_SERVER_MAX_PAGES (default 50) sets how many fetched pages it keeps.",
     )
+    http = commands.add_parser(
+        "http",
+        help="serve HTTP",
+        description=(
+            "Serve onyxweb over HTTP: POST /fetch returns a snapshot, GET /health a status."
+        ),
+        epilog="There is no authentication; put a reverse proxy in front before exposing it.",
+    )
+    http.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
+    http.add_argument("--port", type=int, default=8000, help="port to listen on (default: 8000)")
     return p
 
 
@@ -46,6 +57,15 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         # Nothing but the protocol may reach stdout until the client leaves.
         build_server().run()
+    else:
+        try:
+            import uvicorn
+
+            from onyxweb_server.http import build_app
+        except ImportError as ie:  # the extra isn't installed; the message names it
+            sys.stderr.write(f"onyxweb-server: {ie}\n")
+            return 1
+        uvicorn.run(build_app(), host=args.host, port=args.port)
     return 0
 
 

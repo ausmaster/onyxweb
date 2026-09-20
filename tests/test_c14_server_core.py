@@ -11,47 +11,13 @@ A fake client stands in for the browser, so nothing here launches Chrome.
 from __future__ import annotations
 
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import onyxweb
 import pytest
+from conftest import PUBLIC, Factory
 from onyxweb_server.core import MAX_WAIT_MS, ServerCore, check_url
-
-PUBLIC = "http://93.184.216.34/"  # a public literal, so the real guard needs no DNS
-
-
-class FakeClient:
-    """Stands in for ``AsyncClient``: serves a canned page, records calls, never runs Chrome."""
-
-    def __init__(self) -> None:
-        self.alive = True
-        self.closed = False
-        self.fetched: list[tuple[str, int]] = []
-
-    async def fetch(self, url: str, *, wait_after_ms: int = 0) -> onyxweb.RenderResult:
-        self.fetched.append((url, wait_after_ms))
-        return onyxweb.RenderResult(f"<html><body>{url}</body></html>", final_url=url)
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-@dataclass
-class Factory:
-    """Builds `FakeClient`s and remembers, in order, which engine each was built for."""
-
-    built: list[tuple[str, FakeClient]] = field(default_factory=list)
-
-    def __call__(self, engine: str) -> Any:
-        client = FakeClient()
-        self.built.append((engine, client))
-        return client
-
-    @property
-    def engines(self) -> list[str]:
-        return [engine for engine, _ in self.built]
-
 
 # --- the URL guard ----------------------------------------------------------------------
 
@@ -220,8 +186,11 @@ async def test_a_dead_client_is_replaced_and_closed_on_the_next_fetch() -> None:
     core = ServerCore(factory)
     await core.fetch(PUBLIC + "a")
     ((_, first),) = factory.built
+    assert core.health() == {"shell": True}
     first.alive = False
+    assert core.health() == {"shell": False}
     await core.fetch(PUBLIC + "b")
+    assert core.health() == {"shell": True}
     assert factory.engines == ["shell", "shell"]
     assert first.closed and not factory.built[1][1].closed
 

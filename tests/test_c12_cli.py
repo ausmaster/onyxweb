@@ -366,6 +366,8 @@ SERVER_COMMANDS: dict[str, tuple[list[str], int, str, str]] = {
     "no_command": ([], 1, "", "command"),
     "unknown_command": (["ftp"], 1, "", "invalid choice"),
     "unknown_argument": (["mcp", "--bogus"], 1, "", "unrecognized arguments: --bogus"),
+    "http_help": (["http", "--help"], 0, "usage: onyxweb-server http", ""),
+    "http_port_not_a_number": (["http", "--port", "abc"], 1, "", "invalid int value"),
 }
 
 
@@ -388,16 +390,21 @@ def test_server_command(capsys: pytest.CaptureFixture[str], name: str) -> None:
         assert "Traceback" not in captured.err
 
 
-def test_server_without_its_extra_exits_1_and_names_the_fix() -> None:
-    """Without the ``mcp`` package ``onyxweb-server mcp`` says what to install, not a traceback.
+@pytest.mark.parametrize(
+    ("command", "missing", "extra"), [("mcp", "mcp", "mcp"), ("http", "fastapi", "http")]
+)
+def test_server_without_its_extra_exits_1_and_names_the_fix(
+    command: str, missing: str, extra: str
+) -> None:
+    """Without a front-end's package ``onyxweb-server`` says what to install, not a traceback.
 
-    New test: it needs an interpreter that can't import ``mcp``, so it runs in a subprocess.
+    New test: it needs an interpreter that can't import the package, so it runs in a subprocess.
     """
     block = (
-        "import sys; sys.modules['mcp'] = None; from onyxweb_server.__main__ import main; "
-        "raise SystemExit(main(['mcp']))"
+        f"import sys; sys.modules[{missing!r}] = None; from onyxweb_server.__main__ import main; "
+        f"raise SystemExit(main([{command!r}]))"
     )
     p = subprocess.run([sys.executable, "-c", block], capture_output=True, text=True, timeout=60)
     assert p.returncode == 1, p.stderr
-    assert "onyxweb-server[mcp]" in p.stderr
+    assert f"onyxweb-server[{extra}]" in p.stderr
     assert "Traceback" not in p.stderr

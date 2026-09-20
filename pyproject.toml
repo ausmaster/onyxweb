@@ -55,8 +55,11 @@ dev = [
     "mmh3>=4.0",
     # Cross-platform process tree walk/kill for the C7 parent-death regression test.
     "psutil>=6.0",
-    # C13 and C14 test onyxweb-server, which needs the mcp package for its MCP front-end.
+    # C13 to C15 test onyxweb-server, which needs these for its MCP and HTTP front-ends.
     "mcp>=1.2,<2",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "zstandard>=0.23",
 ]
 bench = [
     "pytest>=8",

@@ -130,7 +130,6 @@ class PageStore:
         return [(i, p, now - t) for i, (p, t) in reversed(self._pages.items())]
 
 
-
 # --- browser clients ---------------------------------------------------------------------
 
 
@@ -153,6 +152,10 @@ class ClientPool:
                     await client.aclose()
                 self._clients[engine] = await asyncio.to_thread(self._make, engine)
             return self._clients[engine]
+
+    def health(self) -> dict[str, bool]:
+        """Whether the Chrome of each engine built so far is alive, without a fetch."""
+        return {engine: client.alive for engine, client in self._clients.items()}
 
     async def aclose(self) -> None:
         """Close every client built so far."""
@@ -201,9 +204,7 @@ class ServerCore:
         self._store = PageStore(max_pages)
         self._pool = ClientPool(make_client)
 
-    async def fetch(
-        self, url: str, *, engine: str = "shell", wait_ms: int = 0
-    ) -> RenderResult:
+    async def fetch(self, url: str, *, engine: str = "shell", wait_ms: int = 0) -> RenderResult:
         """Fetch `url` in a real browser and return the page, holding nothing.
 
         Args:
@@ -234,6 +235,10 @@ class ServerCore:
     def pages(self) -> list[tuple[str, RenderResult, float]]:
         """Every held page as (id, page, age in seconds), newest first, without counting a use."""
         return self._store.newest_first()
+
+    def health(self) -> dict[str, bool]:
+        """Whether the Chrome of each engine built so far is alive, without a fetch."""
+        return self._pool.health()
 
     async def aclose(self) -> None:
         """Close every browser client."""
