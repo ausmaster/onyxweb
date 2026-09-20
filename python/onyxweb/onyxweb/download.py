@@ -1,6 +1,6 @@
 """Pinned Chrome-for-Testing downloader (engine-aware).
 
-Fetches a Chromium build into ``python/onyxweb/_binaries/<platform>/`` so the
+Fetches a Chromium build into ``python/onyxweb/onyxweb/_binaries/<platform>/`` so the
 Rust binary resolver finds it. Two engines (see ``ChromeConfig.engine``):
 
 - ``shell`` → ``chrome-headless-shell`` (flat: ``_binaries/<plat>/``)

@@ -20,8 +20,9 @@ from typing import Any
 import onyxweb
 import pytest
 import zstandard
-from conftest import PUBLIC, Factory
+from conftest import PUBLIC
 from fastapi.testclient import TestClient
+from onyxweb.testing import FakeClientFactory
 from onyxweb_server.core import ServerCore
 from onyxweb_server.http import build_app
 
@@ -74,8 +75,10 @@ REQUESTS: dict[str, Request] = {
 }
 
 
-def _client(factory: Factory | None = None) -> tuple[TestClient, ServerCore, Factory]:
-    factory = factory or Factory()
+def _client(
+    factory: FakeClientFactory | None = None,
+) -> tuple[TestClient, ServerCore, FakeClientFactory]:
+    factory = factory or FakeClientFactory()
     core = ServerCore(factory)
     return TestClient(build_app(core)), core, factory
 
@@ -139,7 +142,7 @@ FAILURES: dict[str, tuple[BaseException, int, str]] = {
 @pytest.mark.parametrize("name", list(FAILURES))
 def test_failure(name: str) -> None:
     err, status, kind = FAILURES[name]
-    client, _, factory = _client(Factory(error=err))
+    client, _, factory = _client(FakeClientFactory(error=err))
     with client:
         r = _post(client, OK)
         assert (r.status_code, r.json()["error"]["kind"]) == (status, kind), r.text
@@ -195,7 +198,7 @@ def test_health_reports_each_built_engine() -> None:
         assert client.get("/health").json() == {"status": "ok", "engines": {}}
         _post(client, OK)
         assert client.get("/health").json() == {"status": "ok", "engines": {"shell": True}}
-        factory.built[0][1].alive = False
+        factory.built[0][1].die()
         assert client.get("/health").json() == {"status": "ok", "engines": {"shell": False}}
 
 

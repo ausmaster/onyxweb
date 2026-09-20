@@ -165,7 +165,7 @@ options:
 
 ## Serving agents
 
-`onyxweb-server`, a separate package in this repository, serves onyxweb's browser to agents over MCP so an agent such as Claude Code can fetch a page once, then look, find and read it in pieces. Install and usage: [`server/README.md`](server/README.md).
+`onyxweb-server`, a separate package in this repository, serves onyxweb's browser to agents over MCP so an agent such as Claude Code can fetch a page once, then look, find and read it in pieces. Install and usage: [`python/server/README.md`](python/server/README.md).
 
 ## Anti-bot
 
@@ -232,7 +232,7 @@ Flat kwargs, a `ClientConfig` object, or `ONYXWEB_*` environment variables.
 onyxweb.Client(viewport=(1920, 1080), locale="en-GB", proxy="http://user:pass@host:8080")
 ```
 
-`client.config` is a live view: assign at any depth and the next fetch uses it. Launch-only fields (concurrency, chrome options) raise `ValueError` instead of failing silently. Full field list with docs: [`python/onyxweb/config.py`](python/onyxweb/config.py).
+`client.config` is a live view: assign at any depth and the next fetch uses it. Launch-only fields (concurrency, chrome options) raise `ValueError` instead of failing silently. Full field list with docs: [`python/onyxweb/onyxweb/config.py`](python/onyxweb/onyxweb/config.py).
 
 Two knobs worth knowing, both off by default, since `outerHTML` drops this content:
 
@@ -272,16 +272,34 @@ except onyxweb.OnyxwebError:        # subclasses RuntimeError; carries .url and 
 
 `client.alive` is `False` once Chrome has exited or the client is closed, and checking it costs no fetch. `Client(queue_timeout_ms=5000)` makes `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError`) after 5 s without a free tab, instead of waiting; `batch` ignores it.
 
+## Testing without Chrome
+
+`onyxweb.testing.FakeClient` stands in for `AsyncClient` in your own tests. It serves canned pages, records each call, and never launches Chrome.
+
+```python
+from onyxweb.testing import FakeClient
+
+fake = FakeClient({"https://example.com/": "<h1>Example</h1>"})
+page = await fake.fetch("https://example.com/")   # a RenderResult; an unlisted URL serves itself
+fake.fetched                                      # [("https://example.com/", {})]
+fake.die()                                        # every later fetch raises ChromeExitedError
+```
+
+A page is html or a ready-made `RenderResult`, `error=` makes every fetch raise, and `fake.fetch` checks its keyword arguments as the real client does. `FakeClientFactory` builds one fake per engine for code that takes a `make_client(engine)` callable.
+
 ## Development
 
+The Python code lives under `python/`. Each project has its own tests, tool config and dev group: the library in `python/onyxweb`, and [`onyxweb-server`](python/server/README.md) in `python/server`.
+
 ```bash
-uv sync                        # venv, deps, Rust extension in editable mode
+uv sync --all-packages --group dev   # venv, both projects' dev tools, Rust extension in editable mode
 uv run onyxweb-download-chrome
+cd python/onyxweb
 uv run pytest                  # tests are Python end-to-end; no Rust unit tests, on purpose
 uv run pytest -m real_sites    # integration tests against live sites (opt-in)
 ```
 
-Editing `src/*.rs` rebuilds on the next `uv run`. Set `ONYXWEB_LOG=debug` for engine logs. Benchmarks and the engine comparison that led here are in [BENCHMARKS.md](BENCHMARKS.md).
+Run `pytest`, `ruff` and `mypy` from inside a project, one project at a time: both have a top-level `conftest.py`. Editing `src/*.rs` rebuilds on the next `uv run`. Set `ONYXWEB_LOG=debug` for engine logs. Benchmarks and the engine comparison that led here are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## License
 

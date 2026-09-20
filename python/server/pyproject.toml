@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onyxweb-server"
+version = "0.1.0"
+description = "Serve onyxweb's browser to agents over MCP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "AusMaster", email = "ausmasterproductions@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+# Raise the floor to onyxweb 0.3 when its breaking changes ship; the workspace serves the local copy.
+dependencies = ["onyxweb>=0.2.3"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2,<2"]
+http = ["fastapi>=0.115", "uvicorn>=0.30", "zstandard>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/ausmaster/onyxweb"
+Repository = "https://github.com/ausmaster/onyxweb"
+Issues = "https://github.com/ausmaster/onyxweb/issues"
+
+[project.scripts]
+onyxweb-server = "onyxweb_server.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["onyxweb_server"]
+
+[tool.uv.sources]
+onyxweb = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-httpserver>=1.1",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # The MCP and HTTP front-ends the tests drive.
+    "mcp>=1.2,<2",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "zstandard>=0.23",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The package sits at the project root; keeping it out of `src` classifies it as third-party in tests.
+src = []
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "D"]
+ignore = [
+    # Google-convention conflicts with these pydocstyle defaults:
+    "D203", # one-blank-line-before-class — google prefers D211
+    "D213", # multi-line-summary-second-line — google prefers D212
+    # __init__ args go in the class docstring under Google convention.
+    "D107",
+    # Magic methods (__repr__ etc.) don't need explicit docstrings.
+    "D105",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests get assert-style summaries; not full Google blocks.
+"tests/*" = ["D"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

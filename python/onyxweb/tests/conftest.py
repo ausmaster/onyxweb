@@ -2,7 +2,7 @@
 
 These tests require a usable Chromium binary. onyxweb auto-resolves from:
   1. explicit chrome_path= on Client (not used here)
-  2. bundled python/onyxweb/_binaries/<platform>/chrome-headless-shell
+  2. bundled python/onyxweb/onyxweb/_binaries/<platform>/chrome-headless-shell
   3. system chromium (apt install chromium-browser etc.)
 
 If neither bundled nor system chromium is available, tests that spin a Client
@@ -16,9 +16,7 @@ import base64
 import socket
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import onyxweb
 import pytest
@@ -26,7 +24,6 @@ from pytest_httpserver import HTTPServer
 
 DataUrl = Callable[[bytes], str]
 
-PUBLIC = "http://93.184.216.34/"  # a public literal, so the real URL guard needs no DNS
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
@@ -139,42 +136,3 @@ def bucket_page(httpserver: HTTPServer) -> str:
     for path, (body, ctype) in _SUBRESOURCES.items():
         httpserver.expect_request(path).respond_with_data(body, content_type=ctype)
     return httpserver.url_for("/page.html")
-
-
-class FakeClient:
-    """Stands in for ``AsyncClient`` in the server contracts: canned pages, no Chrome.
-
-    Set ``error`` to make the next fetches raise it.
-    """
-
-    def __init__(self, error: BaseException | None = None) -> None:
-        self.alive = True
-        self.closed = False
-        self.error = error
-        self.fetched: list[tuple[str, int]] = []
-
-    async def fetch(self, url: str, *, wait_after_ms: int = 0) -> onyxweb.RenderResult:
-        self.fetched.append((url, wait_after_ms))
-        if self.error is not None:
-            raise self.error
-        return onyxweb.RenderResult(f"<html><body>{url}</body></html>", final_url=url)
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-@dataclass
-class Factory:
-    """Builds `FakeClient`s and remembers, in order, which engine each was built for."""
-
-    error: BaseException | None = None  # every client it builds raises this on fetch
-    built: list[tuple[str, FakeClient]] = field(default_factory=list)
-
-    def __call__(self, engine: str) -> Any:
-        client = FakeClient(self.error)
-        self.built.append((engine, client))
-        return client
-
-    @property
-    def engines(self) -> list[str]:
-        return [engine for engine, _ in self.built]

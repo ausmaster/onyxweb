@@ -16,7 +16,8 @@ from typing import Any
 
 import onyxweb
 import pytest
-from conftest import PUBLIC, Factory
+from conftest import PUBLIC
+from onyxweb.testing import FakeClientFactory
 from onyxweb_server.core import MAX_WAIT_MS, ServerCore, check_url
 
 # --- the URL guard ----------------------------------------------------------------------
@@ -127,7 +128,7 @@ CEILINGS: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {
 async def test_fetch_refuses_before_any_client_is_built(name: str) -> None:
     """The default guard runs inside ``fetch``, ahead of the browser, whoever calls it."""
     url, says = REFUSED_FETCHES[name]
-    factory = Factory()
+    factory = FakeClientFactory()
     core = ServerCore(factory)
     with pytest.raises(ValueError, match=says):
         await core.fetch(url)
@@ -140,7 +141,7 @@ async def test_fetch_refuses_before_any_client_is_built(name: str) -> None:
 @pytest.mark.parametrize("name", list(CEILINGS))
 async def test_fetch_enforces_its_ceilings_before_any_client_is_built(name: str) -> None:
     kwargs, says = CEILINGS[name]
-    factory = Factory()
+    factory = FakeClientFactory()
     core = ServerCore(factory)
     with pytest.raises(ValueError) as exc:
         await core.fetch(PUBLIC, **kwargs)
@@ -154,10 +155,10 @@ async def test_fetch_passes_the_settle_through_and_holds_nothing() -> None:
 
     New test: the rows above judge refusals, and this one judges what a good fetch leaves behind.
     """
-    factory = Factory()
+    factory = FakeClientFactory()
     core = ServerCore(factory)
     page = await core.fetch(PUBLIC, wait_ms=700)
-    assert factory.built[0][1].fetched == [(PUBLIC, 700)]
+    assert factory.built[0][1].fetched == [(PUBLIC, {"wait_after_ms": 700})]
     assert core.pages() == []
     assert core.page(core.hold(page)) is page
 
@@ -167,7 +168,7 @@ async def test_each_engine_gets_one_client_built_when_first_used() -> None:
 
     New test: the rows can't see which client a fetch went through.
     """
-    factory = Factory()
+    factory = FakeClientFactory()
     core = ServerCore(factory)
     assert factory.built == [], "a client was built before any fetch"
     await core.fetch(PUBLIC + "a")
@@ -182,12 +183,12 @@ async def test_a_dead_client_is_replaced_and_closed_on_the_next_fetch() -> None:
 
     New test: nothing else makes a client die between two fetches.
     """
-    factory = Factory()
+    factory = FakeClientFactory()
     core = ServerCore(factory)
     await core.fetch(PUBLIC + "a")
     ((_, first),) = factory.built
     assert core.health() == {"shell": True}
-    first.alive = False
+    first.die()
     assert core.health() == {"shell": False}
     await core.fetch(PUBLIC + "b")
     assert core.health() == {"shell": True}

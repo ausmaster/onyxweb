@@ -28,11 +28,10 @@ except ImportError as ie:
         'install it with pip install "onyxweb-server[mcp]".'
     ) from ie
 
-import onyxweb
 from onyxweb import RenderResult
 from onyxweb.records import PAGE_BUCKETS, count_str, size_str
 
-from onyxweb_server.core import ServerCore, check_url
+from onyxweb_server.core import BrowserClient, ServerCore, check_url
 
 TOOL_CAP: Final = 4000  # characters of body from find
 READ_CAP: Final = 6000  # characters of body from read and page_text
@@ -365,7 +364,7 @@ def _best(
 
 
 def build_server(
-    make_client: Callable[[str], onyxweb.AsyncClient] | None = None,
+    make_client: Callable[[str], BrowserClient] | None = None,
     *,
     url_guard: Callable[[str], None] = check_url,
     max_pages: int | None = None,

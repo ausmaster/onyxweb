@@ -2,7 +2,7 @@
 
 Serves [onyxweb](https://github.com/ausmaster/onyxweb)'s browser to agents over MCP and to programs over HTTP.
 
-Requires Python 3.11+ and the browser from `onyxweb --install`. Running in Docker, or as BBOT does, needs `sandbox=False`: see "Docker and BBOT" in the [onyxweb README](../README.md).
+Requires Python 3.11+ and the browser from `onyxweb --install`. Running in Docker, or as BBOT does, needs `sandbox=False`: see "Docker and BBOT" in the [onyxweb README](../../README.md).
 
 ## HTTP
 

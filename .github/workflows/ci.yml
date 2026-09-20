@@ -4,7 +4,7 @@
 # Platforms target what `onyxweb-download-chrome` can stage a binary for:
 # linux x86_64 / aarch64, darwin x86_64 / arm64, windows x86_64. Adding a
 # platform requires both a matrix entry here AND a CFT_PLATFORM row in
-# python/onyxweb/download.py.
+# python/onyxweb/onyxweb/download.py.
 
 name: CI
 
@@ -27,10 +27,19 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - name: Sync dev deps (builds Rust ext via cache-keys)
         run: uv sync --all-packages --group dev
-      - name: Ruff
-        run: uv run ruff check python/ tests/ server/
-      - name: Mypy (strict)
-        run: uv run mypy python/onyxweb/ tests/ server/onyxweb_server/
+      # Each project lints on its own config; one mypy run over both would meet two `conftest` modules.
+      - name: Ruff (onyxweb)
+        working-directory: python/onyxweb
+        run: uv run --no-sync ruff check .
+      - name: Mypy strict (onyxweb)
+        working-directory: python/onyxweb
+        run: uv run --no-sync mypy onyxweb tests
+      - name: Ruff (onyxweb-server)
+        working-directory: python/server
+        run: uv run --no-sync ruff check .
+      - name: Mypy strict (onyxweb-server)
+        working-directory: python/server
+        run: uv run --no-sync mypy onyxweb_server tests
       - name: Cargo fmt
         run: cargo fmt --all -- --check
       - name: Cargo clippy
@@ -51,16 +60,20 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          working-directory: python/onyxweb
+          args: --release --out ../../dist --find-interpreter
           manylinux: "2_28"
           sccache: true
           # Built in the wheel's manylinux container, so the glibc baselines match.
           # No sccache there yet, hence RUSTC_WRAPPER=.
           before-script-linux: |
+            # Resolve the repo root from wherever this runs (maturin's working directory is python/onyxweb).
+            ROOT="$(dirname "$(cargo locate-project --workspace --message-format plain)")"
             RUSTC_WRAPPER= cargo build --release --bin onyxweb_wrapper --no-default-features
             # aarch64 cross-compiles land under target/<triple>/release/.
-            mkdir -p python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper
-            cp "$(find target -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" python/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper/
+            DEST="$ROOT/python/onyxweb/onyxweb/_binaries/linux_${{ matrix.target }}/wrapper"
+            mkdir -p "$DEST"
+            cp "$(find "$ROOT/target" -type f -name onyxweb_wrapper -path '*/release/*' | head -1)" "$DEST/"
       - name: Check the wrapper is in every wheel
         run: |
           for whl in dist/*.whl; do
@@ -88,13 +101,14 @@ jobs:
       - name: Build and stage onyxweb_wrapper
         run: |
           cargo build --release --bin onyxweb_wrapper --no-default-features
-          mkdir -p python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper
-          cp target/release/onyxweb_wrapper python/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper/
+          mkdir -p python/onyxweb/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper
+          cp target/release/onyxweb_wrapper python/onyxweb/onyxweb/_binaries/darwin_${{ matrix.target }}/wrapper/
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          working-directory: python/onyxweb
+          args: --release --out ../../dist --find-interpreter
           sccache: true
       - name: Check the wrapper is in every wheel
         run: |
@@ -119,13 +133,14 @@ jobs:
         shell: bash
         run: |
           cargo build --release --bin onyxweb_wrapper --no-default-features
-          mkdir -p python/onyxweb/_binaries/windows_x86_64/wrapper
-          cp target/release/onyxweb_wrapper.exe python/onyxweb/_binaries/windows_x86_64/wrapper/
+          mkdir -p python/onyxweb/onyxweb/_binaries/windows_x86_64/wrapper
+          cp target/release/onyxweb_wrapper.exe python/onyxweb/onyxweb/_binaries/windows_x86_64/wrapper/
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist --find-interpreter
+          working-directory: python/onyxweb
+          args: --release --out ../../dist --find-interpreter
           sccache: true
       - name: Check the wrapper is in every wheel
         shell: bash
@@ -146,7 +161,8 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist
+          working-directory: python/onyxweb
+          args: --out ../../dist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
@@ -155,8 +171,8 @@ jobs:
   test:
     # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
     # fetch chrome-headless-shell via `onyxweb --install`, run
-    # the default pytest suite. Skips the benchmark tests (-m 'not benchmark'
-    # from pyproject addopts).
+    # each project's default pytest suite. Skips the benchmark tests (-m 'not benchmark'
+    # from python/onyxweb/pyproject.toml addopts).
     needs: [linux]
     runs-on: ubuntu-22.04
     steps:
@@ -175,12 +191,19 @@ jobs:
           # `pip install onyxweb` can resolve to PyPI instead of the local build.
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
-          python -m pip install --group dev
-          python -m pip install ./server --no-deps
+          python -m pip install --group python/onyxweb/pyproject.toml:dev
+          python -m pip install --group python/server/pyproject.toml:dev
+          python -m pip install ./python/server --no-deps
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
-      - name: Run default test suite
-        run: pytest tests/
+      # One run per project, each from its own folder: both have a top-level conftest.py, and a
+      # bare `pytest` keeps the source package out of sys.path, so the installed wheel is tested.
+      - name: Run the onyxweb suite
+        working-directory: python/onyxweb
+        run: pytest
+      - name: Run the onyxweb-server suite
+        working-directory: python/server
+        run: pytest
 
   test-macos:
     # Real-platform check for onyxweb_wrapper: installs
@@ -202,10 +225,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
-          python -m pip install --group dev
+          python -m pip install --group python/onyxweb/pyproject.toml:dev
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
       - name: Run C7 lifecycle tests
+        working-directory: python/onyxweb
         run: pytest tests/test_c7_lifecycle.py -v
 
   test-windows:
@@ -227,8 +251,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
-          python -m pip install --group dev
+          python -m pip install --group python/onyxweb/pyproject.toml:dev
       - name: Fetch chrome-headless-shell
         run: onyxweb --install
       - name: Run C7 lifecycle tests
+        working-directory: python/onyxweb
         run: pytest tests/test_c7_lifecycle.py -v

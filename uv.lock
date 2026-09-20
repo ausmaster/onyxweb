@@ -750,7 +750,7 @@ wheels = [
 [[package]]
 name = "onyxweb"
 version = "0.2.3"
-source = { editable = "." }
+source = { editable = "python/onyxweb" }
 dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -762,8 +762,6 @@ bench = [
     { name = "pytest" },
 ]
 dev = [
-    { name = "fastapi" },
-    { name = "mcp" },
     { name = "mmh3" },
     { name = "mypy" },
     { name = "psutil" },
@@ -771,8 +769,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-httpserver" },
     { name = "ruff" },
-    { name = "uvicorn" },
-    { name = "zstandard" },
 ]
 
 [package.metadata]
@@ -787,8 +783,6 @@ bench = [
     { name = "pytest", specifier = ">=8" },
 ]
 dev = [
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "mcp", specifier = ">=1.2,<2" },
     { name = "mmh3", specifier = ">=4.0" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "psutil", specifier = ">=6.0" },
@@ -796,14 +790,12 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-httpserver", specifier = ">=1.1" },
     { name = "ruff", specifier = ">=0.6" },
-    { name = "uvicorn", specifier = ">=0.30" },
-    { name = "zstandard", specifier = ">=0.23" },
 ]
 
 [[package]]
 name = "onyxweb-server"
 version = "0.1.0"
-source = { editable = "server" }
+source = { editable = "python/server" }
 dependencies = [
     { name = "onyxweb" },
 ]
@@ -818,15 +810,41 @@ mcp = [
     { name = "mcp" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "fastapi" },
+    { name = "mcp" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-httpserver" },
+    { name = "ruff" },
+    { name = "uvicorn" },
+    { name = "zstandard" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.115" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2,<2" },
-    { name = "onyxweb", editable = "." },
+    { name = "onyxweb", editable = "python/onyxweb" },
     { name = "uvicorn", marker = "extra == 'http'", specifier = ">=0.30" },
     { name = "zstandard", marker = "extra == 'http'", specifier = ">=0.23" },
 ]
 provides-extras = ["mcp", "http"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "mcp", specifier = ">=1.2,<2" },
+    { name = "mypy", specifier = ">=1.11" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "pytest-httpserver", specifier = ">=1.1" },
+    { name = "ruff", specifier = ">=0.6" },
+    { name = "uvicorn", specifier = ">=0.30" },
+    { name = "zstandard", specifier = ">=0.23" },
+]
 
 [[package]]
 name = "packaging"

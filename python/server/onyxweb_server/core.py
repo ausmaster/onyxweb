@@ -15,7 +15,7 @@ import socket
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Final
+from typing import Final, Protocol
 from urllib.parse import urlsplit
 
 import onyxweb
@@ -133,17 +133,34 @@ class PageStore:
 # --- browser clients ---------------------------------------------------------------------
 
 
+class BrowserClient(Protocol):
+    """What the server needs of a browser client.
+
+    `onyxweb.AsyncClient` fits it, and so does `onyxweb.testing.FakeClient`.
+    """
+
+    @property
+    def alive(self) -> bool:
+        """Whether the browser is still running."""
+
+    async def fetch(self, url: str, *, wait_after_ms: int = ...) -> RenderResult:
+        """Fetch `url`, waiting `wait_after_ms` after the page loads."""
+
+    async def aclose(self) -> None:
+        """Shut the browser down."""
+
+
 class ClientPool:
     """One browser client per engine, built on first use and closed together."""
 
-    def __init__(self, make: Callable[[str], onyxweb.AsyncClient] | None = None) -> None:
+    def __init__(self, make: Callable[[str], BrowserClient] | None = None) -> None:
         self._make = make or (
             lambda engine: onyxweb.AsyncClient(concurrency=CLIENT_CONCURRENCY, engine=engine)
         )
-        self._clients: dict[str, onyxweb.AsyncClient] = {}
+        self._clients: dict[str, BrowserClient] = {}
         self._building = asyncio.Lock()
 
-    async def get(self, engine: str) -> onyxweb.AsyncClient:
+    async def get(self, engine: str) -> BrowserClient:
         """Return a live client for `engine`, building one on first use or after its Chrome died."""
         async with self._building:
             client = self._clients.get(engine)
@@ -177,7 +194,7 @@ class ServerCore:
 
     def __init__(
         self,
-        make_client: Callable[[str], onyxweb.AsyncClient] | None = None,
+        make_client: Callable[[str], BrowserClient] | None = None,
         *,
         url_guard: Callable[[str], None] = check_url,
         max_pages: int | None = None,

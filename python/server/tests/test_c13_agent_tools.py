@@ -37,10 +37,10 @@ from pytest_httpserver import HTTPServer
 
 TOOLS = {"fetch", "pages", "overview", "find", "query", "read", "page_text"}
 REFUSED_FIELDS = {"scripts", "post_load_scripts", "actions"}
-TOOL_CAP = 4000  # characters of body a tool returns; mirrors TOOL_CAP in mcp_server.py
+TOOL_CAP = 4000  # characters of body a tool returns; mirrors TOOL_CAP in mcp.py
 READ_CAP = 6000  # the same for read and page_text
 QUERY_CAP = 8000  # characters query returns for all its questions together
-PASSAGE_CAP = 300  # longest passage query shows; mirrors PASSAGE_CHARS in mcp_server.py
+PASSAGE_CAP = 300  # longest passage query shows; mirrors PASSAGE_CHARS in mcp.py
 OVERHEAD = 200  # the label and continuation lines around a capped body
 UNTRUSTED = "untrusted page content"
 PAGE_ID = re.compile(r"\bp[0-9a-f]{10}\b")
