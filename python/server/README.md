@@ -51,7 +51,9 @@ claude mcp add onyxweb -- onyxweb-server mcp    # register it, then restart the 
 
 | Tool | Returns |
 |---|---|
-| `fetch` | an id, the final URL, status, title and an overview of the page |
+| `fetch` | an id, the final URL, status, title and an overview of the page; with `screenshot=true`, also an image of it from the same visit |
+| `batch` | many URLs at once: an id per page in the order given, and a `FAILED` line for each URL that failed |
+| `screenshot` | an image of the page, taking `full_page`, `format`, `quality` and `viewport` |
 | `pages` | every page fetched this session, newest first |
 | `overview` | the count and size of every bucket |
 | `query` | several questions at once: each gets the best-matching passages of the page text; omit `id` to search all pages |
@@ -59,6 +61,8 @@ claude mcp add onyxweb -- onyxweb-server mcp    # register it, then restart the 
 | `read` | one record's whole content, in pieces of at most 6,000 characters |
 | `page_text` | what the page displays, in pieces of at most 6,000 characters |
 
-Fetch a page, then ask everything you need in one `query` call. Ranking counts word overlap, so it finds passages that use your words and misses ones that only mean the same thing, and it puts navigation, link lists and bare headings below prose ([Boilerpipe](https://dl.acm.org/doi/10.1145/1718487.1718542)'s link-density and word-count features). Use `find` for an exact string, a regex or a bucket. Every tool caps its output and names the `offset` to continue from. A page that comes back nearly empty gets a note suggesting `engine="full"` or a longer `wait_ms`.
+Fetch a page, then ask everything you need in one `query` call. Ranking counts word overlap, so it finds passages that use your words and misses ones that only mean the same thing, and it puts navigation, link lists and bare headings below prose ([Boilerpipe](https://dl.acm.org/doi/10.1145/1718487.1718542)'s link-density and word-count features). Use `find` for an exact string, a regex or a bucket. Every tool caps its output and names the `offset` to continue from. Each marks page text as untrusted, and puts that label above the page's title and URL, which the page chose. A page that comes back nearly empty gets a note suggesting `engine="full"` or a longer `wait_ms`.
 
-Two things are refused outright, with no setting to turn them on. The tools accept no `scripts`, `post_load_scripts` or `actions`. `fetch` refuses any URL whose host resolves to a private, loopback, link-local or otherwise non-public address. A public URL that redirects to a private one is not caught, so run it where private ranges are unreachable. It speaks stdio only. `ONYXWEB_SERVER_MAX_PAGES` (default 50) sets how many pages it keeps.
+`fetch` and `batch` take `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `block_urls` and `bypass_anti_bot`. `screenshot` takes the same except the last 2. The server checks each against its `ONYXWEB_SERVER_*` limits, and a value outside one fails with the limit named. Headers show in the conversation, so an agent sends only what the user gave it. An image cannot be cut, so `screenshot` refuses one over 5 MB and `fetch` leaves it out with a note. Ask for `jpeg` or a smaller `viewport`.
+
+Two things are refused outright, with no setting to turn them on. The tools accept no `scripts`, `post_load_scripts` or `actions`. `fetch`, `batch` and `screenshot` refuse any URL whose host resolves to a private, loopback, link-local or otherwise non-public address, and the egress proxy above stops a redirect or a page's own request from reaching one. It speaks stdio only. `ONYXWEB_SERVER_MAX_PAGES` (default 50) sets how many pages it keeps.
