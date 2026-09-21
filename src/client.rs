@@ -208,11 +208,18 @@ fn build_full_launch(
     if cfg.network.ignore_https_errors {
         b = b.arg("ignore-certificate-errors");
     }
+    // No navigation here ever goes back, but full Chrome keeps each page a tab leaves in its
+    // back/forward cache, in a renderer process of its own: a tab grew ~14 MB per fetch. Chrome
+    // keeps only the last `--disable-features`, so a caller's own list is merged into ours.
+    let mut disabled = vec!["BackForwardCache".to_string()];
     for arg in &cfg.chrome.args {
         let a = arg.strip_prefix("--").unwrap_or(arg);
-        b = b.arg(a.to_string());
+        match a.strip_prefix("disable-features=") {
+            Some(features) => disabled.push(features.to_string()),
+            None => b = b.arg(a.to_string()),
+        }
     }
-    b
+    b.arg(format!("disable-features={}", disabled.join(",")))
 }
 
 /// A Chrome that exits before it is ready most often has a sandbox that cannot start: running

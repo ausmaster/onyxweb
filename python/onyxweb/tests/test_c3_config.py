@@ -1001,16 +1001,24 @@ def test_explicit_profile_dir_is_used(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("engine", ["shell", "full"])
 @pytest.mark.parametrize("sandbox", [True, False])
-def test_sandbox_reaches_chrome_as_a_launch_flag(engine: str, sandbox: bool) -> None:
-    """``sandbox=False`` alone puts ``--no-sandbox`` on Chrome's command line, on either engine.
+@pytest.mark.parametrize(
+    "args", [[], ["disable-features=Translate"]], ids=["no_extra_args", "own_disable_features"]
+)
+def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) -> None:
+    """The flags a launch asks for are on Chrome's command line, on either engine.
+
+    ``sandbox=False`` alone puts ``--no-sandbox`` there. The full engine also turns the
+    back/forward cache off, even beside a caller's own ``disable-features``: Chrome keeps only
+    the last such flag, and each cached page holds a renderer process, so one tab's memory grew
+    about 14 MB with every fetch (11 to 15 renderers after 60 fetches, 5 to 8 without it).
 
     New test: a launch-only knob can't go through ``EFFECTS``, which changes a running client.
-    The shell engine's own copy of the flag once reached Chrome as ``----no-sandbox``, which
-    Chrome ignores, so its sandbox could not be switched off.
+    The shell engine's own copy of ``--no-sandbox`` once reached Chrome as ``----no-sandbox``,
+    which Chrome ignores, so its sandbox could not be switched off.
     """
     before = {p.pid for p in psutil.Process().children()}
     try:
-        client = onyxweb.Client(concurrency=1, engine=engine, sandbox=sandbox)
+        client = onyxweb.Client(concurrency=1, engine=engine, sandbox=sandbox, chrome_args=args)
     except onyxweb.OnyxwebError as e:
         if "not found" in str(e).lower():
             pytest.skip(f"{engine} Chrome unavailable: {e}")
@@ -1024,6 +1032,11 @@ def test_sandbox_reaches_chrome_as_a_launch_flag(engine: str, sandbox: bool) -> 
         assert launched, "expected this client to start a Chrome process"
         flags = min(launched, key=lambda p: p.pid).cmdline()
     assert ("--no-sandbox" in flags) == (not sandbox), flags
+    if engine == "full":
+        disabled = [f for f in flags if f.startswith("--disable-features=")]
+        assert len(disabled) == 1, f"Chrome keeps only the last --disable-features: {disabled}"
+        assert "BackForwardCache" in disabled[0], disabled
+        assert ("Translate" in disabled[0]) == bool(args), disabled
 
 
 def test_launch_timeout_ms_bounds_the_browser_launch(tmp_path: Path) -> None:

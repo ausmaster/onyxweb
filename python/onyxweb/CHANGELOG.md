@@ -28,6 +28,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - The private `Client._render` helper, which no code called.
 
 ### Fixed
+- A full-engine Chrome no longer grows with every fetch. It kept each page a tab had left in its back/forward cache, in a renderer process of its own, so one tab went from 5 to 15 renderer processes and 2.0 GB after 60 fetches. Four tabs after 40 fetches now hold about 1.0 GB, down from 1.9 GB. A `disable-features` in `chrome_args` is merged with the engine's own list.
 - The source distribution carried the test suite, the `onyxweb-server` package, the CI files and `uv.lock`, and the Python package twice. It now holds the Rust crate and the Python package once, 36 files instead of 92.
 - The package docstring example read `result.html.title`, a `str` method. It now reads `result.title`.
 - The shell engine's `--no-sandbox` reached Chrome as `----no-sandbox`, which Chrome ignores, so the default engine failed to launch in Docker with no working switch except `chrome_args=["no-sandbox"]`. `sandbox=False` now works on both engines.
