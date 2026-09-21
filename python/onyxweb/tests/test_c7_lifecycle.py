@@ -34,7 +34,7 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import onyxweb
 import onyxweb.download as dl
@@ -363,6 +363,7 @@ def _fake_download_for(record: dict[str, object]) -> Callable[..., Path]:
         verbose: bool = True,
     ) -> Path:
         record.update(internal_key=internal_key, engine=engine, dest_root=dest_root, force=force)
+        cast(list[str], record.setdefault("engines", [])).append(engine)
         record["thread"] = threading.current_thread()
         return dest_root / internal_key / "chrome-headless-shell"
 
@@ -392,6 +393,43 @@ def test_ensure_chrome_passes_its_arguments(
     dest_root = tmp_path.resolve() if dest == "tmp" else dl.default_dest_dir().resolve()
     assert (rec["engine"], rec["dest_root"], rec["force"]) == (engine, dest_root, force)
     assert out == dest_root / dl.current_platform_key() / "chrome-headless-shell"
+
+
+# install_chrome kwargs, and the environment it runs in -> the engines download_for is asked for.
+INSTALL_ARGS: dict[str, tuple[dict[str, Any], dict[str, str], list[str]]] = {
+    "every_engine_by_default": ({}, {}, ["shell", "full"]),
+    "the_shell_alone": ({"engine": "shell"}, {}, ["shell"]),
+    "full_alone": ({"engine": "full"}, {}, ["full"]),
+    # The configured engine picks what `Client()` drives, not what a setup step leaves out.
+    "a_configured_engine_does_not_narrow_it": (
+        {},
+        {"ONYXWEB_CHROME__ENGINE": "full"},
+        ["shell", "full"],
+    ),
+    "force_and_dest_reach_every_engine": ({"force": True}, {}, ["shell", "full"]),
+}
+
+
+@pytest.mark.parametrize("name", list(INSTALL_ARGS))
+def test_install_chrome_fetches_the_engines_asked_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    """``install_chrome`` (behind ``onyxweb --install``) leaves every engine installed unless one
+    is named, so the server's full Chrome needs no second command.
+
+    New test: ``ENSURE_ARGS`` checks the one-engine ``ensure_chrome``, and this is the entry point
+    that fetches several.
+    """
+    kwargs, env, engines = INSTALL_ARGS[name]
+    monkeypatch.delenv("ONYXWEB_CHROME__ENGINE", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    rec: dict[str, object] = {}
+    monkeypatch.setattr(dl, "download_for", _fake_download_for(rec))
+    assert dl.install_chrome(dest=tmp_path, **kwargs) == 0
+    assert rec["engines"] == engines
+    assert rec["force"] is kwargs.get("force", False)
+    assert rec["dest_root"] == tmp_path.resolve()
 
 
 async def test_aensure_chrome_offloads_and_returns_path(
@@ -508,6 +546,56 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     assert (tmp_path / _PLATFORM / "icudtl.dat").read_bytes() == b"ICU"
     assert full_chrome.read_bytes() == b"FULL_CHROME"
     assert wrapper.read_bytes() == b"WRAPPER"
+
+
+# engine, what is installed (binary, marker), force -> is a download made, and the binary after.
+# A marker is the version an install recorded; None is an install that recorded nothing.
+REFRESH: dict[str, tuple[str, bytes | None, str | None, bool, bool, bytes]] = {
+    "nothing_installed": ("shell", None, None, False, True, b"NEW"),
+    "the_pinned_build_is_kept": ("shell", b"OLD", dl.CHROME_VERSION, False, False, b"OLD"),
+    "an_older_build_is_replaced": ("shell", b"OLD", "1.0.0.0", False, True, b"NEW"),
+    "an_install_that_recorded_nothing_is_replaced": ("shell", b"OLD", None, False, True, b"NEW"),
+    "force_replaces_the_pinned_build": ("shell", b"OLD", dl.CHROME_VERSION, True, True, b"NEW"),
+    "an_empty_binary_is_replaced": ("shell", b"", dl.CHROME_VERSION, False, True, b"NEW"),
+    "the_full_engine_is_judged_by_its_own_marker": ("full", b"OLD", "1.0.0.0", False, True, b"NEW"),
+    "the_full_engine_keeps_the_pinned_build": (
+        "full",
+        b"OLD",
+        dl.CHROME_VERSION,
+        False,
+        False,
+        b"OLD",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(REFRESH))
+def test_install_replaces_a_chrome_that_is_not_the_pinned_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    """An install is skipped only when its recorded version is the pinned one, so upgrading
+    onyxweb refreshes Chrome by itself instead of leaving the old build in place.
+
+    New test: ``INSTALL_FAILURES`` shows what a failed download leaves behind, and this shows
+    what a successful one replaces. The full engine keeps its binary and marker in ``full/``.
+    """
+    engine, before, marker, force, downloads, after = REFRESH[name]
+    zip_base, binary_name, sub = dl._engine_download(engine, "linux64")
+    engine_dir = tmp_path / _PLATFORM / sub
+    binary = engine_dir / binary_name
+    if before is not None:
+        engine_dir.mkdir(parents=True)
+        binary.write_bytes(before)
+    if marker is not None:
+        (engine_dir / dl.VERSION_MARKER).write_text(marker)
+    rec: dict[str, object] = {}
+    archive = _zip_bytes({f"{zip_base}/{binary_name}": b"NEW"})
+    monkeypatch.setattr(urllib.request, "urlopen", _serve(archive, rec))
+    out = dl.download_for(_PLATFORM, engine=engine, dest_root=tmp_path, force=force, verbose=False)
+    assert out == binary
+    assert ("url" in rec) is downloads, "downloaded when it should have kept the build"
+    assert binary.read_bytes() == after
+    assert (engine_dir / dl.VERSION_MARKER).read_text() == dl.CHROME_VERSION
 
 
 def test_download_engine_specs() -> None:

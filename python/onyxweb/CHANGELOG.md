@@ -18,6 +18,8 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb.testing` with `FakeClient` and `FakeClientFactory`: an `AsyncClient` stand-in that serves canned pages for `fetch`, `screenshot`, `fetch_all` and `batch`, records its calls and can be told to fail or die, so code that fetches pages tests without Chrome.
 
 ### Changed
+- `onyxweb --install` and `onyxweb-download-chrome` fetch both Chrome builds, the headless shell and full Chrome, so the server's default engine needs no second command. It is about 380 MB more; `--engine shell` fetches the shell alone, and `ensure_chrome()` still fetches one engine.
+- `onyxweb --install --force` downloads the pinned Chrome again, as `onyxweb-download-chrome --force` did; `onyxweb-download-chrome` keeps `--all`, `--platform` and `--dest`.
 - **Breaking:** `RenderResult.text` and `Element.text` now read as the page displays them. Block elements break lines, a table row stays on one line with tabs between cells, `<pre>` keeps its spacing, and runs of whitespace collapse elsewhere. Previously adjacent blocks ran together, so `<div>Alice</div><div>30</div>` read as `Alice30`. Response hashes are unaffected: they cover the HTML, not the text.
 - **Breaking:** onyxweb requires Python 3.11 or later. The 0.2.3 wheels for Python 3.10 fail on import.
 - **Breaking:** Chrome runs with its sandbox by default on the full engine, which always passed `--no-sandbox` before. Where the sandbox cannot start (root, Docker's default container profile, restricted user namespaces), pass `sandbox=False` or set `ONYXWEB_CHROME__SANDBOX=false`. Docker and BBOT users need this. See "Docker and BBOT" in the README.
@@ -28,6 +30,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - The private `Client._render` helper, which no code called.
 
 ### Fixed
+- An upgrade that pins a newer Chrome now replaces the installed build on the next `onyxweb --install` or `ensure_chrome()`. Before, an installed browser was kept whatever its version, until `onyxweb-download-chrome --force`. An install made before this release records no version, so it is replaced once.
 - A full-engine Chrome no longer grows with every fetch. It kept each page a tab had left in its back/forward cache, in a renderer process of its own, so one tab went from 5 to 15 renderer processes and 2.0 GB after 60 fetches. Four tabs after 40 fetches now hold about 1.0 GB, down from 1.9 GB. A `disable-features` in `chrome_args` is merged with the engine's own list.
 - The source distribution carried the test suite, the `onyxweb-server` package, the CI files and `uv.lock`, and the Python package twice. It now holds the Rust crate and the Python package once, 36 files instead of 92.
 - The package docstring example read `result.html.title`, a `str` method. It now reads `result.title`.

@@ -76,6 +76,8 @@ BAD_ARGUMENTS: dict[str, tuple[list[str], str]] = {
         "--quality",
     ),
     "malformed_header": ([NEVER_FETCHED, "-H", "no-separator"], "KEY=VALUE"),
+    # A flag that does nothing is an error, not a silent no-op.
+    "force_without_install": ([NEVER_FETCHED, "--force"], "--force applies to --install"),
     # Config validation rejects it; Chromium would drop it silently.
     "forbidden_header": ([NEVER_FETCHED, "-H", "Cookie: a=b"], "Cookie"),
 }
@@ -251,6 +253,42 @@ def test_informational_flags(capsys: pytest.CaptureFixture[str]) -> None:
         "full.stealth.BASIC",
     ):
         assert preset in run.out
+
+
+@pytest.mark.parametrize(
+    ("argv", "engine", "force"),
+    [
+        (["--install"], None, False),
+        (["--install", "--engine", "shell"], "shell", False),
+        (["--install", "--engine", "full"], "full", False),
+        (["--install", "--force"], None, True),
+        (["--install", "--engine", "full", "--force"], "full", True),
+    ],
+    ids=["every_engine", "shell_only", "full_only", "forced", "full_forced"],
+)
+def test_install_flag_fetches_every_engine_unless_one_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    engine: str | None,
+    force: bool,
+) -> None:
+    """``onyxweb --install`` asks for every engine, ``--engine`` narrows it to one, and
+    ``--force`` re-downloads a build that is already there.
+
+    New test: a real install downloads hundreds of MB, so ``install_chrome`` is replaced by a
+    recorder, which the ``BAD_ARGUMENTS`` and ``OUTPUTS`` tables cannot do.
+    """
+    asked: list[dict[str, object]] = []
+
+    def install(**kwargs: object) -> int:
+        asked.append(kwargs)
+        return 0
+
+    monkeypatch.setattr("onyxweb.download.install_chrome", install)
+    result = _run(argv, capsys)
+    assert result.code == 0, result.err
+    assert asked == [{"engine": engine, "force": force}]
 
 
 def test_module_entry_point_runs(tmp_path: Path) -> None:

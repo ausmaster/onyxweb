@@ -182,7 +182,7 @@ jobs:
 
   test:
     # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
-    # fetch chrome-headless-shell via `onyxweb --install`, run
+    # fetch both Chrome builds via `onyxweb --install`, run
     # each project's default pytest suite. Skips the benchmark tests (-m 'not benchmark'
     # from python/onyxweb/pyproject.toml addopts).
     needs: [linux]
@@ -206,7 +206,7 @@ jobs:
           python -m pip install --group python/onyxweb/pyproject.toml:dev
           python -m pip install --group python/server/pyproject.toml:dev
           python -m pip install ./python/server --no-deps
-      - name: Fetch chrome-headless-shell
+      - name: Fetch Chrome (both engines)
         run: onyxweb --install
       # One run per project, each from its own folder: both have a top-level conftest.py, and a
       # bare `pytest` keeps the source package out of sys.path, so the installed wheel is tested.
@@ -238,7 +238,7 @@ jobs:
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
           python -m pip install --group python/onyxweb/pyproject.toml:dev
-      - name: Fetch chrome-headless-shell
+      - name: Fetch Chrome (both engines)
         run: onyxweb --install
       - name: Run C7 lifecycle tests
         working-directory: python/onyxweb
@@ -264,7 +264,7 @@ jobs:
           python -m pip install pydantic pydantic-settings
           python -m pip install onyxweb --no-index --no-deps --find-links dist --force-reinstall
           python -m pip install --group python/onyxweb/pyproject.toml:dev
-      - name: Fetch chrome-headless-shell
+      - name: Fetch Chrome (both engines)
         run: onyxweb --install
       - name: Run C7 lifecycle tests
         working-directory: python/onyxweb

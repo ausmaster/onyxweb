@@ -10,7 +10,9 @@ No Node process like Playwright, no WebDriver like Selenium. One install, one pr
 
 ```bash
 uv add onyxweb              # or: pip install onyxweb
-uv run onyxweb --install    # one-time: fetch the pinned chrome-headless-shell (~180 MB)
+uv run onyxweb --install    # one-time: fetch both pinned Chrome builds (~560 MB: shell ~180 MB, full ~380 MB)
+# uv run onyxweb --install --engine shell    # just the shell, if that is all you use
+# uv run onyxweb --install --force           # download again even if the pinned build is there
 ```
 
 Python 3.11+. Wheels for linux (x86_64, aarch64), macOS (arm64), Windows x64. Anything else builds from source and needs [rustup](https://rustup.rs).
@@ -293,7 +295,7 @@ The Python code lives under `python/`. Each project has its own tests, tool conf
 
 ```bash
 uv sync --all-packages --group dev   # venv, both projects' dev tools, Rust extension in editable mode
-uv run onyxweb-download-chrome
+uv run onyxweb --install       # both engines; `onyxweb-download-chrome` adds --all, --platform and --dest
 cd python/onyxweb
 uv run pytest                  # tests are Python end-to-end; no Rust unit tests, on purpose
 uv run pytest -m real_sites    # integration tests against live sites (opt-in)
