@@ -8,17 +8,44 @@ Requires Python 3.11+ and the browser from `onyxweb --install`. Running in Docke
 
 ```bash
 uv tool install "onyxweb-server[http]"       # or: pip install "onyxweb-server[http]"
-onyxweb-server http --port 8000              # binds 127.0.0.1; there is no authentication
+onyxweb-server http --port 8000              # binds 127.0.0.1
 ```
 
 | Route | Returns |
 |---|---|
 | `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it |
+| `POST /screenshot` | the image itself, as `image/png`, `image/jpeg` or `image/webp` |
+| `POST /fetch_all` | `{"snapshot": {...}, "image": "<base64>", "format": "png"}`: the page and its image from one visit |
+| `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, or `{"url", "error"}` for a URL that failed |
 | `GET /health` | `{"status": "ok", "engines": {"shell": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
 
-The body of `POST /fetch` is `{"url": ..., "engine": "shell" | "full", "wait_ms": 0}`. Send `Accept-Encoding: zstd` to get the snapshot compressed (about 9x on a 7 MB page). `scripts`, `post_load_scripts` and `actions` are refused by name with a 400, because the server never runs caller-supplied JavaScript, and a private, loopback or link-local address is refused too. The server holds nothing between requests.
+Every body is a JSON object sent with `Content-Type: application/json`. A route accepts the fields below and refuses any other by name:
 
-A failure is `{"error": {"kind": ..., "message": ..., "url": ...}}` with a status from the kind: 400 for `invalid_url`, `invalid_config`, `post_load_script` and a refused request; 413 for `too_large`; 502 for `cdp` and `io`; 503 for `chrome_exited`, `queue_timeout`, `launch_failed` and `chrome_not_found`; 504 for `navigation_timeout` and `timeout`; 500 for `internal`. Put a reverse proxy in front before exposing it beyond loopback.
+| Route | Fields |
+|---|---|
+| `/fetch` | `url`, `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `block_urls`, `bypass_anti_bot` |
+| `/screenshot` | `url`, `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `full_page`, `format`, `quality`, `viewport` |
+| `/fetch_all` | the `/fetch` fields, plus `full_page`, `format` and `quality` |
+| `/batch` | `urls` in place of `url`, and the other `/fetch` fields, applied to every URL |
+
+Send `Accept-Encoding: zstd` to get JSON compressed (about 9x on a 7 MB page). A batch is compressed as it is written, and an image never is. `scripts`, `post_load_scripts` and `actions` are refused with a 400, because the server never runs caller-supplied JavaScript, and so is a private, loopback or link-local address. The server holds nothing between requests.
+
+A failure is `{"error": {"kind": ..., "message": ..., "url": ...}}` with a status from the kind:
+
+| Status | Kinds |
+|---|---|
+| 400 | `invalid_url`, `invalid_config`, `post_load_script`, `invalid_request` (a refused option or URL), `refused_field` |
+| 401 | `unauthorized` |
+| 413 | `too_large` |
+| 422 | `invalid_request` (a body that is not a JSON object, or a missing or unknown field) |
+| 502 | `cdp`, `io` |
+| 503 | `chrome_exited`, `queue_timeout`, `launch_failed`, `chrome_not_found` |
+| 504 | `navigation_timeout`, `timeout` |
+| 500 | `internal`, and any kind not listed |
+
+One bad URL never fails a batch. Its line carries the same `error` object, with the same `kind`, and the status stays 200. A batch that is itself refused, with 0 URLs or more than `MAX_BATCH`, is a 400.
+
+Set `ONYXWEB_SERVER_TOKEN` to require `Authorization: Bearer <token>` on every route but `/health`. Without a token, `onyxweb-server http` listens on loopback only and exits 1 for any other `--host`. The server has no other authentication, so put a reverse proxy in front before exposing it.
 
 ## Limits and egress
 
@@ -38,7 +65,7 @@ Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_
 
 A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling. A Chrome that dies mid-call is replaced and the call retried once.
 
-The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A refused navigation is a `refused_url` error. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
+The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
 
 ## MCP
 
