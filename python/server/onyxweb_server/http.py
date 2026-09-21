@@ -74,7 +74,7 @@ class _Timing(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    engine: str = "shell"
+    engine: str = "full"
     wait_ms: int = 0
     timeout_ms: int | None = None
     wait_until: str | None = None

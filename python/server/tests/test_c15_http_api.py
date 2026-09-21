@@ -60,7 +60,7 @@ class Request:
     status: int = 200
     kind: str | None = None  # the error envelope's kind, when it must be one
     says: tuple[str, ...] = ()  # fragments of the body (snapshot JSON or error message)
-    engines: tuple[str, ...] = ("shell",)  # engines the fake browser was built for
+    engines: tuple[str, ...] = ("full",)  # engines the fake browser was built for
     headers: dict[str, str] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)  # CoreConfig overrides
     then: int = 200  # the status of an ordinary request right after, on the same server
@@ -72,7 +72,7 @@ class Request:
 
 
 _SHOT = {
-    "engine": "full",
+    "engine": "shell",
     "wait_ms": 100,
     "timeout_ms": 5000,
     "wait_until": "load",
@@ -99,7 +99,7 @@ REQUESTS: dict[str, Request] = {
     "fetch_bypass_anti_bot": Request(
         {**OK, "bypass_anti_bot": True}, asked={"bypass_anti_bot": True}
     ),
-    "fetch_every_option_at_once": Request({**OK, **_PAGE}, engines=("full",), asked=_PAGE_ASKED),
+    "fetch_every_option_at_once": Request({**OK, **_PAGE}, engines=("shell",), asked=_PAGE_ASKED),
     "a_timeout_over_the_ceiling": Request(
         {**OK, "timeout_ms": 999_999},
         status=400,
@@ -139,7 +139,7 @@ REQUESTS: dict[str, Request] = {
         {**OK, "viewport": [640, 480]}, asked={"viewport": (640, 480)}, path="/screenshot"
     ),
     "screenshot_takes_the_fetch_options": Request(
-        {**OK, **_SHOT}, engines=("full",), asked=_SHOT_ASKED, path="/screenshot"
+        {**OK, **_SHOT}, engines=("shell",), asked=_SHOT_ASKED, path="/screenshot"
     ),
     "screenshot_of_a_private_address": Request(
         {"url": _PRIVATE}, 400, "invalid_request", ("private",), (), path="/screenshot"
@@ -179,7 +179,7 @@ REQUESTS: dict[str, Request] = {
         {**OK, "full_page": True}, asked={"full_page": True}, path="/fetch_all"
     ),
     "fetch_all_takes_every_fetch_option": Request(
-        {**OK, **_PAGE}, engines=("full",), asked=_PAGE_ASKED, path="/fetch_all"
+        {**OK, **_PAGE}, engines=("shell",), asked=_PAGE_ASKED, path="/fetch_all"
     ),
     "fetch_all_takes_no_viewport": Request(
         {**OK, "viewport": [640, 480]}, 422, "invalid_request", ("viewport",), (), path="/fetch_all"
@@ -201,7 +201,7 @@ REQUESTS: dict[str, Request] = {
     ),
     "a_batch_applies_its_options_to_every_url": Request(
         {**TWO, **_PAGE},
-        engines=("full",),
+        engines=("shell",),
         lines=("snapshot", "snapshot"),
         asked=_PAGE_ASKED,
         path="/batch",
@@ -244,7 +244,7 @@ REQUESTS: dict[str, Request] = {
         engines=(),
     ),
     "a_fetch_returns_a_snapshot": Request(OK, says=("onyxweb_snapshot", PUBLIC + "ok", "<body>")),
-    "the_full_engine": Request({**OK, "engine": "full"}, engines=("full",)),
+    "the_shell_engine": Request({**OK, "engine": "shell"}, engines=("shell",)),
     "a_settle_within_the_ceiling": Request({**OK, "wait_ms": 500}),
     # Refused fields are named, so a caller never believes its script ran.
     "scripts_are_refused": Request(
@@ -290,7 +290,7 @@ REQUESTS: dict[str, Request] = {
         413,
         "too_large",
         ("bytes", "ONYXWEB_SERVER_MAX_PAGE_BYTES"),
-        ("shell",),  # the page was fetched before it was refused
+        ("full",),  # the page was fetched before it was refused
         config={"max_page_bytes": 10},
         then=413,  # the cap still applies; what matters is that the server answers
     ),
@@ -468,11 +468,11 @@ def test_health_reports_each_built_engine_and_the_counters() -> None:
         _post(client, OK)
         _post(client, {"url": "http://127.0.0.1/"})  # refused by the guard
         second = client.get("/health").json()
-        assert second["engines"] == {"shell": True}
+        assert second["engines"] == {"full": True}
         assert second["stats"]["requests"] == 2
         assert second["stats"]["failures"] == {"refused_url": 1}
         factory.built[0][1].die()
-        assert client.get("/health").json()["engines"] == {"shell": False}
+        assert client.get("/health").json()["engines"] == {"full": False}
 
 
 @pytest.mark.parametrize("path", ["/fetch", "/fetch_all", "/batch", "/screenshot"])

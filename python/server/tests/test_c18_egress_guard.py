@@ -207,6 +207,9 @@ class Upstream:
 _ALLOW: dict[str, Callable[[Any], bool]] = {
     "public": is_public,
     "local": lambda ip: str(ip) == "127.0.0.1",
+    # What production allows, plus the loopback test origin: a full Chrome connects to
+    # www.google.com by itself, once per tab, and that must not read as a refusal.
+    "reachable": lambda ip: str(ip) == "127.0.0.1" or is_public(ip),
     "any": lambda ip: True,
 }
 
@@ -478,9 +481,9 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
     if start.startswith("/"):
         # By IP: `localhost` also resolves to ::1, which the test's allow rule refuses.
         start = f"http://127.0.0.1:{httpserver.port}{start}"
-    # Only the public origin (127.0.0.1) is reachable; the guard is off because the test server
-    # is loopback, so the proxy is what stands between the browser and the secret.
-    proxy = EgressProxy(is_allowed=_ALLOW["local"])
+    # The test origin (127.0.0.1) and public addresses are reachable; the guard is off because the
+    # test server is loopback, so the proxy is what stands between the browser and the secret.
+    proxy = EgressProxy(is_allowed=_ALLOW["reachable"])
     core = ServerCore(egress=proxy, url_guard=lambda url: None, config=CoreConfig(egress=True))
     options = FetchOptions(wait_ms=row.wait_ms)
     outcome: Any

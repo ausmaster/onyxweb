@@ -2,7 +2,7 @@
 
 Serves [onyxweb](https://github.com/ausmaster/onyxweb)'s browser to agents over MCP and to programs over HTTP.
 
-Requires Python 3.11+ and the browser from `onyxweb --install`. Running in Docker, or as BBOT does, needs `sandbox=False`: see "Docker and BBOT" in the [onyxweb README](../../README.md).
+Requires Python 3.11+ and the browsers from `onyxweb --install`, which fetches both the headless shell and full Chrome. The default engine is the full Chrome; `engine="shell"` is lighter and faster, and many sites block it. Running in Docker, or as BBOT does, needs `sandbox=False`: see "Docker and BBOT" in the [onyxweb README](../../README.md).
 
 ## HTTP
 
@@ -17,7 +17,7 @@ onyxweb-server http --port 8000              # binds 127.0.0.1
 | `POST /screenshot` | the image itself, as `image/png`, `image/jpeg` or `image/webp` |
 | `POST /fetch_all` | `{"snapshot": {...}, "image": "<base64>", "format": "png"}`: the page and its image from one visit |
 | `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, or `{"url", "error"}` for a URL that failed |
-| `GET /health` | `{"status": "ok", "engines": {"shell": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
+| `GET /health` | `{"status": "ok", "engines": {"full": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
 
 Every body is a JSON object sent with `Content-Type: application/json`. A route accepts the fields below and refuses any other by name:
 
@@ -65,7 +65,7 @@ Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_
 
 A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling. A Chrome that dies mid-call is replaced and the call retried once.
 
-The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
+The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A full Chrome opens one connection to `www.google.com` per tab when it starts. The proxy allows it, since the address is public. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
 
 ## MCP
 

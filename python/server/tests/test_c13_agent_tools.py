@@ -346,16 +346,16 @@ CALLS: dict[str, Call] = {
         ),
         silent=("almost no visible text",),
     ),
-    "fetch_says_when_a_page_is_almost_empty": Call(
+    "fetch_on_shell_says_when_a_page_is_almost_empty": Call(
         "fetch",
-        {"url": "{url}"},
+        {"url": "{url}", "engine": "shell"},
         page="empty",
         says=("almost no visible text", 'engine="full"', "wait_ms"),
     ),
-    # Already on the full engine, so suggesting it again would send the agent in a circle.
-    "fetch_on_full_does_not_suggest_full": Call(
+    # The default engine is the full one, so suggesting it would send the agent in a circle.
+    "fetch_on_the_default_engine_does_not_suggest_full": Call(
         "fetch",
-        {"url": "{url}", "engine": "full"},
+        {"url": "{url}"},
         page="empty",
         says=("almost no visible text", "wait_ms"),
         silent=('engine="full"',),
@@ -941,6 +941,8 @@ async def test_the_tools_offer_no_script_execution(server: FastMCP) -> None:
         "search tool",
         "block_urls",
         "Authorization",
+        "bypass_anti_bot=false",  # the wait is on by default, so how to skip it must be said
+        'engine="shell"',  # what the lighter engine is called, now that full is the default
         "show in this conversation",  # what a header value costs the user
         "title and URL included",  # they are the page's words too
     ):
@@ -1074,7 +1076,7 @@ class Reaches:
     args: dict[str, Any]
     asked: dict[str, Any]  # the overrides each URL carries, as the client records them
     urls: int = 1
-    engine: str = "shell"
+    engine: str = "full"
     image: bool = False  # an image comes back beside the text
 
 
@@ -1088,7 +1090,7 @@ OPTIONS: dict[str, Reaches] = {
     "fetch_headers": Reaches("fetch", {"headers": _AUTH}, {"extra_headers": _AUTH}),
     "fetch_block_urls": Reaches("fetch", {"block_urls": _ADS}, {"block_urls": _ADS}),
     "fetch_bypass_anti_bot": Reaches("fetch", {"bypass_anti_bot": True}, {"bypass_anti_bot": True}),
-    "fetch_engine": Reaches("fetch", {"engine": "full"}, {}, engine="full"),
+    "fetch_engine": Reaches("fetch", {"engine": "shell"}, {}, engine="shell"),
     "fetch_with_an_image_is_one_visit": Reaches("fetch", {"screenshot": True}, {}, image=True),
     "fetch_with_an_image_keeps_its_options": Reaches(
         "fetch",
@@ -1112,21 +1114,21 @@ OPTIONS: dict[str, Reaches] = {
     "screenshot_takes_the_fetch_options": Reaches(
         "screenshot",
         {
-            "engine": "full",
+            "engine": "shell",
             "wait_ms": 100,
             "timeout_ms": 5000,
             "wait_until": "load",
             "headers": _AUTH,
         },
         {"wait_after_ms": 100, "timeout_ms": 5000, "wait_until": "load", "extra_headers": _AUTH},
-        engine="full",
+        engine="shell",
         image=True,
     ),
     "batch_with_no_options": Reaches("batch", {}, {}, urls=2),
     "batch_applies_every_option_to_every_url": Reaches(
         "batch",
         {
-            "engine": "full",
+            "engine": "shell",
             "wait_ms": 100,
             "timeout_ms": 5000,
             "wait_until": "load",
@@ -1143,7 +1145,7 @@ OPTIONS: dict[str, Reaches] = {
             "bypass_anti_bot": True,
         },
         urls=3,
-        engine="full",
+        engine="shell",
     ),
 }
 

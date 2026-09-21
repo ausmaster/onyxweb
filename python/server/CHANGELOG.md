@@ -6,6 +6,7 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ### Changed
 - A JSON body sent to an HTTP route without `Content-Type: application/json` is a 422 that names the fix, where `POST /fetch` read it anyway.
+- The default engine is `full`, a real Chrome, and the server's own clients wait out bot-check pages unless a call passes `bypass_anti_bot: false`. On 22 popular sites the full engine passed 18 and the shell 10. `engine="shell"` is lighter and faster; `onyxweb --install` fetches both.
 
 ### Added
 - The MCP server offers `screenshot` and `batch`, and `fetch` takes every option the core allows: `timeout_ms`, `wait_until`, `headers`, `block_urls`, `bypass_anti_bot`, and `screenshot` for an image from the same visit.

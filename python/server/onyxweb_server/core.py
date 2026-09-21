@@ -155,7 +155,7 @@ class FetchOptions:
     server never runs caller-supplied JavaScript.
     """
 
-    engine: str = "shell"  # "shell" is fast; "full" is a real Chrome that passes more bot checks
+    engine: str = "full"  # a real Chrome that passes more bot checks; "shell" is lighter and faster
     wait_ms: int = 0  # settle after the page loads
     timeout_ms: int | None = None  # navigation budget; None keeps the client's
     wait_until: str | None = None  # "load" or "domcontentloaded"; None keeps the client's
@@ -452,6 +452,7 @@ class ClientPool:
             concurrency=self._config.concurrency,
             queue_timeout_ms=self._config.queue_ms,
             engine=engine,
+            bypass_anti_bot=True,  # wait out a challenge page; a call can pass False to skip it
             **proxied,
         )
 

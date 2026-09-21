@@ -325,7 +325,7 @@ CALLS: dict[str, Call] = {
             urls=(PUBLIC + "a", PUBLIC + "b") if op == "batch" else (PUBLIC,),
             items=("page", "page") if op == "batch" else (),
             dies=1,
-            builds=("shell", "shell"),
+            builds=("full", "full"),
             retries=1,
         )
         for op in ("fetch", "screenshot", "fetch_all", "batch")
@@ -338,7 +338,7 @@ CALLS: dict[str, Call] = {
             items=("ChromeExitedError",) * 2 if op == "batch" else (),
             expect="ok" if op == "batch" else "ChromeExitedError",
             dies=2,
-            builds=("shell", "shell"),
+            builds=("full", "full"),
             retries=1,
         )
         for op in ("fetch", "screenshot", "fetch_all", "batch")
@@ -348,7 +348,7 @@ CALLS: dict[str, Call] = {
     "a_browser_failure_is_counted_by_its_kind": Call(error=CDP_FAILED, expect="OnyxwebError"),
     # --- the log: one line, its operation, engine and outcome, and never a secret --------------
     "a_good_fetch_is_logged": Call(
-        urls=(PUBLIC + "ok",), log=("fetch", "93.184.216.34/ok", "shell", "ok")
+        urls=(PUBLIC + "ok",), log=("fetch", "93.184.216.34/ok", "full", "ok")
     ),
     "the_query_string_is_never_logged": Call(
         urls=(PUBLIC + "p?token=SECRET#frag",),
@@ -368,13 +368,18 @@ CALLS: dict[str, Call] = {
         silent=("k=v", "points at"),
     ),
     "the_engine_is_named": Call(
-        "screenshot", options={"engine": "full"}, builds=("full",), log=("screenshot", "full")
+        "screenshot", options={"engine": "shell"}, builds=("shell",), log=("screenshot", "shell")
     ),
     # --- built the real way: the client gets the core's limits and the proxy --------------------
+    # The default is a full Chrome, and a challenge is waited out unless a call says not to.
     "the_default_limits": Call(
-        options={"engine": "full"},
         config={"egress": False},
-        client_kwargs={"engine": "full", "concurrency": 4, "queue_timeout_ms": 10_000},
+        client_kwargs={
+            "engine": "full",
+            "concurrency": 4,
+            "queue_timeout_ms": 10_000,
+            "bypass_anti_bot": True,
+        },
     ),
     "a_tighter_queue": Call(
         config={"egress": False, "queue_ms": 250}, client_kwargs={"queue_timeout_ms": 250}
@@ -512,7 +517,7 @@ async def test_a_core_call_gives_its_outcome_and_every_effect(
         # Which clients were built, and which URLs reached them with what.
         tokens_for_work = row.items or (row.expect,)
         early = all(t in ("refused_url", "refused_option") for t in tokens_for_work)
-        engine = row.options.get("engine", "shell")
+        engine = row.options.get("engine", "full")
         builds = row.builds if row.builds is not None else (() if early else (engine,))
         assert tuple(e for e, _ in clients) == builds, "clients built beyond what the row says"
         if row.fetched is not None:

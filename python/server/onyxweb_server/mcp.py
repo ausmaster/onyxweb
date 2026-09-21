@@ -105,8 +105,9 @@ Use it for pages that need JavaScript to render, when you need exact source (scr
 links, meta tags, JSON-LD), or to check what a page really holds. For a static docs page,
 prefer WebFetch.
 
-If a page comes back nearly empty, a bot check or unrendered JavaScript is the likely cause:
-retry with engine="full" (a real Chrome that gets past more checks) or a longer wait_ms.
+The default engine is a real Chrome, which gets past most bot checks. engine="shell" is lighter
+and faster, and many sites block it. If a page comes back nearly empty, a bot check or unrendered
+JavaScript is the likely cause: retry with a longer wait_ms.
 
 Work in this order: fetch (returns an id and an overview of the page), then query with every
 question you have at once (ranked passages of the page text, one section per question). Use find
@@ -116,9 +117,9 @@ page fetched this session; find without an id searches all of them.
 
 fetch takes options for a hard page: wait_until="domcontentloaded" stops waiting for slow
 resources, timeout_ms sets how long to wait, block_urls (patterns such as "*://*.ads.test/*")
-skips ads and trackers, bypass_anti_bot waits out a challenge page, and headers sends extra
-request headers such as Authorization. Headers you send show in this conversation: send only
-what the user gave you.
+skips ads and trackers, bypass_anti_bot=false returns a bot-check page at once instead of waiting
+it out, and headers sends extra request headers such as Authorization. Headers you send
+show in this conversation: send only what the user gave you.
 
 fetch(url, screenshot=True) also returns an image of the page, from the same visit. screenshot
 returns just an image and takes full_page, format ("jpeg" is smaller), quality and viewport.
@@ -417,7 +418,7 @@ class _Tools:
     async def fetch(
         self,
         url: str,
-        engine: Literal["shell", "full"] = "shell",
+        engine: Literal["shell", "full"] = "full",
         wait_ms: int = 0,
         timeout_ms: int | None = None,
         wait_until: Literal["load", "domcontentloaded"] | None = None,
@@ -430,14 +431,16 @@ class _Tools:
 
         Args:
             url: A public http or https URL.
-            engine: "shell" is fast; "full" is a real Chrome that gets past more bot checks.
+            engine: "full" (the default) is a real Chrome that gets past more bot checks; "shell" is
+                lighter and faster.
             wait_ms: Milliseconds to wait after the page loads, for content added late.
             timeout_ms: Longest to wait for the page to load; the server's default if omitted.
             wait_until: "load" waits for every resource; "domcontentloaded" returns once the
                 HTML is parsed.
             headers: Extra request headers, such as Authorization. They show in this conversation.
             block_urls: URL patterns not to load, such as "*://*.ads.test/*", to load faster.
-            bypass_anti_bot: Wait out a bot-check page instead of returning it.
+            bypass_anti_bot: Wait out a bot-check page, as it does by default; false returns it
+                at once.
             screenshot: Also return an image of the page, from the same visit.
         """
         options = FetchOptions(
@@ -488,7 +491,7 @@ class _Tools:
     async def batch(
         self,
         urls: list[str],
-        engine: Literal["shell", "full"] = "shell",
+        engine: Literal["shell", "full"] = "full",
         wait_ms: int = 0,
         timeout_ms: int | None = None,
         wait_until: Literal["load", "domcontentloaded"] | None = None,
@@ -503,14 +506,16 @@ class _Tools:
 
         Args:
             urls: Public http or https URLs, at least 1 and at most the server's batch limit.
-            engine: "shell" is fast; "full" is a real Chrome that gets past more bot checks.
+            engine: "full" (the default) is a real Chrome that gets past more bot checks; "shell" is
+                lighter and faster.
             wait_ms: Milliseconds to wait after each page loads, for content added late.
             timeout_ms: Longest to wait for each page to load; the server's default if omitted.
             wait_until: "load" waits for every resource; "domcontentloaded" returns once the
                 HTML is parsed.
             headers: Extra request headers, such as Authorization. They show in this conversation.
             block_urls: URL patterns not to load, such as "*://*.ads.test/*", to load faster.
-            bypass_anti_bot: Wait out a bot-check page instead of returning it.
+            bypass_anti_bot: Wait out a bot-check page, as it does by default; false returns it
+                at once.
         """
         options = FetchOptions(
             engine=engine,
@@ -546,7 +551,7 @@ class _Tools:
     async def screenshot(
         self,
         url: str,
-        engine: Literal["shell", "full"] = "shell",
+        engine: Literal["shell", "full"] = "full",
         wait_ms: int = 0,
         timeout_ms: int | None = None,
         wait_until: Literal["load", "domcontentloaded"] | None = None,
@@ -560,7 +565,8 @@ class _Tools:
 
         Args:
             url: A public http or https URL.
-            engine: "shell" is fast; "full" is a real Chrome that gets past more bot checks.
+            engine: "full" (the default) is a real Chrome that gets past more bot checks; "shell" is
+                lighter and faster.
             wait_ms: Milliseconds to wait after the page loads, for content added late.
             timeout_ms: Longest to wait for the page to load; the server's default if omitted.
             wait_until: "load" waits for every resource; "domcontentloaded" returns once the
