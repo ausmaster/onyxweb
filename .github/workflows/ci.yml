@@ -163,6 +163,18 @@ jobs:
           command: sdist
           working-directory: python/onyxweb
           args: --out ../../dist
+      - name: Check the sdist holds the library and nothing else
+        run: |
+          for tgz in dist/*.tar.gz; do
+            files=$(tar tzf "$tgz")
+            # The sdist is the library: the crate and the Python package, with no tests, server or CI files.
+            extra=$(echo "$files" | grep -E '/(python|tests|\.github)/|/uv\.lock$' || true)
+            [ -z "$extra" ] || { echo "$tgz holds files that are not the library:"; echo "$extra" | head -5; exit 1; }
+            # What a build needs is still there.
+            for want in Cargo.toml Cargo.lock rust-toolchain.toml src/lib.rs pyproject.toml README.md LICENSE onyxweb/__init__.py; do
+              echo "$files" | grep -q "^[^/]*/$want\$" || { echo "$want is missing from $tgz"; exit 1; }
+            done
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

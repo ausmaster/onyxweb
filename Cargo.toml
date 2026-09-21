@@ -3,6 +3,8 @@ name = "onyxweb"
 version = "0.2.3"
 edition = "2024"
 publish = false
+# The sdist is the library: the crate, and the Python package maturin adds itself.
+exclude = ["/python", "/.github", "/uv.lock", "/BENCHMARKS.md", "/.python-version", "/.gitignore"]
 
 [lib]
 name = "_onyxweb"

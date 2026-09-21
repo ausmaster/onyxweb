@@ -28,6 +28,7 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - The private `Client._render` helper, which no code called.
 
 ### Fixed
+- The source distribution carried the test suite, the `onyxweb-server` package, the CI files and `uv.lock`, and the Python package twice. It now holds the Rust crate and the Python package once, 36 files instead of 92.
 - The package docstring example read `result.html.title`, a `str` method. It now reads `result.title`.
 - The shell engine's `--no-sandbox` reached Chrome as `----no-sandbox`, which Chrome ignores, so the default engine failed to launch in Docker with no working switch except `chrome_args=["no-sandbox"]`. `sandbox=False` now works on both engines.
 - A launch that fails while the sandbox is on now says how to fix it, instead of `CDP: Input/Output error while resolving websocket URL`.
