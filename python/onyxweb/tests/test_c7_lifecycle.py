@@ -34,7 +34,7 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import onyxweb
 import onyxweb.download as dl
@@ -68,22 +68,28 @@ def _chrome_children(*, zombies: bool = False) -> set[int]:
     return pids
 
 
-def _gone(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
+def _settled(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
+    """Whether every pid has stopped: gone, or a zombie whose last thread has exited.
+
+    A SIGKILLed leader shows `Z` while its other threads unwind, and `waitpid` — so
+    `client.alive` — succeeds only after the last one; that took up to 22 ms on a CI runner.
+    """
     deadline = time.monotonic() + within_s
     while time.monotonic() < deadline:
-        if not pids & _chrome_children():
+        busy = set()
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    stat = f.read()
+                threads = len(os.listdir(f"/proc/{pid}/task"))
+            except OSError:
+                continue  # already reaped
+            if stat[stat.rindex(")") + 2 :].split()[0] != "Z" or threads > 1:
+                busy.add(pid)
+        if not busy:
             return True
-        time.sleep(0.01)
+        time.sleep(0.001)
     return False
-
-
-async def _close(shape: Shape, client: onyxweb.Client | onyxweb.AsyncClient) -> None:
-    if isinstance(client, onyxweb.AsyncClient):
-        await client.aclose()
-    elif shape == "context_manager":
-        client.__exit__(None, None, None)
-    else:
-        client.close()
 
 
 @needs_proc
@@ -98,24 +104,33 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
         client = onyxweb.Client(concurrency=1)
         if shape == "context_manager":
             client.__enter__()
+
+    async def close() -> None:
+        if isinstance(client, onyxweb.AsyncClient):
+            await client.aclose()
+        elif shape == "context_manager":
+            client.__exit__(None, None, None)
+        else:
+            client.close()
+
     launched = _chrome_children() - before
     assert launched, "expected this client to start a Chrome process"
     assert client.alive
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
             os.kill(pid, signal.SIGKILL)
-        assert _gone(launched, within_s=5.0), "Chrome survived SIGKILL"
+        assert _settled(launched, within_s=5.0), "Chrome survived SIGKILL"
         assert not client.alive
         await _assert_dead_chrome_is_named(client)
 
     started = time.perf_counter()
-    await _close(shape, client)
+    await close()
     assert time.perf_counter() - started < CLOSE_BUDGET_S
     assert not client.alive
-    assert _gone(launched), "Chrome still running after close, though the client is referenced"
+    assert _settled(launched), "Chrome still running after close, though the client is referenced"
     assert not launched & _chrome_children(zombies=True), "Chrome left unreaped after close"
 
-    await _close(shape, client)  # a second close is a no-op
+    await close()  # a second close is a no-op
     with pytest.raises(RuntimeError, match="closed"):
         if isinstance(client, onyxweb.AsyncClient):
             await client.fetch("data:text/html,x")
@@ -210,15 +225,6 @@ def _chrome_tree(root_pid: int) -> set[int]:
     return tree
 
 
-def _all_gone(pids: set[int], within_s: float) -> bool:
-    deadline = time.monotonic() + within_s
-    while time.monotonic() < deadline:
-        if not any(psutil.pid_exists(pid) for pid in pids):
-            return True
-        time.sleep(0.05)
-    return False
-
-
 # Engine and sandbox as the owning process launches Chrome: the wrapper must stop every one.
 @pytest.mark.parametrize(
     ("engine", "sandbox"),
@@ -256,8 +262,14 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
         tree = _chrome_tree(proc.pid)
         assert tree, "expected the subprocess to have a live Chrome process tree"
         proc.kill()  # only the owning process — SIGKILL on POSIX, TerminateProcess on Windows
-        assert _all_gone(tree, within_s=5.0), f"orphaned Chrome survived: {tree}"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and any(psutil.pid_exists(pid) for pid in tree):
+            time.sleep(0.05)
+        assert not any(psutil.pid_exists(pid) for pid in tree), f"orphaned Chrome survived: {tree}"
     finally:
+        # A launch that never became ready is still running; kill it so the failure reports that,
+        # rather than this wait timing out.
+        proc.kill()
         proc.wait(timeout=5)
         for pid in _chrome_tree(proc.pid):
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
@@ -324,7 +336,12 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
         "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
     }
     out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,  # `-c` puts the cwd on sys.path, and the source package has no extension
     )
     said = out.stdout.strip()
     assert said, out.stderr
@@ -349,6 +366,7 @@ def _fake_download_for(record: dict[str, object]) -> Callable[..., Path]:
         verbose: bool = True,
     ) -> Path:
         record.update(internal_key=internal_key, engine=engine, dest_root=dest_root, force=force)
+        cast(list[str], record.setdefault("engines", [])).append(engine)
         record["thread"] = threading.current_thread()
         return dest_root / internal_key / "chrome-headless-shell"
 
@@ -378,6 +396,43 @@ def test_ensure_chrome_passes_its_arguments(
     dest_root = tmp_path.resolve() if dest == "tmp" else dl.default_dest_dir().resolve()
     assert (rec["engine"], rec["dest_root"], rec["force"]) == (engine, dest_root, force)
     assert out == dest_root / dl.current_platform_key() / "chrome-headless-shell"
+
+
+# install_chrome kwargs, and the environment it runs in -> the engines download_for is asked for.
+INSTALL_ARGS: dict[str, tuple[dict[str, Any], dict[str, str], list[str]]] = {
+    "every_engine_by_default": ({}, {}, ["shell", "full"]),
+    "the_shell_alone": ({"engine": "shell"}, {}, ["shell"]),
+    "full_alone": ({"engine": "full"}, {}, ["full"]),
+    # The configured engine picks what `Client()` drives, not what a setup step leaves out.
+    "a_configured_engine_does_not_narrow_it": (
+        {},
+        {"ONYXWEB_CHROME__ENGINE": "full"},
+        ["shell", "full"],
+    ),
+    "force_and_dest_reach_every_engine": ({"force": True}, {}, ["shell", "full"]),
+}
+
+
+@pytest.mark.parametrize("name", list(INSTALL_ARGS))
+def test_install_chrome_fetches_the_engines_asked_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    """``install_chrome`` (behind ``onyxweb --install``) leaves every engine installed unless one
+    is named, so the server's full Chrome needs no second command.
+
+    New test: ``ENSURE_ARGS`` checks the one-engine ``ensure_chrome``, and this is the entry point
+    that fetches several.
+    """
+    kwargs, env, engines = INSTALL_ARGS[name]
+    monkeypatch.delenv("ONYXWEB_CHROME__ENGINE", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    rec: dict[str, object] = {}
+    monkeypatch.setattr(dl, "download_for", _fake_download_for(rec))
+    assert dl.install_chrome(dest=tmp_path, **kwargs) == 0
+    assert rec["engines"] == engines
+    assert rec["force"] is kwargs.get("force", False)
+    assert rec["dest_root"] == tmp_path.resolve()
 
 
 async def test_aensure_chrome_offloads_and_returns_path(
@@ -496,6 +551,56 @@ def test_install_extracts_with_a_timeout_and_keeps_the_other_engine(
     assert wrapper.read_bytes() == b"WRAPPER"
 
 
+# engine, what is installed (binary, marker), force -> is a download made, and the binary after.
+# A marker is the version an install recorded; None is an install that recorded nothing.
+REFRESH: dict[str, tuple[str, bytes | None, str | None, bool, bool, bytes]] = {
+    "nothing_installed": ("shell", None, None, False, True, b"NEW"),
+    "the_pinned_build_is_kept": ("shell", b"OLD", dl.CHROME_VERSION, False, False, b"OLD"),
+    "an_older_build_is_replaced": ("shell", b"OLD", "1.0.0.0", False, True, b"NEW"),
+    "an_install_that_recorded_nothing_is_replaced": ("shell", b"OLD", None, False, True, b"NEW"),
+    "force_replaces_the_pinned_build": ("shell", b"OLD", dl.CHROME_VERSION, True, True, b"NEW"),
+    "an_empty_binary_is_replaced": ("shell", b"", dl.CHROME_VERSION, False, True, b"NEW"),
+    "the_full_engine_is_judged_by_its_own_marker": ("full", b"OLD", "1.0.0.0", False, True, b"NEW"),
+    "the_full_engine_keeps_the_pinned_build": (
+        "full",
+        b"OLD",
+        dl.CHROME_VERSION,
+        False,
+        False,
+        b"OLD",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(REFRESH))
+def test_install_replaces_a_chrome_that_is_not_the_pinned_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    """An install is skipped only when its recorded version is the pinned one, so upgrading
+    onyxweb refreshes Chrome by itself instead of leaving the old build in place.
+
+    New test: ``INSTALL_FAILURES`` shows what a failed download leaves behind, and this shows
+    what a successful one replaces. The full engine keeps its binary and marker in ``full/``.
+    """
+    engine, before, marker, force, downloads, after = REFRESH[name]
+    zip_base, binary_name, sub = dl._engine_download(engine, "linux64")
+    engine_dir = tmp_path / _PLATFORM / sub
+    binary = engine_dir / binary_name
+    if before is not None:
+        engine_dir.mkdir(parents=True)
+        binary.write_bytes(before)
+    if marker is not None:
+        (engine_dir / dl.VERSION_MARKER).write_text(marker)
+    rec: dict[str, object] = {}
+    archive = _zip_bytes({f"{zip_base}/{binary_name}": b"NEW"})
+    monkeypatch.setattr(urllib.request, "urlopen", _serve(archive, rec))
+    out = dl.download_for(_PLATFORM, engine=engine, dest_root=tmp_path, force=force, verbose=False)
+    assert out == binary
+    assert ("url" in rec) is downloads, "downloaded when it should have kept the build"
+    assert binary.read_bytes() == after
+    assert (engine_dir / dl.VERSION_MARKER).read_text() == dl.CHROME_VERSION
+
+
 def test_download_engine_specs() -> None:
     """The downloader's per-engine layout must match the Rust resolver — full
     puts the binary in a ``full/chrome`` subdir; shell keeps it flat."""
@@ -506,6 +611,14 @@ def test_download_engine_specs() -> None:
         "",
     )
     assert dl._engine_download("full", "win64")[1] == "chrome.exe"
+    # The macOS zip holds an app bundle, and Chrome's executable sits inside it, not beside it.
+    for mac in ("mac-arm64", "mac-x64"):
+        assert dl._engine_download("full", mac) == (
+            f"chrome-{mac}",
+            "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            "full",
+        )
+    assert dl._engine_download("shell", "mac-arm64")[1] == "chrome-headless-shell"
     with pytest.raises(ValueError):
         dl._engine_download("bogus", "linux64")
 

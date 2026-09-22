@@ -190,7 +190,7 @@ fn build_full_launch(
         .user_agent
         .clone()
         .or_else(|| derive_chrome_ua(chrome_path))
-        .unwrap_or_else(|| FALLBACK_FULL_UA.to_string());
+        .unwrap_or_else(fallback_full_ua);
     let mut b = builder
         .new_headless_mode()
         .disable_default_args()
@@ -208,11 +208,18 @@ fn build_full_launch(
     if cfg.network.ignore_https_errors {
         b = b.arg("ignore-certificate-errors");
     }
+    // No navigation here ever goes back, but full Chrome keeps each page a tab leaves in its
+    // back/forward cache, in a renderer process of its own: a tab grew ~14 MB per fetch. Chrome
+    // keeps only the last `--disable-features`, so a caller's own list is merged into ours.
+    let mut disabled = vec!["BackForwardCache".to_string()];
     for arg in &cfg.chrome.args {
         let a = arg.strip_prefix("--").unwrap_or(arg);
-        b = b.arg(a.to_string());
+        match a.strip_prefix("disable-features=") {
+            Some(features) => disabled.push(features.to_string()),
+            None => b = b.arg(a.to_string()),
+        }
     }
-    b
+    b.arg(format!("disable-features={}", disabled.join(",")))
 }
 
 /// A Chrome that exits before it is ready most often has a sandbox that cannot start: running
@@ -248,27 +255,54 @@ fn resolve_user_data_dir(cfg: &ClientConfigRs) -> (PathBuf, bool) {
     (std::env::temp_dir().join(unique), true)
 }
 
-/// Fallback UA if the binary version can't be read. Linux desktop Chrome.
-const FALLBACK_FULL_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+/// This OS's `Mozilla/5.0 (...)` token, so the plain UA agrees with Chrome's own
+/// `Sec-CH-UA-Platform` instead of contradicting it.
+fn platform_token() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "Windows NT 10.0; Win64; x64";
+    #[cfg(target_os = "macos")]
+    return "Macintosh; Intel Mac OS X 10_15_7";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    "X11; Linux x86_64"
+}
 
-/// Derive a real Chrome UA from the binary's `--version` (so the UA's major
-/// matches the actual build — a UA/binary mismatch is itself a tell). Linux
-/// desktop shape; returns None if the version can't be parsed.
+/// Fallback UA if the binary version can't be read.
+fn fallback_full_ua() -> String {
+    format!(
+        "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        platform_token()
+    )
+}
+
+/// Derive a real Chrome UA from the binary's `--version` (a UA/binary mismatch
+/// is itself a tell). Returns None if the version can't be parsed.
 fn derive_chrome_ua(chrome_path: &Path) -> Option<String> {
-    let out = std::process::Command::new(chrome_path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // e.g. "Chromium 147.0.7727.137" / "Google Chrome 148.0.7778.56"
-    let version = text
-        .split_whitespace()
-        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let version = if cfg!(windows) {
+        // Windows Chrome ignores `--version` and starts the browser, which never exits. The
+        // version names a file beside it (`148.0.7778.56.manifest`) or, installed, a folder.
+        std::fs::read_dir(chrome_path.parent()?)
+            .ok()?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .map(|name| name.trim_end_matches(".manifest").to_string())
+            .find(|name| {
+                let parts: Vec<&str> = name.split('.').collect();
+                parts.len() == 4 && parts.iter().all(|p| p.parse::<u32>().is_ok())
+            })?
+    } else {
+        let out = std::process::Command::new(chrome_path)
+            .arg("--version")
+            .output()
+            .ok()?;
+        // e.g. "Chromium 147.0.7727.137" / "Google Chrome 148.0.7778.56"
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?
+            .to_string()
+    };
     let major = version.split('.').next()?;
     Some(format!(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-         Chrome/{major}.0.0.0 Safari/537.36"
+        "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+        platform_token()
     ))
 }
 

@@ -30,4 +30,4 @@ CLAUDE.md
 
 # Bundled chromium binaries — populated at wheel build time (`uv run onyxweb-download-chrome`).
 # Not committed to git (too large); maturin `include` picks them up from disk.
-python/onyxweb/_binaries/
+python/onyxweb/onyxweb/_binaries/

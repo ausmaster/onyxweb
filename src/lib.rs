@@ -1,7 +1,7 @@
 //! onyxweb — URL in, fully-rendered HTML (and/or screenshot) out.
 //!
 //! This crate is the Rust side of the `onyxweb` Python package. The Python
-//! side (`python/onyxweb/__init__.py`) is the user-facing API; this module
+//! side (`python/onyxweb/onyxweb/__init__.py`) is the user-facing API; this module
 //! is the compiled extension `onyxweb._onyxweb`.
 
 use pyo3::prelude::*;

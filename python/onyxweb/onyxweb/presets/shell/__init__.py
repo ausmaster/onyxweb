@@ -1,9 +1,9 @@
 """Shell-engine presets — ``chrome-headless-shell`` (light, fast).
 
 These target the default ``shell`` engine. The stealth preset's JS
-patches counter *naive* client-side bot checks; they are **not** a WAF bypass
-(Akamai/Cloudflare hard-block the shell regardless — use ``presets.full`` for
-those). Every preset here pins ``engine="shell"`` explicitly.
+patches and normal Chrome user agent counter *naive* client-side bot checks and the
+``HeadlessChrome`` tell; they are **not** a full WAF bypass, and some WAFs still block
+the shell (use ``presets.full`` for those). Every preset here pins ``engine="shell"`` explicitly.
 
     from onyxweb import Client
     from onyxweb.presets.shell import stealth, recon

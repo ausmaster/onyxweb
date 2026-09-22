@@ -1,6 +1,6 @@
 """Pinned Chrome-for-Testing downloader (engine-aware).
 
-Fetches a Chromium build into ``python/onyxweb/_binaries/<platform>/`` so the
+Fetches a Chromium build into ``python/onyxweb/onyxweb/_binaries/<platform>/`` so the
 Rust binary resolver finds it. Two engines (see ``ChromeConfig.engine``):
 
 - ``shell`` → ``chrome-headless-shell`` (flat: ``_binaries/<plat>/``)
@@ -9,13 +9,14 @@ Rust binary resolver finds it. Two engines (see ``ChromeConfig.engine``):
 
 Exposed as the ``onyxweb-download-chrome`` console script::
 
-    uv run onyxweb-download-chrome                 # default engine, current platform
-    uv run onyxweb-download-chrome --engine full   # full Chrome
+    uv run onyxweb-download-chrome                 # every engine, current platform
+    uv run onyxweb-download-chrome --engine shell  # the headless shell alone
     uv run onyxweb-download-chrome --all            # every supported platform
     uv run onyxweb-download-chrome --force          # re-download even if present
 
-Idempotent: skips if the binary is already present and non-empty. Bump
-``CHROME_VERSION`` to upgrade the pinned build across all platforms/engines.
+Idempotent: skips if the binary is present, non-empty and was installed at the pinned
+``CHROME_VERSION`` (recorded in ``VERSION_MARKER``); an older or unrecorded build is replaced.
+Bump ``CHROME_VERSION`` to upgrade the pinned build across all platforms/engines.
 """
 
 from __future__ import annotations
@@ -63,6 +64,10 @@ CFT_PLATFORM: dict[str, str] = {
 }
 
 ENGINES = ("shell", "full")
+# The macOS full build is an app bundle; Chrome's executable is inside it (mirrors chrome.rs).
+MAC_FULL_BINARY = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+# Written into an engine's directory after an install: the pinned version that put the binary there.
+VERSION_MARKER = ".onyxweb-chrome-version"
 
 # Per-socket-op timeout for the CDN fetch (connect + each read), NOT a total cap
 # — a healthy download makes steady progress. Without it urllib blocks forever on
@@ -81,13 +86,16 @@ def _engine_download(engine: str, cft_plat: str) -> tuple[str, str, str]:
     """Return ``(zip_base, binary_name, dest_subdir)`` for an engine + platform.
 
     ``zip_base`` is both the ``.zip`` filename stem and its top-level directory.
-    ``dest_subdir`` is "" (flat) for the shell, "full" for full Chrome.
+    ``dest_subdir`` is "" (flat) for the shell, "full" for full Chrome. ``binary_name`` is
+    relative to that directory; on macOS full Chrome it reaches into the app bundle.
     """
     is_win = cft_plat.startswith("win")
     if engine == "shell":
         binary = "chrome-headless-shell.exe" if is_win else "chrome-headless-shell"
         return f"chrome-headless-shell-{cft_plat}", binary, ""
     if engine == "full":
+        if cft_plat.startswith("mac"):
+            return f"chrome-{cft_plat}", MAC_FULL_BINARY, "full"
         return f"chrome-{cft_plat}", "chrome.exe" if is_win else "chrome", "full"
     raise ValueError(f"unknown engine {engine!r}; expected one of {ENGINES}")
 
@@ -144,13 +152,23 @@ def download_for(
         dest_dir = dest_dir / dest_sub
     dest_bin = dest_dir / binary_name
 
-    if dest_bin.is_file() and dest_bin.stat().st_size > 0 and not force:
+    try:
+        installed: str | None = (dest_dir / VERSION_MARKER).read_text().strip()
+    except OSError:
+        installed = None  # an install from before the marker existed: its version is unknown
+    present = dest_bin.is_file() and dest_bin.stat().st_size > 0
+    if present and not force and installed == CHROME_VERSION:
         if verbose:
             print(
                 f"  [{internal_key}/{engine}] already present at {dest_bin} — skip "
                 "(pass --force to re-download)."
             )
         return dest_bin
+    if present and not force and verbose:
+        print(
+            f"  [{internal_key}/{engine}] installed build {installed or 'of unknown version'} "
+            f"is not the pinned {CHROME_VERSION} — replacing it."
+        )
 
     url = f"{CDN_BASE}/{CHROME_VERSION}/{cft_plat}/{zip_base}.zip"
     if verbose:
@@ -233,6 +251,7 @@ def download_for(
                 existing.unlink()
         for item in list(staging.iterdir()):
             shutil.move(str(item), str(dest_dir / item.name))
+        (dest_dir / VERSION_MARKER).write_text(CHROME_VERSION)
 
         size_mb = dest_bin.stat().st_size / (1024 * 1024)
         if verbose:
@@ -303,14 +322,15 @@ def install_chrome(
     platform_key: str | None = None,
     all_platforms: bool = False,
 ) -> int:
-    """Fetch a Chromium build. Returns a CLI-style exit code (0 = success).
+    """Fetch Chromium builds. Returns a CLI-style exit code (0 = success).
 
-    ``engine`` defaults to onyxweb's configured default (see
-    ``ChromeConfig.engine``). Shared by the ``onyxweb-download-chrome`` console
+    ``engine`` names one build; without it every engine is fetched, so the shell that
+    ``Client()`` drives and the full Chrome the server defaults to are both in place, whatever
+    ``ChromeConfig.engine`` is set to. Shared by the ``onyxweb-download-chrome`` console
     script and the ``onyxweb --install`` CLI flag — kept callable (no argparse)
     so both can invoke it without fighting over ``sys.argv``.
     """
-    engine = engine or _default_engine()
+    engines = [engine] if engine else list(ENGINES)
     dest = (dest or default_dest_dir()).resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -322,11 +342,12 @@ def install_chrome(
         targets = [current_platform_key()]
 
     print(f"Chrome version: {CHROME_VERSION}")
-    print(f"Engine:         {engine}")
+    print(f"Engines:        {', '.join(engines)}")
     print(f"Destination:    {dest}")
     print(f"Platforms:      {targets}")
     for t in targets:
-        download_for(t, engine=engine, dest_root=dest, force=force)
+        for e in engines:
+            download_for(t, engine=e, dest_root=dest, force=force)
 
     print("done.")
     return 0
@@ -394,7 +415,7 @@ def main() -> int:
         "--engine",
         choices=ENGINES,
         default=None,
-        help="which build to fetch (default: onyxweb's configured engine)",
+        help="which build to fetch (default: every engine)",
     )
     p.add_argument(
         "--dest",

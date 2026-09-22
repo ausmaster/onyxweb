@@ -1080,20 +1080,7 @@ class Client:
         **overrides: Any,
     ) -> bytes:
         """Fetch URL, return a screenshot as image bytes (PNG by default)."""
-        if config is None and not overrides:
-            sc = ScreenshotConfig()
-        elif config is not None and not overrides:
-            sc = config
-        else:
-            data = config.model_dump() if config else {}
-            for k, v in overrides.items():
-                if k not in _SCREENSHOT_KWARGS:
-                    raise TypeError(
-                        f"unknown screenshot kwarg: {k!r}; "
-                        f"use one of: {', '.join(sorted(_SCREENSHOT_KWARGS))}"
-                    )
-                data[k] = v
-            sc = ScreenshotConfig.model_validate(data)
+        sc = _merge_screenshot_config(config, overrides)
         _client_log.debug("screenshot: %s (format=%s)", url, sc.format)
         return bytes(self._rust.screenshot(url, sc.model_dump()))
 
@@ -1413,20 +1400,7 @@ class AsyncClient:
             TypeError: On unknown screenshot kwarg.
             RuntimeError: On CDP / navigation failures.
         """
-        if config is None and not overrides:
-            sc = ScreenshotConfig()
-        elif config is not None and not overrides:
-            sc = config
-        else:
-            data = config.model_dump() if config else {}
-            for k, v in overrides.items():
-                if k not in _SCREENSHOT_KWARGS:
-                    raise TypeError(
-                        f"unknown screenshot kwarg: {k!r}; "
-                        f"use one of: {', '.join(sorted(_SCREENSHOT_KWARGS))}"
-                    )
-                data[k] = v
-            sc = ScreenshotConfig.model_validate(data)
+        sc = _merge_screenshot_config(config, overrides)
         _client_log.debug("ascreenshot: %s (format=%s)", url, sc.format)
         return bytes(await self._rust.screenshot_async(url, sc.model_dump()))
 
@@ -1624,6 +1598,24 @@ _FETCH_KWARGS = {
     "wait_after_ms",
     "wait_after_post_load_ms",
 }
+
+
+def _merge_screenshot_config(
+    base: ScreenshotConfig | None, overrides: dict[str, Any]
+) -> ScreenshotConfig:
+    if base is None and not overrides:
+        return ScreenshotConfig()
+    if base is not None and not overrides:
+        return base
+    data: dict[str, Any] = base.model_dump() if base else {}
+    for k, v in overrides.items():
+        if k not in _SCREENSHOT_KWARGS:
+            raise TypeError(
+                f"unknown screenshot kwarg: {k!r}; "
+                f"use one of: {', '.join(sorted(_SCREENSHOT_KWARGS))}"
+            )
+        data[k] = v
+    return ScreenshotConfig.model_validate(data)
 
 
 def _merge_fetch_config(base: FetchConfig | None, overrides: dict[str, Any]) -> FetchConfig:

@@ -88,7 +88,7 @@ Option A (CEF) has NO win that matters for BBOT-scale headless screenshot pumpin
 
 ## Reproduction
 
-The spike crates (`cef_spike`, `chromiumoxide_spike`, `servo_spike`) and their raw artifacts live in the previous `blazeweb` repo, not in this one. The commands below run from a checkout of that repo. To measure onyxweb itself, run `uv run pytest -m benchmark -s tests/test_c11_real_sites.py`.
+The spike crates (`cef_spike`, `chromiumoxide_spike`, `servo_spike`) and their raw artifacts live in the previous `blazeweb` repo, not in this one. The commands below run from a checkout of that repo. To measure onyxweb itself, run `uv run pytest -m benchmark -s tests/test_c11_real_sites.py` from `python/onyxweb`.
 
 ```bash
 # Option A — CEF

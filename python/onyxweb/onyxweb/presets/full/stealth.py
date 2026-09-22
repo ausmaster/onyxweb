@@ -12,8 +12,8 @@ real Chrome already has legitimately and *create* tells (e.g.
 ``navigator.webdriver`` → ``undefined``, which real Chrome never is — that alone
 flips tesla.com back to 403). The full engine *is* the stealth.
 
-Needs a full Chrome binary — ``onyxweb-download-chrome --engine full``, a
-system Chrome/Chromium, or ``chrome_path=``.
+Needs a full Chrome binary — ``onyxweb --install``, a system Chrome/Chromium,
+or ``chrome_path=``.
 
     from onyxweb import Client
     from onyxweb.presets.full import stealth

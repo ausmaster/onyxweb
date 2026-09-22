@@ -2,7 +2,7 @@
 
 These tests require a usable Chromium binary. onyxweb auto-resolves from:
   1. explicit chrome_path= on Client (not used here)
-  2. bundled python/onyxweb/_binaries/<platform>/chrome-headless-shell
+  2. bundled python/onyxweb/onyxweb/_binaries/<platform>/chrome-headless-shell
   3. system chromium (apt install chromium-browser etc.)
 
 If neither bundled nor system chromium is available, tests that spin a Client
@@ -23,6 +23,7 @@ import pytest
 from pytest_httpserver import HTTPServer
 
 DataUrl = Callable[[bytes], str]
+
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"

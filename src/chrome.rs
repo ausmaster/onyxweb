@@ -34,6 +34,9 @@ pub fn chrome_binary_name(engine: ChromeEngine) -> &'static str {
         ChromeEngine::Full => {
             #[cfg(target_os = "windows")]
             return "chrome.exe";
+            // The macOS build is an app bundle; the executable sits inside it.
+            #[cfg(target_os = "macos")]
+            return "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
             #[allow(unreachable_code)]
             "chrome"
         }
@@ -98,8 +101,8 @@ pub fn resolve(explicit: Option<&str>, engine: ChromeEngine) -> Result<PathBuf> 
 }
 
 /// Look for `_binaries/<platform>/<binary>` under the installed package dir
-/// (`ONYXWEB_PKG_DIR`, set by `python/onyxweb/__init__.py` at import) or —
-/// for dev builds — under `CARGO_MANIFEST_DIR/python/onyxweb`.
+/// (`ONYXWEB_PKG_DIR`, set by `python/onyxweb/onyxweb/__init__.py` at import) or —
+/// for dev builds — under `CARGO_MANIFEST_DIR/python/onyxweb/onyxweb`.
 fn find_bundled(engine: ChromeEngine) -> Option<PathBuf> {
     let plat = platform_subdir();
     let bin = chrome_binary_name(engine);
@@ -117,7 +120,9 @@ fn find_bundled(engine: ChromeEngine) -> Option<PathBuf> {
         }
     }
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = Path::new(&manifest_dir).join("python/onyxweb").join(&rel);
+        let p = Path::new(&manifest_dir)
+            .join("python/onyxweb/onyxweb")
+            .join(&rel);
         if p.is_file() {
             return Some(p);
         }
@@ -151,7 +156,9 @@ pub fn resolve_wrapper() -> Option<PathBuf> {
         }
     }
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = Path::new(&manifest_dir).join("python/onyxweb").join(&rel);
+        let p = Path::new(&manifest_dir)
+            .join("python/onyxweb/onyxweb")
+            .join(&rel);
         if p.is_file() {
             return Some(p);
         }

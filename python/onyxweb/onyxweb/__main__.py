@@ -59,12 +59,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--install", action="store_true",
         help=(
-            "one-time setup: download the Chrome build for onyxweb's default "
-            "engine (see chrome.engine) for this platform into the installed "
-            "package. Run once after `uv tool install onyxweb` / `pipx install "
-            "onyxweb` / `pip install onyxweb`. For a specific engine, --force, "
-            "--all, or --platform, use `onyxweb-download-chrome`."
+            "one-time setup: download both Chrome builds (the headless shell "
+            "and full Chrome) for this platform into the installed package; "
+            "add --engine shell or --engine full for one. Run once after "
+            "`uv tool install onyxweb` / `pipx install onyxweb` / `pip install "
+            "onyxweb`; an upgrade that pins a newer Chrome replaces the old one "
+            "on the next --install. For --all, --platform, or --dest, use "
+            "`onyxweb-download-chrome`."
         ),
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="with --install: download again even when the pinned build is already there",
     )
 
     out = p.add_argument_group("output")
@@ -132,8 +138,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--engine", choices=["full", "shell"], default=None,
         help=(
             "which Chromium build to drive (default: shell). 'full' "
-            "= real Chrome, anti-WAF (needs a full Chrome binary — see "
-            "`onyxweb-download-chrome --engine full`)."
+            "= real Chrome, anti-WAF (fetched by --install; or `onyxweb-download-chrome "
+            "--engine full`)."
         ),
     )
     cfg.add_argument(
@@ -295,9 +301,12 @@ def main(argv: list[str] | None = None) -> int:
             print("unknown")
         return 0
 
+    if args.force and not args.install:
+        p.error("--force applies to --install (see --help)")
+
     if args.install:
         from onyxweb.download import install_chrome
-        return install_chrome()
+        return install_chrome(engine=args.engine, force=args.force)
 
     if args.preset == "list":
         _list_presets()

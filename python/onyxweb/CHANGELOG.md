@@ -15,8 +15,11 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb page` with `overview`, `search` and `text`, to query a snapshot offline.
 - `Dom(html, doc_url)` can be built from Python, and `ResponseHeaders.pairs` lists every header as received.
 - `onyxweb URL --json -o PATH` writes the snapshot to a file.
+- `onyxweb.testing` with `FakeClient` and `FakeClientFactory`: an `AsyncClient` stand-in that serves canned pages for `fetch`, `screenshot`, `fetch_all` and `batch`, records its calls and can be told to fail or die, so code that fetches pages tests without Chrome.
 
 ### Changed
+- `onyxweb --install` and `onyxweb-download-chrome` fetch both Chrome builds, the headless shell and full Chrome, so the server's default engine needs no second command. It is about 380 MB more; `--engine shell` fetches the shell alone, and `ensure_chrome()` still fetches one engine.
+- `onyxweb --install --force` downloads the pinned Chrome again, as `onyxweb-download-chrome --force` did; `onyxweb-download-chrome` keeps `--all`, `--platform` and `--dest`.
 - **Breaking:** `RenderResult.text` and `Element.text` now read as the page displays them. Block elements break lines, a table row stays on one line with tabs between cells, `<pre>` keeps its spacing, and runs of whitespace collapse elsewhere. Previously adjacent blocks ran together, so `<div>Alice</div><div>30</div>` read as `Alice30`. Response hashes are unaffected: they cover the HTML, not the text.
 - **Breaking:** onyxweb requires Python 3.11 or later. The 0.2.3 wheels for Python 3.10 fail on import.
 - **Breaking:** Chrome runs with its sandbox by default on the full engine, which always passed `--no-sandbox` before. Where the sandbox cannot start (root, Docker's default container profile, restricted user namespaces), pass `sandbox=False` or set `ONYXWEB_CHROME__SANDBOX=false`. Docker and BBOT users need this. See "Docker and BBOT" in the README.
@@ -27,6 +30,12 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - The private `Client._render` helper, which no code called.
 
 ### Fixed
+- `Client(engine="full")` no longer hangs at launch on Windows. It read Chrome's version from `chrome.exe --version`, which Windows Chrome ignores: it starts the browser instead and never exits. The version is now read from the files beside `chrome.exe`.
+- The full engine installs and launches on macOS. `onyxweb --install --engine full` failed there with `No such file or directory: .../full/chrome`, because Chrome for Testing ships the macOS build as an app bundle and the installer and the resolver both looked for a flat `chrome`.
+- The full engine's own User-Agent names the real host OS on Windows and macOS instead of always claiming `X11; Linux x86_64`, which contradicted the browser's own `Sec-CH-UA-Platform` on every request.
+- An upgrade that pins a newer Chrome now replaces the installed build on the next `onyxweb --install` or `ensure_chrome()`. Before, an installed browser was kept whatever its version, until `onyxweb-download-chrome --force`. An install made before this release records no version, so it is replaced once.
+- A full-engine Chrome no longer grows with every fetch. It kept each page a tab had left in its back/forward cache, in a renderer process of its own, so one tab went from 5 to 15 renderer processes and 2.0 GB after 60 fetches. Four tabs after 40 fetches now hold about 1.0 GB, down from 1.9 GB. A `disable-features` in `chrome_args` is merged with the engine's own list.
+- The source distribution carried the test suite, the `onyxweb-server` package, the CI files and `uv.lock`, and the Python package twice. It now holds the Rust crate and the Python package once, 36 files instead of 92.
 - The package docstring example read `result.html.title`, a `str` method. It now reads `result.title`.
 - The shell engine's `--no-sandbox` reached Chrome as `----no-sandbox`, which Chrome ignores, so the default engine failed to launch in Docker with no working switch except `chrome_args=["no-sandbox"]`. `sandbox=False` now works on both engines.
 - A launch that fails while the sandbox is on now says how to fix it, instead of `CDP: Input/Output error while resolving websocket URL`.
