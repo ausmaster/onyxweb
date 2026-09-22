@@ -4,6 +4,8 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-22
+
 ### Changed
 - A JSON body sent to an HTTP route without `Content-Type: application/json` is a 422 that names the fix, where `POST /fetch` read it anyway.
 - The default engine is `full`, a real Chrome, and the server's own clients wait out bot-check pages unless a call passes `bypass_anti_bot: false`. On 22 popular sites the full engine passed 18 and the shell 10. `engine="shell"` is lighter and faster; `onyxweb --install` fetches both.
@@ -22,3 +24,6 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 - `onyxweb-server mcp`, an MCP server that lets an agent fetch a page, ask several questions of it in one `query` call, then find and read the details. Install it with `pip install "onyxweb-server[mcp]"`.
   Pages stay in memory for the session, and every tool caps its output. It runs no caller-supplied scripts and never fetches a private, loopback or link-local address. Everything a page wrote, its title and URL included, appears below the untrusted label.
 - `onyxweb_server.core.ServerCore`, the part every front-end shares: a guarded, stateless `fetch`, held pages, and a browser client per engine that is rebuilt after its Chrome dies. `ONYXWEB_SERVER_MAX_PAGES` (default 50) sets how many pages it holds.
+
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.0...HEAD
+[0.1.0]: https://github.com/ausmaster/onyxweb/releases/tag/server-v0.1.0
