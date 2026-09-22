@@ -1,0 +1,179 @@
+# Manual publish of onyxweb-server to (Test)PyPI via Trusted Publishing (OIDC).
+# Pure Python (hatchling): one build job, no wheel matrix. Run it from the
+# Actions tab ("Run workflow" -> pick testpypi (default) or pypi). Requires a
+# matching GitHub Environment (testpypi / pypi) and a PyPI trusted publisher
+# for the onyxweb-server project, configured for THIS workflow file.
+#
+# testpypi runs publish a unique dev version (BASE.dev<run_number>) so retries
+# never collide with PyPI's immutable filenames; pypi runs publish the
+# pyproject version as-is and tag the commit server-v<version> — the
+# library's own tags are vX.Y.Z, so this scheme keeps the two release lines
+# from colliding.
+name: Publish onyxweb-server
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Index to publish to"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+# Never run two publishes to the same index at once, and never cancel one
+# mid-upload (a half-finished upload is exactly what we want to avoid).
+concurrency:
+  group: publish-server-${{ inputs.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    # Single source of the published version. Only pyproject.toml carries it
+    # (hatchling reads it from [project]). Hand the file to the build job as
+    # an artifact so the rewrite happens once.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: calc
+        run: |
+          BASE=$(python3 -c "import re;print(re.search(r'(?m)^version = \"([^\"]+)\"', open('python/server/pyproject.toml').read()).group(1))")
+          if [ "${{ inputs.repository }}" = "testpypi" ]; then
+            VERSION="${BASE}.dev${{ github.run_number }}"
+          else
+            VERSION="$BASE"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing onyxweb-server $VERSION to ${{ inputs.repository }}"
+      - name: Require a CHANGELOG section (pypi only)
+        if: inputs.repository == 'pypi'
+        run: |
+          grep -q "^## \[${{ steps.calc.outputs.version }}\]" python/server/CHANGELOG.md \
+            || { echo "python/server/CHANGELOG.md has no '## [${{ steps.calc.outputs.version }}]' section; rename [Unreleased] first."; exit 1; }
+      - name: Pin version into pyproject.toml
+        env:
+          V: ${{ steps.calc.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          v = os.environ["V"]
+          s = open("python/server/pyproject.toml").read()
+          s = re.sub(r'(?m)^version = "[^"]+"', f'version = "{v}"', s, count=1)
+          open("python/server/pyproject.toml", "w").write(s)
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-files
+          path: python/server/pyproject.toml
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: version-files
+          path: python/server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel + sdist
+        working-directory: python/server
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+  smoke:
+    # Gate the publish on the actual built wheel importing. A testpypi run
+    # resolves onyxweb-server's own onyxweb dependency from TestPyPI, falling
+    # back to real PyPI for everything TestPyPI doesn't mirror (mcp, fastapi, ...).
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Install the built wheel
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ inputs.repository }}" = "testpypi" ]; then
+            python -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ dist/*.whl
+          else
+            python -m pip install dist/*.whl
+          fi
+      - name: Smoke test
+        run: python -c "import onyxweb_server; print('smoke OK')"
+
+  publish:
+    name: Publish to ${{ inputs.repository }}
+    needs: [version, build, smoke]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.repository }}
+      url: ${{ inputs.repository == 'testpypi' && 'https://test.pypi.org/p/onyxweb-server' || 'https://pypi.org/p/onyxweb-server' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1.14
+        with:
+          packages-dir: dist
+          # Tolerate files already uploaded (e.g. a retry after a partial run).
+          skip-existing: true
+          # Empty string → real PyPI; only set for TestPyPI.
+          repository-url: ${{ inputs.repository == 'testpypi' && 'https://test.pypi.org/legacy/' || '' }}
+
+  tag:
+    # Tag real releases (pypi only) with server-v<version>, distinct from the
+    # library's own vX.Y.Z tags.
+    needs: [version, publish]
+    if: inputs.repository == 'pypi'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag the release commit
+        env:
+          V: server-v${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$V" >/dev/null 2>&1; then
+            echo "Tag $V already exists, skipping."
+          else
+            git tag -a "$V" -m "Release $V"
+            git push origin "$V"
+          fi
+      - name: Create the GitHub release from python/server/CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "server-v$VERSION" >/dev/null 2>&1; then
+            echo "Release server-v$VERSION already exists, skipping."
+            exit 0
+          fi
+          # The section body: everything after its heading, up to the next release heading.
+          notes=$(awk -v v="$VERSION" '/^## \[/ { on = index($0, "## [" v "]") == 1; next } on && !/^\[[^]]+\]: /' python/server/CHANGELOG.md)
+          gh release create "server-v$VERSION" --verify-tag --title "server-v$VERSION" --notes "$notes"
