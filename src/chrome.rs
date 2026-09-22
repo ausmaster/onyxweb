@@ -34,6 +34,9 @@ pub fn chrome_binary_name(engine: ChromeEngine) -> &'static str {
         ChromeEngine::Full => {
             #[cfg(target_os = "windows")]
             return "chrome.exe";
+            // The macOS build is an app bundle; the executable sits inside it.
+            #[cfg(target_os = "macos")]
+            return "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
             #[allow(unreachable_code)]
             "chrome"
         }

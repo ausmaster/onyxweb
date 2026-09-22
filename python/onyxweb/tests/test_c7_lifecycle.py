@@ -267,6 +267,9 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
             time.sleep(0.05)
         assert not any(psutil.pid_exists(pid) for pid in tree), f"orphaned Chrome survived: {tree}"
     finally:
+        # A launch that never became ready is still running; kill it so the failure reports that,
+        # rather than this wait timing out.
+        proc.kill()
         proc.wait(timeout=5)
         for pid in _chrome_tree(proc.pid):
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
@@ -608,6 +611,14 @@ def test_download_engine_specs() -> None:
         "",
     )
     assert dl._engine_download("full", "win64")[1] == "chrome.exe"
+    # The macOS zip holds an app bundle, and Chrome's executable sits inside it, not beside it.
+    for mac in ("mac-arm64", "mac-x64"):
+        assert dl._engine_download("full", mac) == (
+            f"chrome-{mac}",
+            "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            "full",
+        )
+    assert dl._engine_download("shell", "mac-arm64")[1] == "chrome-headless-shell"
     with pytest.raises(ValueError):
         dl._engine_download("bogus", "linux64")
 

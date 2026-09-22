@@ -1027,9 +1027,10 @@ def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) 
         launched = [
             p
             for p in psutil.Process().children()
-            if p.pid not in before and "chrome" in p.name().lower()
+            if p.pid not in before and any(n in p.name().lower() for n in ("chrome", "wrapper"))
         ]
         assert launched, "expected this client to start a Chrome process"
+        # Off Linux the wrapper supervises Chrome, so it is the child, with the same flags.
         flags = min(launched, key=lambda p: p.pid).cmdline()
     assert ("--no-sandbox" in flags) == (not sandbox), flags
     if engine == "full":

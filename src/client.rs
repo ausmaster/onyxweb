@@ -263,15 +263,28 @@ const FALLBACK_FULL_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.
 /// matches the actual build — a UA/binary mismatch is itself a tell). Linux
 /// desktop shape; returns None if the version can't be parsed.
 fn derive_chrome_ua(chrome_path: &Path) -> Option<String> {
-    let out = std::process::Command::new(chrome_path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // e.g. "Chromium 147.0.7727.137" / "Google Chrome 148.0.7778.56"
-    let version = text
-        .split_whitespace()
-        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let version = if cfg!(windows) {
+        // Windows Chrome ignores `--version` and starts the browser, which never exits. The
+        // version names a file beside it (`148.0.7778.56.manifest`) or, installed, a folder.
+        std::fs::read_dir(chrome_path.parent()?)
+            .ok()?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .map(|name| name.trim_end_matches(".manifest").to_string())
+            .find(|name| {
+                let parts: Vec<&str> = name.split('.').collect();
+                parts.len() == 4 && parts.iter().all(|p| p.parse::<u32>().is_ok())
+            })?
+    } else {
+        let out = std::process::Command::new(chrome_path)
+            .arg("--version")
+            .output()
+            .ok()?;
+        // e.g. "Chromium 147.0.7727.137" / "Google Chrome 148.0.7778.56"
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?
+            .to_string()
+    };
     let major = version.split('.').next()?;
     Some(format!(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \

@@ -64,6 +64,8 @@ CFT_PLATFORM: dict[str, str] = {
 }
 
 ENGINES = ("shell", "full")
+# The macOS full build is an app bundle; Chrome's executable is inside it (mirrors chrome.rs).
+MAC_FULL_BINARY = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
 # Written into an engine's directory after an install: the pinned version that put the binary there.
 VERSION_MARKER = ".onyxweb-chrome-version"
 
@@ -84,13 +86,16 @@ def _engine_download(engine: str, cft_plat: str) -> tuple[str, str, str]:
     """Return ``(zip_base, binary_name, dest_subdir)`` for an engine + platform.
 
     ``zip_base`` is both the ``.zip`` filename stem and its top-level directory.
-    ``dest_subdir`` is "" (flat) for the shell, "full" for full Chrome.
+    ``dest_subdir`` is "" (flat) for the shell, "full" for full Chrome. ``binary_name`` is
+    relative to that directory; on macOS full Chrome it reaches into the app bundle.
     """
     is_win = cft_plat.startswith("win")
     if engine == "shell":
         binary = "chrome-headless-shell.exe" if is_win else "chrome-headless-shell"
         return f"chrome-headless-shell-{cft_plat}", binary, ""
     if engine == "full":
+        if cft_plat.startswith("mac"):
+            return f"chrome-{cft_plat}", MAC_FULL_BINARY, "full"
         return f"chrome-{cft_plat}", "chrome.exe" if is_win else "chrome", "full"
     raise ValueError(f"unknown engine {engine!r}; expected one of {ENGINES}")
 
