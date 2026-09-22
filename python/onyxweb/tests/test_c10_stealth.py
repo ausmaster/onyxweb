@@ -196,6 +196,38 @@ def test_full_engine_has_webgl_context() -> None:
     assert has_webgl is True, "full engine exposes no WebGL context"
 
 
+# Host OS -> the wire UA's platform token.
+_HOST_PLATFORM_TOKEN = {"Linux": "X11; Linux", "Darwin": "Macintosh", "Windows": "Windows NT"}
+
+
+def test_full_engine_ua_names_the_real_host_platform(httpserver: HTTPServer) -> None:
+    """The full engine's own derived UA must name this OS, not always claim Linux.
+
+    New test: the closest existing ones don't fit. ``test_basic_identity_agrees_on_wire_js_
+    and_client_hints`` checks the shell preset's spoofed brands against known preset data, not
+    the full engine's real, unspoofed identity. ``test_full_engine_has_webgl_context`` fetches a
+    ``data:`` URL, which never touches the network, so there is no wire ``User-Agent`` to read.
+    """
+    import platform as host_platform
+
+    httpserver.expect_request("/").respond_with_data(
+        "<html><body>x</body></html>", content_type="text/html"
+    )
+    try:
+        client = onyxweb.Client(engine="full", concurrency=1, navigation_timeout_ms=15_000)
+    except onyxweb.OnyxwebError as e:
+        if "not found" in str(e).lower():
+            pytest.skip(f"full Chrome unavailable: {e}")
+        raise
+    try:
+        client.fetch(httpserver.url_for("/"))
+    finally:
+        client.close()
+    wire_ua = httpserver.log[0][0].headers.get("User-Agent") or ""
+    token = _HOST_PLATFORM_TOKEN[host_platform.system()]
+    assert token in wire_ua, f"{wire_ua!r} does not name {host_platform.system()}"
+
+
 # ----------------------------------------------------------------------------
 # Canvas — stable across navigations, and toDataURL agrees with getImageData
 # ----------------------------------------------------------------------------
