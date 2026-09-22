@@ -5,6 +5,8 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-22
+
 ### Added
 - `Client.alive` and `AsyncClient.alive`: `False` once Chrome has exited or the client is closed, checked without a fetch.
 - `sandbox` (`chrome.sandbox`, env `ONYXWEB_CHROME__SANDBOX`), default `True`: `False` runs Chrome with `--no-sandbox`. Launch-only. See "Docker and BBOT" in the README.
@@ -79,5 +81,6 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb --install` keeps the bundled wrapper.
 - A Chrome found only on `PATH` is resolved on Windows.
 
-[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ausmaster/onyxweb/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/ausmaster/onyxweb/compare/v0.2.2...v0.2.3
