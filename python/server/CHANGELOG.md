@@ -4,6 +4,8 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-23
+
 ### Fixed
 - The MCP server's instructions fit in the 2048 characters Claude Code shows of them, with the warning that page content is untrusted data first. The 0.1.0 text was 2349 characters, so the client cut that warning off.
 
@@ -32,5 +34,6 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
   Pages stay in memory for the session, and every tool caps its output. It runs no caller-supplied scripts and never fetches a private, loopback or link-local address. Everything a page wrote, its title and URL included, appears below the untrusted label.
 - `onyxweb_server.core.ServerCore`, the part every front-end shares: a guarded, stateless `fetch`, held pages, and a browser client per engine that is rebuilt after its Chrome dies. `ONYXWEB_SERVER_MAX_PAGES` (default 50) sets how many pages it holds.
 
-[Unreleased]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.0...HEAD
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.1...HEAD
+[0.1.1]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.0...server-v0.1.1
 [0.1.0]: https://github.com/ausmaster/onyxweb/releases/tag/server-v0.1.0
