@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import re
 import struct
 import subprocess
@@ -39,7 +40,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from onyxweb.testing import FakeClientFactory
 from onyxweb_server import mcp as mcp_module
-from onyxweb_server.mcp import build_server
+from onyxweb_server.mcp import INSTRUCTIONS_CAP, build_server
 from pytest_httpserver import HTTPServer
 
 TOOLS = {"fetch", "batch", "screenshot", "pages", "overview", "find", "query", "read", "page_text"}
@@ -930,26 +931,43 @@ async def test_the_tools_offer_no_script_execution(server: FastMCP) -> None:
         *knobs,
     }
     assert server.instructions is not None
-    assert "untrusted" in server.instructions.lower()
-    assert "engine" in server.instructions  # the advice for a page that comes back empty
-    # What the text is, so a glued or broken reading is checked rather than believed.
+    # Claude Code cuts the rest off; the shipped 0.1.0 text was 2349 characters, so the untrusted
+    # warning below never reached an agent. Measured with headless sessions on 2026-09-22.
+    assert len(server.instructions) <= INSTRUCTIONS_CAP, len(server.instructions)
+    # First after the summary, so text added later can only push out what matters less.
+    assert server.instructions.lower().index("untrusted") < 150
+    # The instructions carry only what decides between tools; an agent reads them before any
+    # description loads (the tool list shows names alone), so this is the whole decision surface.
     for stated in (
-        "derived",
-        "<pre>",
-        "table",
-        "find",
+        "WebFetch",  # the tool this one is weighed against, by name
+        "JavaScript",
+        "bot check",
         "search tool",
-        "block_urls",
-        "Authorization",
-        "bypass_anti_bot=false",  # the wait is on by default, so how to skip it must be said
-        'engine="shell"',  # what the lighter engine is called, now that full is the default
-        "show in this conversation",  # what a header value costs the user
         "title and URL included",  # they are the page's words too
+        "in order",  # page_text, not query, for a list as the page shows it
+        # Without this line Sonnet 5 answered a docs question from memory in 6 of 9 headless
+        # sessions and fetched nothing; with it, 9 of 9 fetched (2026-09-23).
+        "rather than answer from memory",
     ):
         assert stated in server.instructions, stated
     # A tool the instructions never name is one the agent never picks.
     for tool in TOOLS:
         assert tool in server.instructions, tool
+    # What is read at the moment of use lives in that tool's description, and nowhere else.
+    placed = {
+        "fetch": ("block_urls", "Authorization", "false returns it", "show in this conversation",
+                  '"shell"'),
+        "page_text": ("derived", "<pre>", "table row"),
+        "query": ("word overlap", "links bucket"),
+    }
+    for name, phrases in placed.items():
+        for stated in phrases:
+            assert stated in (tools[name].description or ""), (name, stated)
+            assert stated not in server.instructions, f"{stated!r} is repeated in the instructions"
+    # Every character of a description reaches the agent, so none is spent on indentation.
+    for name, listed in tools.items():
+        description = listed.description or ""
+        assert description == inspect.cleandoc(description), f"{name} description is indented"
 
 
 def test_a_missing_mcp_package_names_the_extra() -> None:

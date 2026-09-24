@@ -4,6 +4,13 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Fixed
+- The MCP server's instructions fit in the 2048 characters Claude Code shows of them, with the warning that page content is untrusted data first. The 0.1.0 text was 2349 characters, so the client cut that warning off.
+
+### Changed
+- The MCP instructions are 959 characters, down from 2349, and carry only what decides between tools; an agent reads them before any tool description loads. Option details live in the description of the tool that takes them, how the page text is derived moved to `page_text`, how `query` ranks moved to `query`, and tool descriptions no longer carry docstring indentation (591 characters over the nine tools). `fetch`'s "Next" line routes by need: `query` for questions, `page_text` for the page in order.
+- Measured in headless sessions on 19 tasks: Sonnet 5 picks the right tool in 60 of 63 runs and falls back from a blocked WebFetch in the other 3, where the 1333-character draft launched a browser for 3 plain pages; Opus 5 picks it in 19 of 19; every answer is correct. The instructions also tell an agent given a URL to read the page rather than answer from memory, which Sonnet 5 did in 6 of 9 runs without that line.
+
 ## [0.1.0] - 2026-09-22
 
 ### Changed
