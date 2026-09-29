@@ -9,16 +9,16 @@ only the main frame speaks for the page. These feed BBOT's ``HTTP_RESPONSE``.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
+from hashlib import md5, sha256
 from urllib.parse import urlparse
 
-import mmh3
-import onyxweb
 import pytest
 from conftest import reloaded
+from mmh3 import hash
+from onyxweb import Client, RenderResult
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
@@ -134,21 +134,21 @@ ROWS: dict[str, Row] = {
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1) as c:
+def client() -> Iterator[Client]:
+    with Client(concurrency=1) as c:
         yield c
 
 
-def _check_invariants(r: onyxweb.RenderResult) -> None:
+def _check_invariants(r: RenderResult) -> None:
     """What holds for any response, served locally or not."""
     m = r.metadata
     body = r.html.encode()
     assert m.status_code == r.status_code
     assert m.content_length == len(body)
     assert (m.body_hashes.md5, m.body_hashes.sha256, m.body_hashes.mmh3) == (
-        hashlib.md5(body).hexdigest(),
-        hashlib.sha256(body).hexdigest(),
-        mmh3.hash(body),  # signed 32-bit, as BBOT computes it
+        md5(body).hexdigest(),
+        sha256(body).hexdigest(),
+        hash(body),  # signed 32-bit, as BBOT computes it
     )
     raw = r.headers.raw
     assert not raw.lower().startswith("http/"), "no status line"
@@ -156,9 +156,9 @@ def _check_invariants(r: onyxweb.RenderResult) -> None:
     assert all(": " in line for line in (raw.split("\r\n") if raw else []))
     raw_bytes = raw.encode()
     assert (r.headers.hashes.md5, r.headers.hashes.sha256, r.headers.hashes.mmh3) == (
-        hashlib.md5(raw_bytes).hexdigest(),
-        hashlib.sha256(raw_bytes).hexdigest(),
-        mmh3.hash(raw_bytes),
+        md5(raw_bytes).hexdigest(),
+        sha256(raw_bytes).hexdigest(),
+        hash(raw_bytes),
     )
     # A saved and loaded result reports the same response: redirects, cert, cookies too.
     again = reloaded(r)
@@ -169,7 +169,7 @@ def _check_invariants(r: onyxweb.RenderResult) -> None:
 
 
 @pytest.mark.parametrize("name", list(ROWS))
-def test_response(client: onyxweb.Client, httpserver: HTTPServer, name: str) -> None:
+def test_response(client: Client, httpserver: HTTPServer, name: str) -> None:
     """Each local site maps to the metadata the fetch reports."""
     row = ROWS[name]
     for path, page in row.site.items():
@@ -212,14 +212,14 @@ def test_response(client: onyxweb.Client, httpserver: HTTPServer, name: str) -> 
     _check_invariants(r)
 
 
-def test_data_url_response(client: onyxweb.Client) -> None:
+def test_data_url_response(client: Client) -> None:
     """A ``data:`` URL has no server: no certificate, but the invariants still hold."""
     r = client.fetch("data:text/html,<html><body>x</body></html>")
     assert r.metadata.cert_info is None
     _check_invariants(r)
 
 
-def test_https_response_carries_its_certificate(client: onyxweb.Client) -> None:
+def test_https_response_carries_its_certificate(client: Client) -> None:
     """``cert_info`` comes from CDP ``securityDetails`` — real network, example.com."""
     r = client.fetch("https://example.com/")
     ci = r.metadata.cert_info

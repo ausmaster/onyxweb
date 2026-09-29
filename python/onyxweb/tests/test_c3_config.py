@@ -20,27 +20,24 @@ and the presets, which are bundles of flat kwargs. The tables:
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import http.server
-import json
-import os
-import re
-import tempfile
-import threading
-import urllib.request
+from asyncio import run
+from base64 import b64encode
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from json import dumps
+from os import environ
 from pathlib import Path
+from re import escape
+from tempfile import TemporaryDirectory
+from threading import Lock, Thread
 from typing import Any
+from urllib.request import urlopen
 
-import onyxweb
-import psutil
-import pydantic
 import pytest
-from onyxweb import _LAUNCH_ONLY_FIELDS
+from onyxweb import _LAUNCH_ONLY_FIELDS, AsyncClient, Client, OnyxwebError, RenderResult
 from onyxweb.config import (
     _FLAT_KWARG_PATHS,
     _FORBIDDEN_HEADERS,
@@ -56,6 +53,8 @@ from onyxweb.config import (
     ViewportConfig,
 )
 from onyxweb.presets import full, shell
+from psutil import Process
+from pydantic import BaseModel, ValidationError
 from pytest_httpserver import HTTPServer
 from werkzeug.datastructures import Headers
 
@@ -67,7 +66,7 @@ _NOT_CONFIG = ("ONYXWEB_PKG_DIR", "ONYXWEB_LOG")  # read by onyxweb itself, not 
 def _clean_env() -> Iterator[None]:
     """Drop ``ONYXWEB_*`` config variables a developer shell may set, so defaults hold."""
     with pytest.MonkeyPatch.context() as mp:
-        for name in list(os.environ):
+        for name in list(environ):
             if name.startswith("ONYXWEB_") and name not in _NOT_CONFIG:
                 mp.delenv(name)
         yield
@@ -77,22 +76,22 @@ def _clean_env() -> Iterator[None]:
 class Clients:
     """Open clients no row fetches with; each runtime entry path changes its own."""
 
-    updated: onyxweb.Client  # update_config rows change this one
-    assigned: onyxweb.Client  # setattr rows change this one
-    aio: onyxweb.AsyncClient  # only refused changes reach this one
+    updated: Client  # update_config rows change this one
+    assigned: Client  # setattr rows change this one
+    aio: AsyncClient  # only refused changes reach this one
 
 
 @pytest.fixture(scope="module")
 def clients() -> Iterator[Clients]:
     made = Clients(
-        onyxweb.Client(concurrency=1), onyxweb.Client(concurrency=1), onyxweb.AsyncClient()
+        Client(concurrency=1), Client(concurrency=1), AsyncClient()
     )
     try:
         yield made
     finally:
         made.updated.close()
         made.assigned.close()
-        asyncio.run(made.aio.aclose())
+        run(made.aio.aclose())
 
 
 def _at(data: Any, path: tuple[str, ...]) -> Any:
@@ -103,8 +102,6 @@ def _at(data: Any, path: tuple[str, ...]) -> Any:
         data = data[key]
     return data
 
-
-# --- flat kwargs on every entry path ----------------------------------------------
 
 _META: dict[str, Any] = {
     "platform": "Windows",
@@ -196,11 +193,11 @@ def _env_vars(kwarg: str, value: Any) -> dict[str, str]:
     if isinstance(value, bool):
         return {name: str(value).lower()}
     if isinstance(value, dict | list | tuple):
-        return {name: json.dumps(value)}
+        return {name: dumps(value)}
     return {name: str(value)}
 
 
-def _assign(client: onyxweb.Client | onyxweb.AsyncClient, kwarg: str, value: Any) -> None:
+def _assign(client: Client | AsyncClient, kwarg: str, value: Any) -> None:
     """Set a flat kwarg by assignment through the live ``client.config`` view."""
     if kwarg == "viewport":
         client.config.viewport.width = value[0]
@@ -278,8 +275,6 @@ def test_snapshot_is_detached(clients: Clients) -> None:
     assert clients.assigned.config.network.user_agent != "SNAPSHOT_EDIT"
 
 
-# --- defaults ---------------------------------------------------------------------
-
 _CLIENT_DEFAULTS: dict[str, Any] = {
     "concurrency": 16,
     "wait_until": "load",
@@ -340,7 +335,7 @@ _WAITS: dict[str, Any] = {
     "wait_after_post_load_ms": None,
 }
 # Model -> (build with nothing set, its whole dump). A new field must pick its default here.
-DEFAULTS: dict[str, tuple[Callable[[], pydantic.BaseModel], dict[str, Any]]] = {
+DEFAULTS: dict[str, tuple[Callable[[], BaseModel], dict[str, Any]]] = {
     "ClientConfig": (ClientConfig, _CLIENT_DEFAULTS),
     "FetchConfig": (
         FetchConfig,
@@ -389,17 +384,15 @@ def test_defaults(model: str) -> None:
     assert build().model_dump() == expected
 
 
-# --- invalid and accepted input -----------------------------------------------------
-
 Invalid = tuple[Callable[[Clients], object], type[Exception], tuple[str, ...]]
 
 
 def _load_snapshot(text: str) -> object:
     """Load a snapshot file holding `text`."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with TemporaryDirectory() as tmp:
         path = Path(tmp) / "bad.json"
         path.write_text(text)
-        return onyxweb.RenderResult.load(path)
+        return RenderResult.load(path)
 
 
 _EXTRA = "Extra inputs are not permitted"
@@ -422,91 +415,91 @@ INVALID: dict[str, Invalid] = {
     ),
     "viewport_zero": (
         lambda c: ViewportConfig(width=0),
-        pydantic.ValidationError,
+        ValidationError,
         ("greater than or equal to 1",),
     ),
     "viewport_negative": (
         lambda c: ViewportConfig(width=-1),
-        pydantic.ValidationError,
+        ValidationError,
         ("greater than or equal to 1",),
     ),
     "network_unknown_field": (
         lambda c: NetworkConfig(usr_agent="oops"),  # type: ignore[call-arg]
-        pydantic.ValidationError,
+        ValidationError,
         ("usr_agent", _EXTRA),
     ),
     "scripts_unknown_field": (
         lambda c: ScriptsConfig(on_navigation=["x"]),  # type: ignore[call-arg]
-        pydantic.ValidationError,
+        ValidationError,
         ("on_navigation", _EXTRA),
     ),
     "ua_metadata_unknown_field": (
         lambda c: UserAgentMetadata(**_META, nonsense="x"),  # type: ignore[call-arg]
-        pydantic.ValidationError,
+        ValidationError,
         ("nonsense", _EXTRA),
     ),
     "ua_metadata_missing_fields": (
         lambda c: UserAgentMetadata(),  # type: ignore[call-arg]
-        pydantic.ValidationError,
+        ValidationError,
         ("platform", "Field required"),
     ),
     "color_scheme_unknown": (
         lambda c: EmulationConfig(prefers_color_scheme="sepia"),  # type: ignore[arg-type]
-        pydantic.ValidationError,
+        ValidationError,
         ("'light' or 'dark'",),
     ),
     "engine_unknown": (
         lambda c: ChromeConfig(engine="turbo"),  # type: ignore[arg-type]
-        pydantic.ValidationError,
+        ValidationError,
         ("'full' or 'shell'",),
     ),
     "console_level_unknown": (
         lambda c: ClientConfig(capture_console_level="invalid"),  # type: ignore[arg-type]
-        pydantic.ValidationError,
+        ValidationError,
         ("'all', 'warn' or 'error'",),
     ),
     "hash_navigation_unknown": (
         lambda c: FetchConfig(hash_navigation="sideways"),  # type: ignore[arg-type]
-        pydantic.ValidationError,
+        ValidationError,
         ("'reload' or 'continue'",),
     ),
     "queue_timeout_zero": (
         lambda c: ClientConfig.from_flat(queue_timeout_ms=0),
-        pydantic.ValidationError,
+        ValidationError,
         ("greater than or equal to 1",),
     ),
     "screenshot_format_unknown": (
         lambda c: ScreenshotConfig(format="tiff"),  # type: ignore[arg-type]
-        pydantic.ValidationError,
+        ValidationError,
         ("'png', 'jpeg' or 'webp'",),
     ),
     "screenshot_quality_over_100": (
         lambda c: ScreenshotConfig(format="jpeg", quality=150),
-        pydantic.ValidationError,
+        ValidationError,
         ("less than or equal to 100",),
     ),
     "screenshot_kwarg_checked_before_navigating": (
         lambda c: c.updated.screenshot(NEVER_FETCHED, format="tiff"),
-        pydantic.ValidationError,
+        ValidationError,
         ("'png', 'jpeg' or 'webp'",),
     ),
     "client_positional_argument": (
-        lambda c: onyxweb.Client("x"),
+        lambda c: Client("x"),
         TypeError,
         ("Client() takes only keyword args", "config=ClientConfig"),
     ),
     "async_client_positional_argument": (
-        lambda c: onyxweb.AsyncClient("x"),
+        lambda c: AsyncClient("x"),
         TypeError,
         ("AsyncClient() takes only keyword args", "config=ClientConfig"),
     ),
     "client_config_and_kwargs": (
-        lambda c: onyxweb.Client(config=ClientConfig(), user_agent="x"),
+        lambda c: Client(config=ClientConfig(), user_agent="x"),
         TypeError,
         ("config=... or flat kwargs, not both",),
     ),
     "async_client_config_and_kwargs": (
-        lambda c: onyxweb.AsyncClient(config=ClientConfig(), user_agent="x"),
+        lambda c: AsyncClient(config=ClientConfig(), user_agent="x"),
         TypeError,
         ("config=... or flat kwargs, not both",),
     ),
@@ -559,27 +552,27 @@ INVALID: dict[str, Invalid] = {
     # glob made every fetch fail with a raw CDP error.
     "block_url_without_scheme_in_network_config": (
         lambda c: NetworkConfig(block_urls=["*doubleclick*"]),
-        pydantic.ValidationError,
+        ValidationError,
         ("'*doubleclick*'", _NO_SCHEME, "*://*.doubleclick.net/*"),
     ),
     "block_url_without_scheme_in_fetch_config": (
         lambda c: FetchConfig(block_urls=["*/x.png"]),
-        pydantic.ValidationError,
+        ValidationError,
         ("'*/x.png'", _NO_SCHEME, "*://*.doubleclick.net/*"),
     ),
     "block_url_without_scheme_via_from_flat": (
         lambda c: ClientConfig.from_flat(block_urls=["example.com/*"]),
-        pydantic.ValidationError,
+        ValidationError,
         ("'example.com/*'", _NO_SCHEME),
     ),
     "block_url_without_scheme_via_update_config": (
         lambda c: c.updated.update_config(block_urls=["*.png"]),
-        pydantic.ValidationError,
+        ValidationError,
         ("'*.png'", _NO_SCHEME),
     ),
     "block_url_without_scheme_via_fetch_kwarg": (
         lambda c: c.updated.fetch(NEVER_FETCHED, block_urls=["/x.png"]),
-        pydantic.ValidationError,
+        ValidationError,
         ("'/x.png'", _NO_SCHEME),
     ),
 }
@@ -615,7 +608,7 @@ for _header in FORBIDDEN:
         _sent = _header.lower() if _entry == "fetch_kwarg" else _header
         INVALID[f"forbidden_header_{_header.lower()}_via_{_entry}"] = (
             partial(_send_header, _send, _sent),
-            pydantic.ValidationError,
+            ValidationError,
             (f"cannot set '{_sent}'",),
         )
 
@@ -674,9 +667,6 @@ def test_accepted_input(name: str) -> None:
     assert build() == expected
 
 
-# --- launch-only fields -----------------------------------------------------------------
-
-
 @pytest.mark.parametrize("entry", ["update_config", "update_config_object", "setattr"])
 @pytest.mark.parametrize("kind", ["Client", "AsyncClient"])
 @pytest.mark.parametrize("kwarg", sorted(LAUNCH_ONLY_KWARGS))
@@ -687,7 +677,7 @@ def test_launch_only_field_refuses_a_runtime_change(
     _, value = FLAT_KWARGS[kwarg]
     *parents, name = _field_path(kwarg)
     before = client.config.model_dump()
-    dotted = re.escape(".".join(_field_path(kwarg)))
+    dotted = escape(".".join(_field_path(kwarg)))
     with pytest.raises(ValueError, match=f"launch-only field '{dotted}'.*Create a new {kind} "):
         if entry == "update_config":
             client.update_config(**{kwarg: value})
@@ -705,8 +695,6 @@ def _at_model(model: Any, path: list[str]) -> Any:
         model = getattr(model, part)
     return model
 
-
-# --- presets ----------------------------------------------------------------------------
 
 _OVERRIDE = "shell.stealth.BASIC with user_agent pre-merged"
 # Preset -> (the flat kwargs, path -> value its config must hold).
@@ -802,8 +790,6 @@ def test_tables_match_the_code() -> None:
     assert set(PRESETS) - {_OVERRIDE} == _shipped_presets()
 
 
-# --- effects on the next fetch ------------------------------------------------------------
-
 # A page that shows every knob below: an image to block, a console.log, and an open
 # shadow root whose marker is assembled at runtime so the source can't match.
 _PROBE_PAGE = (
@@ -859,7 +845,7 @@ class Probe:
     hits: Counter[str]  # requests per path during the fetch
 
 
-def _read(r: onyxweb.RenderResult, server: HTTPServer, seen: int, path: str) -> Probe:
+def _read(r: RenderResult, server: HTTPServer, seen: int, path: str) -> Probe:
     requests = [req for req, _ in server.log[seen:]]
     page = next(req for req in requests if req.path == path)
     return Probe(
@@ -935,13 +921,13 @@ def observed() -> Iterator[dict[str, Probe]]:
         server.expect_request("/probe").respond_with_data(_PROBE_PAGE, content_type="text/html")
         server.expect_request("/blocked.png").respond_with_data(b"", content_type="image/png")
 
-        def probe(client: onyxweb.Client) -> Probe:
+        def probe(client: Client) -> Probe:
             seen = len(server.log)
             r = client.fetch(server.url_for("/probe"), post_load_scripts=[_PROBE_JS])
             return _read(r, server, seen, "/probe")
 
-        def changed(apply: Callable[[onyxweb.Client], None]) -> Probe:
-            with onyxweb.Client(concurrency=1) as client:
+        def changed(apply: Callable[[Client], None]) -> Probe:
+            with Client(concurrency=1) as client:
                 before = probe(client)
                 apply(client)
                 probes.setdefault("baseline", before)
@@ -950,31 +936,31 @@ def observed() -> Iterator[dict[str, Probe]]:
         probes["update_config"] = changed(lambda c: c.update_config(**knobs))
         probes["update_config_object"] = changed(lambda c: c.update_config(config=whole))
 
-        def assign_each(client: onyxweb.Client) -> None:
+        def assign_each(client: Client) -> None:
             for kwarg, value in knobs.items():
                 _assign(client, kwarg, value)
 
         probes["setattr"] = changed(assign_each)
-        with onyxweb.Client(concurrency=1, **knobs) as client:
+        with Client(concurrency=1, **knobs) as client:
             probes["constructor"] = probe(client)
-        with onyxweb.Client(config=whole) as client:
+        with Client(config=whole) as client:
             probes["constructor_config"] = probe(client)
         with pytest.MonkeyPatch.context() as mp:
             for kwarg, value in knobs.items():
                 for name, text in _env_vars(kwarg, value).items():
                     mp.setenv(name, text)
-            with onyxweb.Client(concurrency=1) as client:
+            with Client(concurrency=1) as client:
                 probes["env"] = probe(client)
 
         async def async_changed() -> Probe:
-            async with onyxweb.AsyncClient(concurrency=1) as ac:
+            async with AsyncClient(concurrency=1) as ac:
                 await ac.fetch(server.url_for("/probe"))
                 ac.update_config(**knobs)
                 seen = len(server.log)
                 r = await ac.fetch(server.url_for("/probe"), post_load_scripts=[_PROBE_JS])
                 return _read(r, server, seen, "/probe")
 
-        probes["async_update_config"] = asyncio.run(async_changed())
+        probes["async_update_config"] = run(async_changed())
         yield probes
 
 
@@ -994,7 +980,7 @@ def test_explicit_profile_dir_is_used(tmp_path: Path) -> None:
     A launch-only knob can't go through ``EFFECTS``, which changes a running client.
     """
     profile = tmp_path / "profile"
-    with onyxweb.Client(concurrency=1, user_data_dir=str(profile)) as client:
+    with Client(concurrency=1, user_data_dir=str(profile)) as client:
         assert client.fetch("data:text/html,<p>x</p>").status_code == 200
     assert profile.is_dir() and any(profile.iterdir())
 
@@ -1016,17 +1002,17 @@ def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) 
     The shell engine's own copy of ``--no-sandbox`` once reached Chrome as ``----no-sandbox``,
     which Chrome ignores, so its sandbox could not be switched off.
     """
-    before = {p.pid for p in psutil.Process().children()}
+    before = {p.pid for p in Process().children()}
     try:
-        client = onyxweb.Client(concurrency=1, engine=engine, sandbox=sandbox, chrome_args=args)
-    except onyxweb.OnyxwebError as e:
+        client = Client(concurrency=1, engine=engine, sandbox=sandbox, chrome_args=args)
+    except OnyxwebError as e:
         if "not found" in str(e).lower():
             pytest.skip(f"{engine} Chrome unavailable: {e}")
         raise
     with client:
         launched = [
             p
-            for p in psutil.Process().children()
+            for p in Process().children()
             if p.pid not in before and any(n in p.name().lower() for n in ("chrome", "wrapper"))
         ]
         assert launched, "expected this client to start a Chrome process"
@@ -1048,7 +1034,7 @@ def test_launch_timeout_ms_bounds_the_browser_launch(tmp_path: Path) -> None:
     stub.write_text("#!/bin/sh\nsleep 2\n")
     stub.chmod(0o755)
     with pytest.raises(TimeoutError):
-        onyxweb.Client(chrome_path=str(stub), launch_timeout_ms=500)
+        Client(chrome_path=str(stub), launch_timeout_ms=500)
 
 
 def test_screenshot_timeout_ms_bounds_a_plain_screenshot_call() -> None:
@@ -1057,7 +1043,7 @@ def test_screenshot_timeout_ms_bounds_a_plain_screenshot_call() -> None:
     under the (generous) nav budget but over the (tight) screenshot one must
     still time out."""
     with (
-        onyxweb.Client(concurrency=1, navigation_timeout_ms=10_000, screenshot_timeout_ms=300) as c,
+        Client(concurrency=1, navigation_timeout_ms=10_000, screenshot_timeout_ms=300) as c,
         pytest.raises(TimeoutError),
     ):
         c.screenshot("data:text/html,<html></html>", wait_after_ms=600)
@@ -1071,13 +1057,11 @@ def test_user_agent_metadata_alone_still_reaches_the_wire(httpserver: HTTPServer
         "<html><body>x</body></html>", content_type="text/html"
     )
     meta = {**_META, "brands": [{"brand": "OnlyMetaBrand", "version": "77"}]}
-    with onyxweb.Client(concurrency=1, user_agent_metadata=meta) as c:
+    with Client(concurrency=1, user_agent_metadata=meta) as c:
         c.fetch(httpserver.url_for("/"))
     wire = httpserver.log[0][0].headers.get("Sec-CH-UA") or ""
     assert "OnlyMetaBrand" in wire, f"metadata never reached the wire: {wire!r}"
 
-
-# --- per-fetch settings merge with the client's --------------------------------------
 
 _MERGE_PAGE = (
     "<html><body><img src='/beacon/base.png'><img src='/beacon/call.png'>"
@@ -1178,14 +1162,12 @@ def test_per_fetch_setting_merges_with_the_client(httpserver: HTTPServer, name: 
     for beacon in ("base", "call", "free"):
         httpserver.expect_request(f"/beacon/{beacon}.png").respond_with_data(b"")
     origin = httpserver.url_for("/").rstrip("/")
-    with onyxweb.Client(concurrency=1, **row.client) as client:
+    with Client(concurrency=1, **row.client) as client:
         r = client.fetch(
             httpserver.url_for("/merge"), post_load_scripts=[_MERGE_JS], **_fill(row.fetch, origin)
         )
     assert row.read(_read(r, httpserver, 0, "/merge")) == _fill(row.expected, origin)
 
-
-# --- proxies ------------------------------------------------------------------------------
 
 _BYPASS = "<-loopback>"  # drop the implicit loopback bypass, so localhost goes through the proxy
 
@@ -1196,11 +1178,11 @@ class ProxyState:
 
     credentials: tuple[str, str] | None  # the Basic credentials it demands, if any
     forwarded: list[str] = field(default_factory=list)  # absolute URIs it relayed
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: Lock = field(default_factory=Lock)
 
 
-def _proxy_handler(state: ProxyState) -> type[http.server.BaseHTTPRequestHandler]:
-    class Proxy(http.server.BaseHTTPRequestHandler):
+def _proxy_handler(state: ProxyState) -> type[BaseHTTPRequestHandler]:
+    class Proxy(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *_args: object) -> None:
@@ -1216,14 +1198,14 @@ def _proxy_handler(state: ProxyState) -> type[http.server.BaseHTTPRequestHandler
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             if state.credentials is not None:
-                token = base64.b64encode(":".join(state.credentials).encode()).decode()
+                token = b64encode(":".join(state.credentials).encode()).decode()
                 if self.headers.get("Proxy-Authorization") != f"Basic {token}":
                     self._reply(407, b"proxy auth required", {"Proxy-Authenticate": "Basic"})
                     return
             with state.lock:
                 state.forwarded.append(self.path)
             try:
-                with urllib.request.urlopen(self.path, timeout=5) as upstream:  # noqa: S310
+                with urlopen(self.path, timeout=5) as upstream:  # noqa: S310
                     content_type = upstream.headers.get("Content-Type", "text/html")
                     self._reply(upstream.status, upstream.read(), {"Content-Type": content_type})
             except OSError:
@@ -1235,13 +1217,13 @@ def _proxy_handler(state: ProxyState) -> type[http.server.BaseHTTPRequestHandler
 @pytest.fixture
 def start_proxy() -> Iterator[Callable[[tuple[str, str] | None], tuple[str, ProxyState]]]:
     """Start local forward proxies on demand; each returns its URL and state."""
-    servers: list[http.server.ThreadingHTTPServer] = []
+    servers: list[ThreadingHTTPServer] = []
 
     def start(credentials: tuple[str, str] | None) -> tuple[str, ProxyState]:
         state = ProxyState(credentials)
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler(state))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler(state))
         servers.append(server)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        Thread(target=server.serve_forever, daemon=True).start()
         return f"http://127.0.0.1:{server.server_address[1]}", state
 
     yield start
@@ -1308,7 +1290,7 @@ def test_proxy(
         proxy: url.replace("http://", f"http://{userinfo}") for proxy, (url, _) in proxies.items()
     }
     first = run.steps[0].proxy
-    with onyxweb.Client(concurrency=1, proxy=address[first], proxy_bypass_list=_BYPASS) as c:
+    with Client(concurrency=1, proxy=address[first], proxy_bypass_list=_BYPASS) as c:
         for step in run.steps:
             c.config.network.proxy = address[step.proxy]
             before = {proxy: len(state.forwarded) for proxy, (_, state) in proxies.items()}

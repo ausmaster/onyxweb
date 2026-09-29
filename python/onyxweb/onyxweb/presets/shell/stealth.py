@@ -78,7 +78,6 @@ BASIC_UA_METADATA: dict[str, Any] = {
 }
 
 
-# -- JS patches ---------------------------------------------------------------
 # Each patch is a self-contained statement / IIFE. All are idempotent and
 # guard with feature checks so double-registration or running on shapes
 # other than chrome-headless-shell is harmless.

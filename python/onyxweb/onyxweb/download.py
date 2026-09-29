@@ -21,16 +21,16 @@ Bump ``CHROME_VERSION`` to upgrade the pinned build across all platforms/engines
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-import platform
-import shutil
-import stat
 import sys
-import tempfile
 import urllib.request
-import zipfile
+from argparse import ArgumentParser
+from asyncio import to_thread
 from pathlib import Path
+from platform import machine, system
+from shutil import copyfileobj, move, rmtree
+from stat import S_IXGRP, S_IXOTH, S_IXUSR
+from tempfile import NamedTemporaryFile, mkdtemp
+from zipfile import BadZipFile, ZipFile
 
 from onyxweb._onyxweb import OnyxwebError
 
@@ -43,7 +43,7 @@ class OnyxwebDownloadError(OnyxwebError):
     or a corrupt / unsafe archive. Subclasses ``onyxweb.OnyxwebError`` (itself a
     ``RuntimeError``), so a host app can branch on this one type
     (``except onyxweb.OnyxwebError``) instead of a grab-bag of ``OSError`` /
-    ``zipfile.BadZipFile`` / ``RuntimeError``. Programming errors (``ImportError``,
+    ``BadZipFile`` / ``RuntimeError``. Programming errors (``ImportError``,
     ``ValueError``, …) deliberately escape unwrapped.
     """
 
@@ -102,20 +102,20 @@ def _engine_download(engine: str, cft_plat: str) -> tuple[str, str, str]:
 
 def current_platform_key() -> str:
     """Return the internal_key matching the host OS+arch."""
-    system = platform.system()
-    machine = platform.machine().lower()
-    if system == "Linux" and machine in {"x86_64", "amd64"}:
+    os_name = system()
+    arch = machine().lower()
+    if os_name == "Linux" and arch in {"x86_64", "amd64"}:
         return "linux_x86_64"
-    if system == "Linux" and machine in {"aarch64", "arm64"}:
+    if os_name == "Linux" and arch in {"aarch64", "arm64"}:
         return "linux_aarch64"
-    if system == "Darwin" and machine == "x86_64":
+    if os_name == "Darwin" and arch == "x86_64":
         return "darwin_x86_64"
-    if system == "Darwin" and machine in {"arm64", "aarch64"}:
+    if os_name == "Darwin" and arch in {"arm64", "aarch64"}:
         return "darwin_aarch64"
-    if system == "Windows" and machine in {"amd64", "x86_64"}:
+    if os_name == "Windows" and arch in {"amd64", "x86_64"}:
         return "windows_x86_64"
     raise OnyxwebDownloadError(
-        f"unsupported host platform: {system}/{machine}. Pass chrome_path= to use "
+        f"unsupported host platform: {os_name}/{arch}. Pass chrome_path= to use "
         "a system Chromium."
     )
 
@@ -182,10 +182,10 @@ def download_for(
     staging: Path | None = None
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".onyxweb-stage-", dir=dest_root))
+        staging = Path(mkdtemp(prefix=".onyxweb-stage-", dir=dest_root))
         staging_root = staging.resolve()
         # Stream to a tempfile so we don't buffer 100+MB in memory.
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        with NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         with (
             urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as resp,
@@ -214,7 +214,7 @@ def download_for(
         if verbose:
             print(f"  [{internal_key}/{engine}] extracting...")
 
-        with zipfile.ZipFile(tmp_path) as zf:
+        with ZipFile(tmp_path) as zf:
             # Archive layout: <zip_base>/<files>. Flatten into the staging dir.
             for member in zf.namelist():
                 rel = member
@@ -228,7 +228,7 @@ def download_for(
                     raise OnyxwebDownloadError(f"unsafe path in archive: {member!r}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                    copyfileobj(src, dst)
                 # Preserve executable bit if it was set in the zip.
                 if (zf.getinfo(member).external_attr >> 16) & 0o111:
                     target.chmod(target.stat().st_mode | 0o755)
@@ -236,7 +236,7 @@ def download_for(
         # Always ensure the main binary is executable (some zips lose the bit).
         staged_bin = staging / binary_name
         if staged_bin.is_file():
-            staged_bin.chmod(staged_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            staged_bin.chmod(staged_bin.stat().st_mode | S_IXUSR | S_IXGRP | S_IXOTH)
 
         # Swap staged files in, keeping subdirs this install doesn't own: `full/`
         # (the other engine) and `wrapper/` (onyxweb_wrapper, bundled into the wheel).
@@ -246,18 +246,18 @@ def download_for(
             if existing.name in preserve:
                 continue
             if existing.is_dir():
-                shutil.rmtree(existing)
+                rmtree(existing)
             else:
                 existing.unlink()
         for item in list(staging.iterdir()):
-            shutil.move(str(item), str(dest_dir / item.name))
+            move(str(item), str(dest_dir / item.name))
         (dest_dir / VERSION_MARKER).write_text(CHROME_VERSION)
 
         size_mb = dest_bin.stat().st_size / (1024 * 1024)
         if verbose:
             print(f"  [{internal_key}/{engine}] ok — {dest_bin} ({size_mb:.0f} MB)")
         return dest_bin
-    except (OSError, zipfile.BadZipFile) as e:
+    except (OSError, BadZipFile) as e:
         # Wrap the whole I/O + archive surface (permissions, disk, and network —
         # URLError / HTTPError / timeout are all OSError in 3.10+ — plus a
         # truncated or corrupt zip) into one type. The platform + zip-slip raises
@@ -269,7 +269,7 @@ def download_for(
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+            rmtree(staging, ignore_errors=True)
 
 
 def default_dest_dir() -> Path:
@@ -404,13 +404,13 @@ async def aensure_chrome(
     Awaitable from an event loop (e.g. a BBOT module's ``setup_deps``) without
     blocking it. Same arguments and return value as :func:`ensure_chrome`.
     """
-    return await asyncio.to_thread(
+    return await to_thread(
         ensure_chrome, engine=engine, dest=dest, force=force, verbose=verbose
     )
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = ArgumentParser(description=__doc__)
     p.add_argument(
         "--engine",
         choices=ENGINES,

@@ -14,22 +14,28 @@ per route carries a real page. The server holds nothing between requests.
 
 from __future__ import annotations
 
-import base64
-import json
-import struct
-import tempfile
+from base64 import b64decode
 from dataclasses import dataclass, field
+from json import dumps, loads
 from pathlib import Path
+from struct import unpack
+from tempfile import TemporaryDirectory
 from typing import Any
 
-import onyxweb
 import pytest
-import zstandard
 from conftest import PUBLIC
 from fastapi.testclient import TestClient
+from onyxweb import (
+    SNAPSHOT_VERSION,
+    ChromeExitedError,
+    OnyxwebError,
+    QueueTimeoutError,
+    RenderResult,
+)
 from onyxweb.testing import FakeClientFactory
 from onyxweb_server.core import CoreConfig, ServerCore
 from onyxweb_server.http import build_app
+from zstandard import ZstdDecompressor
 
 OK: dict[str, Any] = {"url": PUBLIC + "ok"}
 TWO: dict[str, Any] = {"urls": [PUBLIC + "one", PUBLIC + "two"]}
@@ -334,22 +340,22 @@ def test_request(name: str) -> None:
             assert r.content.startswith(MAGIC[row.format])
         elif row.path == "/batch":
             assert r.headers["content-type"].startswith("application/x-ndjson")
-            got = [json.loads(line) for line in r.text.splitlines()]
+            got = [loads(line) for line in r.text.splitlines()]
             assert [g["url"] for g in got] == row.body["urls"]  # type: ignore[index]
             assert [g["error"]["kind"] if "error" in g else "snapshot" for g in got] == list(
                 row.lines
             )
             assert all(
-                g["snapshot"]["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+                g["snapshot"]["onyxweb_snapshot"] == SNAPSHOT_VERSION
                 for g in got
                 if "snapshot" in g
             )
         else:
             assert r.headers["content-type"].startswith("application/json")
-            assert SNAPSHOTS[row.path](r.json())["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+            assert SNAPSHOTS[row.path](r.json())["onyxweb_snapshot"] == SNAPSHOT_VERSION
             if row.path == "/fetch_all":
                 assert row.format == r.json()["format"]
-                assert base64.b64decode(r.json()["image"]).startswith(MAGIC[row.format])
+                assert b64decode(r.json()["image"]).startswith(MAGIC[row.format])
         for fragment in row.says:
             assert fragment in r.text, r.text[:300]
         assert factory.engines == list(row.engines), "clients built beyond what the row says"
@@ -362,7 +368,7 @@ def test_request(name: str) -> None:
         assert _post(client, BODIES[row.path], path=row.path).status_code == row.then
 
 
-def _failure(kind: str | None, cls: type[BaseException] = onyxweb.OnyxwebError) -> BaseException:
+def _failure(kind: str | None, cls: type[BaseException] = OnyxwebError) -> BaseException:
     err = cls("boom")
     if kind is not None:
         err.kind = kind  # type: ignore[attr-defined]
@@ -372,8 +378,8 @@ def _failure(kind: str | None, cls: type[BaseException] = onyxweb.OnyxwebError) 
 
 # What a fetch can raise -> the status and kind the caller sees.
 FAILURES: dict[str, tuple[BaseException, int, str]] = {
-    "chrome_exited": (_failure("chrome_exited", onyxweb.ChromeExitedError), 503, "chrome_exited"),
-    "queue_timeout": (_failure("queue_timeout", onyxweb.QueueTimeoutError), 503, "queue_timeout"),
+    "chrome_exited": (_failure("chrome_exited", ChromeExitedError), 503, "chrome_exited"),
+    "queue_timeout": (_failure("queue_timeout", QueueTimeoutError), 503, "queue_timeout"),
     "navigation_timeout": (_failure("navigation_timeout", TimeoutError), 504, "navigation_timeout"),
     "timeout": (_failure("timeout", TimeoutError), 504, "timeout"),
     "cdp": (_failure("cdp"), 502, "cdp"),
@@ -399,7 +405,7 @@ def test_failure(name: str, path: str) -> None:
         r = _post(client, BODIES[path], path=path)
         if path == "/batch":  # a batch never fails as a whole: each URL carries its own failure
             assert r.status_code == 200, r.text
-            errors = [json.loads(line)["error"] for line in r.text.splitlines()]
+            errors = [loads(line)["error"] for line in r.text.splitlines()]
             assert [e["kind"] for e in errors] == [kind, kind]
             assert all("boom" in e["message"] for e in errors)
         else:
@@ -431,8 +437,8 @@ def test_encoding(name: str, path: str) -> None:
     assert r.status_code == 200
     assert r.headers.get("content-encoding") == expected
     assert "accept-encoding" in r.headers["vary"].lower()
-    first = SNAPSHOTS[path](json.loads(r.text.splitlines()[0]))
-    assert first["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+    first = SNAPSHOTS[path](loads(r.text.splitlines()[0]))
+    assert first["onyxweb_snapshot"] == SNAPSHOT_VERSION
 
 
 @pytest.mark.parametrize("path", list(SNAPSHOTS))
@@ -448,8 +454,8 @@ def test_zstd_actually_compresses(path: str) -> None:
         client.stream("POST", path, json=BODIES[path], headers={"accept-encoding": "zstd"}) as r,
     ):
         raw = b"".join(r.iter_raw())
-    plain = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
-    assert SNAPSHOTS[path](json.loads(plain.splitlines()[0]))["final_url"].startswith(PUBLIC)
+    plain = ZstdDecompressor().decompressobj().decompress(raw)
+    assert SNAPSHOTS[path](loads(plain.splitlines()[0]))["final_url"].startswith(PUBLIC)
     assert len(raw) < len(plain)
     if path == "/batch":
         assert len(plain.splitlines()) == 2, "the stream lost a line"
@@ -492,17 +498,17 @@ def test_a_real_page_over_http(bucket_page: str, path: str) -> None:
     assert r.status_code == 200, r.text[:300]
     if path == "/screenshot":
         assert r.content.startswith(PNG)
-        assert struct.unpack(">II", r.content[16:24]) == (640, 480)
+        assert unpack(">II", r.content[16:24]) == (640, 480)
     else:
-        first = json.loads(r.text.splitlines()[0])
-        with tempfile.TemporaryDirectory() as tmp:
+        first = loads(r.text.splitlines()[0])
+        with TemporaryDirectory() as tmp:
             saved = Path(tmp) / "page.json"
-            saved.write_text(json.dumps(SNAPSHOTS[path](first)))
-            page = onyxweb.RenderResult.load(saved)
+            saved.write_text(dumps(SNAPSHOTS[path](first)))
+            page = RenderResult.load(saved)
         assert (page.title, len(page.scripts), page.status_code) == ("Bucket Fixture", 4, 200)
         assert page.final_url == bucket_page
         if path == "/fetch_all":
-            assert base64.b64decode(first["image"]).startswith(PNG)
+            assert b64decode(first["image"]).startswith(PNG)
     assert core.pages() == []
 
 

@@ -20,30 +20,30 @@ unless a token is set.
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import dataclasses
-import json
-import os
-import secrets
+from asyncio import to_thread
+from base64 import b64encode
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import fields
+from json import dumps
+from os import environ
+from secrets import compare_digest
 from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict
 
 try:
-    import zstandard
     from fastapi import APIRouter, Depends, FastAPI, Request
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse, Response, StreamingResponse
+    from zstandard import ZstdCompressor
 except ImportError as ie:
     raise ImportError(
         "onyxweb_server.http needs fastapi and zstandard; "
         'install them with pip install "onyxweb-server[http]".'
     ) from ie
 
-import onyxweb
+from onyxweb import OnyxwebError, RenderResult
 
 from onyxweb_server.core import FetchOptions, Refused, ServerCore, ShotOptions, TooLarge
 
@@ -65,8 +65,8 @@ STATUS: Final = {
     "timeout": 504,
     "internal": 500,
 }
-FETCH_KNOBS: Final = {f.name for f in dataclasses.fields(FetchOptions)}
-SHOT_KNOBS: Final = {f.name for f in dataclasses.fields(ShotOptions)}
+FETCH_KNOBS: Final = {f.name for f in fields(FetchOptions)}
+SHOT_KNOBS: Final = {f.name for f in fields(ShotOptions)}
 
 
 class _Timing(BaseModel):
@@ -171,15 +171,16 @@ def _wire(make: Callable[[], Any], compress: bool) -> tuple[bytes, dict[str, str
 
     Runs in a thread, since building a large page's snapshot and compressing it hold the loop.
     """
-    body = json.dumps(make(), ensure_ascii=False).encode()
+    body = dumps(make(), ensure_ascii=False).encode()
     headers = {"Vary": "Accept-Encoding"}
     if compress:
-        return zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(body), headers | {
+        return ZstdCompressor(level=ZSTD_LEVEL).compress(body), headers | {
             "Content-Encoding": "zstd"
         }
     return body, headers
 
 
+# Front-end routes share `ServerCore`; see the docstring for the wire format.
 def build_app(core: ServerCore | None = None, token: str | None = None) -> FastAPI:
     """Build the HTTP app over `core`, or over a default core when none is given.
 
@@ -189,7 +190,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
             ``ONYXWEB_SERVER_TOKEN``; none set, or an empty one, leaves the routes open.
     """
     core = core or ServerCore()
-    token = os.environ.get(TOKEN_VAR) if token is None else token
+    token = environ.get(TOKEN_VAR) if token is None else token
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -203,7 +204,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         if not token:
             return
         scheme, _, given = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(given.encode(), token.encode()):
+        if scheme.lower() != "bearer" or not compare_digest(given.encode(), token.encode()):
             raise _Unauthorized
 
     app = FastAPI(title="onyxweb-server", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -248,7 +249,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         status, kind = _problem(exc)
         return _error(request, status, kind, str(exc), getattr(exc, "url", None))
 
-    for cause in (Refused, onyxweb.OnyxwebError, TimeoutError):
+    for cause in (Refused, OnyxwebError, TimeoutError):
         app.add_exception_handler(cause, failed)
 
     guarded = APIRouter(dependencies=[Depends(authorized)])
@@ -257,7 +258,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
     async def fetch(wanted: FetchRequest, request: Request) -> Response:
         request.state.url = wanted.url  # the handlers above name it in their answers
         page = await core.fetch(wanted.url, wanted.options())
-        body, headers = await asyncio.to_thread(_wire, page.snapshot, _accepts_zstd(request))
+        body, headers = await to_thread(_wire, page.snapshot, _accepts_zstd(request))
         return Response(body, media_type="application/json", headers=headers)
 
     @guarded.post("/screenshot")
@@ -278,11 +279,11 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         def envelope() -> dict[str, Any]:
             return {
                 "snapshot": both.html.snapshot(),
-                "image": base64.b64encode(both.png).decode(),
+                "image": b64encode(both.png).decode(),
                 "format": wanted.format,
             }
 
-        body, headers = await asyncio.to_thread(_wire, envelope, _accepts_zstd(request))
+        body, headers = await to_thread(_wire, envelope, _accepts_zstd(request))
         return Response(body, media_type="application/json", headers=headers)
 
     @guarded.post("/batch")
@@ -290,20 +291,20 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         results = await core.batch(wanted.urls, wanted.options())
         compress = _accepts_zstd(request)
 
-        def line(url: str, item: onyxweb.RenderResult | Exception) -> bytes:
+        def line(url: str, item: RenderResult | Exception) -> bytes:
             if isinstance(item, Exception):
                 _, kind = _problem(item)
                 error = {"kind": kind, "message": str(item), "url": getattr(item, "url", url)}
                 entry: dict[str, Any] = {"url": url, "error": error}
             else:
                 entry = {"url": url, "snapshot": item.snapshot()}
-            return json.dumps(entry, ensure_ascii=False).encode() + b"\n"
+            return dumps(entry, ensure_ascii=False).encode() + b"\n"
 
         async def lines() -> AsyncIterator[bytes]:
             """Each URL's line as it is built, so no more than one is held encoded at a time."""
-            packer = zstandard.ZstdCompressor(level=ZSTD_LEVEL).compressobj() if compress else None
+            packer = ZstdCompressor(level=ZSTD_LEVEL).compressobj() if compress else None
             for url, item in zip(wanted.urls, results, strict=True):
-                data = await asyncio.to_thread(line, url, item)
+                data = await to_thread(line, url, item)
                 if chunk := packer.compress(data) if packer else data:
                     yield chunk
             if packer:

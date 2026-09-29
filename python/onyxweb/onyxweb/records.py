@@ -13,10 +13,10 @@ root::
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from inspect import signature
+from json import dumps
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, TypeVar, overload
 
 from onyxweb._onyxweb import Buckets as _RustBuckets
@@ -49,11 +49,6 @@ FrameWhere = Literal["inline", "external", "blank"]
 
 #: One search term, as Rust receives it: ``(needle, field, case_sensitive, regex)``.
 Query = tuple[str, str | None, bool, bool]
-
-
-# ----------------------------------------------------------------------------
-# Record shapes
-# ----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, repr=False)
@@ -317,11 +312,6 @@ class Match:
         return f"<Match #{self.index} {self.field} {_clip(self.value)!r}>"
 
 
-# ----------------------------------------------------------------------------
-# Formatter — returns the table; callers print it
-# ----------------------------------------------------------------------------
-
-
 def count_str(n: int, singular: str, plural: str) -> str:
     """Render a count with a noun that agrees. Ex: ``(1, "form", "forms")`` -> ``"1 form"``."""
     return f"{n} {singular if n == 1 else plural}"
@@ -436,11 +426,6 @@ def overview_str(overview: Overview) -> str:
     lines.append(rule)
     lines.append(f"{'total':<9} {'':<9} {'':>6}  {size_str(overview.total_size):>8}")
     return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------------
-# Bucket
-# ----------------------------------------------------------------------------
 
 
 class Bucket(Sequence[R]):
@@ -675,7 +660,7 @@ class Bucket(Sequence[R]):
         # The first body field the record fills wins: a script's source, else its URL.
         found = next((v for name in self._body if (v := getattr(record, name)) is not None), "")
         content = (
-            found if isinstance(found, str) else json.dumps(found, indent=2, ensure_ascii=False)
+            found if isinstance(found, str) else dumps(found, indent=2, ensure_ascii=False)
         )
         if prnt:
             print(content)
@@ -718,10 +703,6 @@ class Bucket(Sequence[R]):
         """Every record as a plain dict, for JSON pipelines."""
         return [asdict(r) for r in self._materialize()]
 
-
-# ----------------------------------------------------------------------------
-# Views — which buckets a handle holds, and which side of each it keeps
-# ----------------------------------------------------------------------------
 
 BUCKET_SPECS: Final[dict[str, tuple[str, Callable[..., Any], str | None, tuple[str, ...]]]] = {
     "scripts": ("Scripts", Script, "where", ("text", "url")),

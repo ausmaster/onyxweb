@@ -10,8 +10,8 @@ anything else only with ``ONYXWEB_SERVER_TOKEN`` set.
 
 from __future__ import annotations
 
-import subprocess
 import sys
+from subprocess import run
 from typing import Any
 
 import pytest
@@ -65,7 +65,7 @@ def test_server_without_its_extra_exits_1_and_names_the_fix(
         f"import sys; sys.modules[{missing!r}] = None; from onyxweb_server.__main__ import main; "
         f"raise SystemExit(main([{command!r}]))"
     )
-    p = subprocess.run([sys.executable, "-c", block], capture_output=True, text=True, timeout=60)
+    p = run([sys.executable, "-c", block], capture_output=True, text=True, timeout=60)
     assert p.returncode == 1, p.stderr
     assert f"onyxweb-server[{extra}]" in p.stderr
     assert "Traceback" not in p.stderr
