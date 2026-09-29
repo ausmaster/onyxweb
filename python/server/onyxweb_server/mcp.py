@@ -12,14 +12,14 @@ Register it with Claude Code::
 
 from __future__ import annotations
 
-import contextlib
-import inspect
-import io
-import math
-import re
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager, redirect_stdout
 from dataclasses import dataclass
+from inspect import cleandoc
+from io import StringIO
+from math import log
+from re import IGNORECASE, compile, error, escape, findall
 from typing import Any, Final, Literal
 
 try:
@@ -126,9 +126,6 @@ def _bucket(page: RenderResult, name: str) -> Any:
     return getattr(page, name)
 
 
-# --- finding -----------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class _Search:
     """One `find` call: what to look for, where, how to match it, and how much to show.
@@ -166,8 +163,8 @@ class _Search:
         if name == "text":
             return [self._cut(t) for t in tables], values
         for bucket in self._buckets(page):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
+            buf = StringIO()
+            with redirect_stdout(buf):
                 bucket.matches(
                     self.query,
                     field=self.field,
@@ -216,11 +213,11 @@ class _Search:
         Python's ``re``, so unlike the buckets it accepts lookaround.
         """
         try:
-            pattern = re.compile(
-                self.query if self.regex else re.escape(self.query),
-                0 if self.case_sensitive else re.I,
+            pattern = compile(
+                self.query if self.regex else escape(self.query),
+                0 if self.case_sensitive else IGNORECASE,
             )
-        except re.error as re_err:
+        except error as re_err:
             raise ValueError(f"invalid search pattern {self.query!r}: {re_err}") from re_err
         text = page.text
         found = list(pattern.finditer(text))
@@ -245,9 +242,6 @@ class _Search:
             return lines
         more = count_str(len(matches) - self.limit, "more match", "more matches")
         return [*head, *matches[: self.limit], f"… {more}; narrow the query or raise limit."]
-
-
-# --- ranked passages ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -286,7 +280,7 @@ class _Passages:
                 if not (tf := count[term]):
                     continue
                 holding = sum(1 for other in self._counts if term in other)
-                idf = math.log(1 + (len(self._counts) - holding + 0.5) / (holding + 0.5))
+                idf = log(1 + (len(self._counts) - holding + 0.5) / (holding + 0.5))
                 score += (
                     idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / max(self._average, 1)))
                 )
@@ -370,7 +364,7 @@ class _Passages:
     @staticmethod
     def _terms(text: str) -> list[str]:
         """Lowercased words, cut to `STEM` characters so word forms meet."""
-        return [w[:STEM] if len(w) > STEM else w for w in re.findall(r"\w+", text.lower())]
+        return [w[:STEM] if len(w) > STEM else w for w in findall(r"\w+", text.lower())]
 
     @staticmethod
     def _link_share(text: str, links: set[str]) -> float:
@@ -380,9 +374,6 @@ class _Passages:
         0.02-0.12, so `LINK_HEAVY` sits in an empty gap.
         """
         return min(sum(len(t) for t in links if t in text) / max(len(text), 1), 1.0)
-
-
-# --- the tools ---------------------------------------------------------------------------
 
 
 class _Tools:
@@ -784,7 +775,7 @@ def build_server(
     """
     core = ServerCore(make_client, url_guard=url_guard, max_pages=max_pages)
 
-    @contextlib.asynccontextmanager
+    @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
         try:
             yield
@@ -808,7 +799,7 @@ def build_server(
         server.add_tool(
             tool,
             # FastMCP sends the docstring raw; its indentation would cost characters on every line.
-            description=inspect.cleandoc(tool.__doc__ or ""),
+            description=cleandoc(tool.__doc__ or ""),
             structured_output=False if tool in (tools.fetch, tools.screenshot) else None,
         )
     return server

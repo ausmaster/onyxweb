@@ -19,31 +19,39 @@ bad network, a bad archive or an unsupported platform: each raises
 
 from __future__ import annotations
 
-import contextlib
-import inspect
-import io
-import os
-import shutil
-import signal
-import subprocess
 import sys
-import threading
-import time
-import urllib.error
 import urllib.request
-import zipfile
 from collections.abc import Callable
+from contextlib import suppress
+from inspect import isawaitable
+from io import BytesIO
+from os import environ, getpid, kill, listdir, pathsep
+from os.path import isdir
 from pathlib import Path
+from shutil import copy, which
+from signal import SIGKILL, SIGSTOP
+from subprocess import Popen, run
+from threading import Thread, current_thread
+from time import monotonic, perf_counter, sleep
 from typing import Any, Literal, cast
+from urllib.error import URLError
+from zipfile import ZipFile
 
-import onyxweb
 import onyxweb.download as dl
-import psutil
 import pytest
+from onyxweb import (
+    AsyncClient,
+    ChromeExitedError,
+    Client,
+    OnyxwebDownloadError,
+    OnyxwebError,
+    aensure_chrome,
+    ensure_chrome,
+    find_chrome,
+)
+from psutil import AccessDenied, NoSuchProcess, Process, ZombieProcess, pid_exists
 
-needs_proc = pytest.mark.skipif(not os.path.isdir("/proc"), reason="reads /proc")
-
-# --- closing ------------------------------------------------------------------
+needs_proc = pytest.mark.skipif(not isdir("/proc"), reason="reads /proc")
 
 CLOSE_BUDGET_S = 1.0  # a healthy close takes ~10 ms; generous for a loaded CI box
 CLOSE_TIMEOUT_S = 3.0  # mirrors CLOSE_TIMEOUT in src/client.rs
@@ -53,7 +61,7 @@ Shape = Literal["close", "context_manager", "aclose"]
 def _chrome_children(*, zombies: bool = False) -> set[int]:
     """Chrome processes started by this test process; zombies (unreaped) only when asked."""
     pids: set[int] = set()
-    for entry in os.listdir("/proc"):
+    for entry in listdir("/proc"):
         if not entry.isdigit():
             continue
         try:
@@ -63,7 +71,7 @@ def _chrome_children(*, zombies: bool = False) -> set[int]:
             continue
         name = stat[stat.index("(") + 1 : stat.rindex(")")]
         state, ppid = stat[stat.rindex(")") + 2 :].split()[:2]
-        if int(ppid) == os.getpid() and "chrome" in name and (zombies or state != "Z"):
+        if int(ppid) == getpid() and "chrome" in name and (zombies or state != "Z"):
             pids.add(int(entry))
     return pids
 
@@ -74,21 +82,21 @@ def _settled(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
     A SIGKILLed leader shows `Z` while its other threads unwind, and `waitpid` — so
     `client.alive` — succeeds only after the last one; that took up to 22 ms on a CI runner.
     """
-    deadline = time.monotonic() + within_s
-    while time.monotonic() < deadline:
+    deadline = monotonic() + within_s
+    while monotonic() < deadline:
         busy = set()
         for pid in pids:
             try:
                 with open(f"/proc/{pid}/stat") as f:
                     stat = f.read()
-                threads = len(os.listdir(f"/proc/{pid}/task"))
+                threads = len(listdir(f"/proc/{pid}/task"))
             except OSError:
                 continue  # already reaped
             if stat[stat.rindex(")") + 2 :].split()[0] != "Z" or threads > 1:
                 busy.add(pid)
         if not busy:
             return True
-        time.sleep(0.001)
+        sleep(0.001)
     return False
 
 
@@ -97,16 +105,16 @@ def _settled(pids: set[int], within_s: float = CLOSE_BUDGET_S) -> bool:
 @pytest.mark.parametrize("shape", ["close", "context_manager", "aclose"])
 async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: bool) -> None:
     before = _chrome_children()
-    client: onyxweb.Client | onyxweb.AsyncClient
+    client: Client | AsyncClient
     if shape == "aclose":
-        client = onyxweb.AsyncClient(concurrency=1)
+        client = AsyncClient(concurrency=1)
     else:
-        client = onyxweb.Client(concurrency=1)
+        client = Client(concurrency=1)
         if shape == "context_manager":
             client.__enter__()
 
     async def close() -> None:
-        if isinstance(client, onyxweb.AsyncClient):
+        if isinstance(client, AsyncClient):
             await client.aclose()
         elif shape == "context_manager":
             client.__exit__(None, None, None)
@@ -118,21 +126,21 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
     assert client.alive
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
-            os.kill(pid, signal.SIGKILL)
+            kill(pid, SIGKILL)
         assert _settled(launched, within_s=5.0), "Chrome survived SIGKILL"
         assert not client.alive
         await _assert_dead_chrome_is_named(client)
 
-    started = time.perf_counter()
+    started = perf_counter()
     await close()
-    assert time.perf_counter() - started < CLOSE_BUDGET_S
+    assert perf_counter() - started < CLOSE_BUDGET_S
     assert not client.alive
     assert _settled(launched), "Chrome still running after close, though the client is referenced"
     assert not launched & _chrome_children(zombies=True), "Chrome left unreaped after close"
 
     await close()  # a second close is a no-op
     with pytest.raises(RuntimeError, match="closed"):
-        if isinstance(client, onyxweb.AsyncClient):
+        if isinstance(client, AsyncClient):
             await client.fetch("data:text/html,x")
         else:
             client.fetch("data:text/html,x")
@@ -144,20 +152,20 @@ def test_close_is_bounded_when_chrome_stops_responding(
 ) -> None:
     """A wedged Chrome can't hold close hostage: the whole shutdown shares one budget."""
     before = _chrome_children()
-    client = onyxweb.Client(concurrency=1)
+    client = Client(concurrency=1)
     launched = _chrome_children() - before
     assert launched, "expected this Client to start a Chrome process"
     for pid in launched:
-        os.kill(pid, signal.SIGSTOP)  # a frozen Chrome never answers shutdown commands
+        kill(pid, SIGSTOP)  # a frozen Chrome never answers shutdown commands
     # Close on a thread: an unbounded close then fails fast instead of hanging the run.
-    closer = threading.Thread(target=client.close, daemon=True)
+    closer = Thread(target=client.close, daemon=True)
     try:
         closer.start()
         closer.join(CLOSE_TIMEOUT_S + 1.0)
         finished = not closer.is_alive()
     finally:
         for pid in launched:
-            os.kill(pid, signal.SIGKILL)  # also unblocks a close that overran
+            kill(pid, SIGKILL)  # also unblocks a close that overran
         closer.join(5.0)
     assert finished, f"close() still running {CLOSE_TIMEOUT_S + 1.0} s after Chrome froze"
     # The warning proves the budget was actually hit, so the bound above isn't vacuous.
@@ -170,7 +178,7 @@ URL = "data:text/html,x"
 
 async def _ready(value: object) -> object:
     """Await a call's result when it is awaitable, so sync and async clients read alike."""
-    return await value if inspect.isawaitable(value) else value
+    return await value if isawaitable(value) else value
 
 
 async def _batch_failure(client: Any, url: str) -> object:
@@ -197,12 +205,12 @@ async def _assert_dead_chrome_is_named(client: Any) -> None:
     """
     for call in DEAD_CALLS.values():
         for _ in range(3):
-            started = time.perf_counter()
+            started = perf_counter()
             with pytest.raises(BaseException) as exc:  # a panic is a BaseException, so it shows
                 await _ready(call(client, URL))
-            assert time.perf_counter() - started < DEAD_CALL_S
+            assert perf_counter() - started < DEAD_CALL_S
             err = exc.value
-            assert isinstance(err, onyxweb.ChromeExitedError), f"{type(err).__name__}: {err}"
+            assert isinstance(err, ChromeExitedError), f"{type(err).__name__}: {err}"
             assert (err.kind, err.url) == ("chrome_exited", URL)
             assert "exited" in str(err) and "create a new" in str(err), str(err)
 
@@ -213,13 +221,13 @@ def _chrome_tree(root_pid: int) -> set[int]:
     process itself; the owning process below is a subprocess two levels removed).
     """
     try:
-        root = psutil.Process(root_pid)
+        root = Process(root_pid)
         candidates = [root, *root.children(recursive=True)]
-    except psutil.NoSuchProcess:
+    except NoSuchProcess:
         return set()
     tree: set[int] = set()
     for p in candidates:
-        with contextlib.suppress(psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        with suppress(NoSuchProcess, ZombieProcess, AccessDenied):
             if "chrome" in p.name().lower():
                 tree.add(p.pid)
     return tree
@@ -241,7 +249,7 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
     New test — nothing else in this suite kills an *external* process and checks
     OS-level survival of what it spawned.
     """
-    if engine == "full" and onyxweb.find_chrome(engine="full") is None:
+    if engine == "full" and find_chrome(engine="full") is None:
         pytest.skip("full Chrome is not installed")
     script = tmp_path / "spawn_client.py"
     ready = tmp_path / "ready"
@@ -252,28 +260,28 @@ def test_chrome_tree_does_not_survive_an_abrupt_kill_of_its_owning_process(
         f"open({str(ready)!r}, 'w').close()\n"
         "import time; time.sleep(60)\n"
     )
-    proc = subprocess.Popen([sys.executable, str(script)])
+    proc = Popen([sys.executable, str(script)])
     try:
-        deadline = time.monotonic() + 15.0
+        deadline = monotonic() + 15.0
         while not ready.exists():
-            assert time.monotonic() < deadline, "Client() in the subprocess never became ready"
-            time.sleep(0.1)
-        time.sleep(0.5)  # let the pool's tab finish opening (zygote/GPU/renderer too)
+            assert monotonic() < deadline, "Client() in the subprocess never became ready"
+            sleep(0.1)
+        sleep(0.5)  # let the pool's tab finish opening (zygote/GPU/renderer too)
         tree = _chrome_tree(proc.pid)
         assert tree, "expected the subprocess to have a live Chrome process tree"
         proc.kill()  # only the owning process — SIGKILL on POSIX, TerminateProcess on Windows
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and any(psutil.pid_exists(pid) for pid in tree):
-            time.sleep(0.05)
-        assert not any(psutil.pid_exists(pid) for pid in tree), f"orphaned Chrome survived: {tree}"
+        deadline = monotonic() + 5.0
+        while monotonic() < deadline and any(pid_exists(pid) for pid in tree):
+            sleep(0.05)
+        assert not any(pid_exists(pid) for pid in tree), f"orphaned Chrome survived: {tree}"
     finally:
         # A launch that never became ready is still running; kill it so the failure reports that,
         # rather than this wait timing out.
         proc.kill()
         proc.wait(timeout=5)
         for pid in _chrome_tree(proc.pid):
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                psutil.Process(pid).kill()
+            with suppress(NoSuchProcess, AccessDenied):
+                Process(pid).kill()
 
 
 # Client kwargs for a stub Chrome that exits before it is ready -> what the error must carry
@@ -300,8 +308,8 @@ def test_a_chrome_that_dies_at_launch_is_explained(tmp_path: Path, name: str) ->
     stub = tmp_path / "dies.sh"
     stub.write_text("#!/bin/sh\necho 'No usable sandbox!' >&2\nexit 1\n")
     stub.chmod(0o755)
-    with pytest.raises(onyxweb.OnyxwebError) as exc:
-        onyxweb.Client(chrome_path=str(stub), launch_timeout_ms=5000, **kwargs)
+    with pytest.raises(OnyxwebError) as exc:
+        Client(chrome_path=str(stub), launch_timeout_ms=5000, **kwargs)
     for fragment in says:
         assert fragment in str(exc.value), str(exc.value)
     for fragment in silent:
@@ -316,26 +324,26 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
     reaches this stage, which needs no bundled Chrome.
     """
     windows = sys.platform == "win32"
-    exits_at_once = shutil.which("hostname" if windows else "true")
+    exits_at_once = which("hostname" if windows else "true")
     assert exits_at_once, "no stub binary to copy"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    shutil.copy(exits_at_once, bin_dir / ("chrome.exe" if windows else "chrome"))
+    copy(exits_at_once, bin_dir / ("chrome.exe" if windows else "chrome"))
     probe = (
         "import onyxweb\n"
         "try:\n"
-        "    onyxweb.Client(launch_timeout_ms=5000)\n"
-        "except (onyxweb.OnyxwebError, TimeoutError) as e:\n"
+            "    onyxweb.Client(launch_timeout_ms=5000)\n"
+            "except (onyxweb.OnyxwebError, TimeoutError) as e:\n"
         "    print(e)\n"
         "else:\n"
         "    print('launched')\n"
     )
     env = {
-        **os.environ,
+        **environ,
         "ONYXWEB_PKG_DIR": str(tmp_path / "no-bundle"),
-        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "PATH": str(bin_dir) + pathsep + environ["PATH"],
     }
-    out = subprocess.run(
+    out = run(
         [sys.executable, "-c", probe],
         env=env,
         capture_output=True,
@@ -349,8 +357,6 @@ def test_chrome_found_only_on_path_is_resolved(tmp_path: Path) -> None:
         pytest.skip("a system Chrome shadows PATH")
     assert "not found" not in said.lower(), f"PATH was not searched: {said}"
 
-
-# --- installing ----------------------------------------------------------------
 
 _PLATFORM = "linux_x86_64"
 _SHELL_ZIP_BASE = "chrome-headless-shell-linux64"
@@ -367,7 +373,7 @@ def _fake_download_for(record: dict[str, object]) -> Callable[..., Path]:
     ) -> Path:
         record.update(internal_key=internal_key, engine=engine, dest_root=dest_root, force=force)
         cast(list[str], record.setdefault("engines", [])).append(engine)
-        record["thread"] = threading.current_thread()
+        record["thread"] = current_thread()
         return dest_root / internal_key / "chrome-headless-shell"
 
     return fake
@@ -392,7 +398,7 @@ def test_ensure_chrome_passes_its_arguments(
     monkeypatch.delenv("ONYXWEB_CHROME__ENGINE", raising=False)  # the default engine reads it
     rec: dict[str, object] = {}
     monkeypatch.setattr(dl, "download_for", _fake_download_for(rec))
-    out = onyxweb.ensure_chrome(**kwargs(tmp_path))
+    out = ensure_chrome(**kwargs(tmp_path))
     dest_root = tmp_path.resolve() if dest == "tmp" else dl.default_dest_dir().resolve()
     assert (rec["engine"], rec["dest_root"], rec["force"]) == (engine, dest_root, force)
     assert out == dest_root / dl.current_platform_key() / "chrome-headless-shell"
@@ -440,11 +446,11 @@ async def test_aensure_chrome_offloads_and_returns_path(
 ) -> None:
     rec: dict[str, object] = {}
     monkeypatch.setattr(dl, "download_for", _fake_download_for(rec))
-    out = await onyxweb.aensure_chrome(dest=tmp_path, engine="full")
+    out = await aensure_chrome(dest=tmp_path, engine="full")
     assert isinstance(out, Path)
     assert rec["engine"] == "full"
     # asyncio.to_thread ran the blocking download off the event-loop thread.
-    assert rec["thread"] is not threading.current_thread()
+    assert rec["thread"] is not current_thread()
 
 
 class _FakeResp:
@@ -469,8 +475,8 @@ class _FakeResp:
 
 
 def _zip_bytes(members: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
+    buf = BytesIO()
+    with ZipFile(buf, "w") as z:
         for name, data in members.items():
             z.writestr(name, data)
     return buf.getvalue()
@@ -486,7 +492,7 @@ def _serve(data: bytes, record: dict[str, object] | None = None) -> Callable[...
 
 
 def _refuse(url: str, timeout: float | None = None) -> _FakeResp:
-    raise urllib.error.URLError("name resolution failed")
+    raise URLError("name resolution failed")
 
 
 # Platform key, urlopen stand-in, message fragment. Every row also has a prior install.
@@ -513,9 +519,9 @@ def test_install_failure_is_contained(
     prior.parent.mkdir(parents=True)
     prior.write_bytes(b"PRIOR")
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
-    with pytest.raises(onyxweb.OnyxwebDownloadError, match=says) as exc:
+    with pytest.raises(OnyxwebDownloadError, match=says) as exc:
         dl.download_for(platform, engine="shell", dest_root=tmp_path, force=True, verbose=False)
-    assert isinstance(exc.value, onyxweb.OnyxwebError) and isinstance(exc.value, RuntimeError)
+    assert isinstance(exc.value, OnyxwebError) and isinstance(exc.value, RuntimeError)
     assert prior.read_bytes() == b"PRIOR", "a failed install damaged the prior one"
 
 
@@ -624,7 +630,7 @@ def test_download_engine_specs() -> None:
 
 
 def _unknown_platform() -> str:
-    raise onyxweb.OnyxwebDownloadError("unsupported host platform: FreeBSD/amd64")
+    raise OnyxwebDownloadError("unsupported host platform: FreeBSD/amd64")
 
 
 @pytest.mark.parametrize("state", ["absent", "present", "unknown_platform"])
@@ -633,7 +639,7 @@ def test_find_chrome(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
     if state == "unknown_platform":
         # A host app calls it to decide whether to download, on hosts we can't map too.
         monkeypatch.setattr(dl, "current_platform_key", _unknown_platform)
-        assert onyxweb.find_chrome(dest=tmp_path) is None
+        assert find_chrome(dest=tmp_path) is None
         return
     key = dl.current_platform_key()
     cft = dl.CFT_PLATFORM.get(key)
@@ -645,4 +651,4 @@ def test_find_chrome(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"x")
     expected = binary if state == "present" else None
-    assert onyxweb.find_chrome(dest=tmp_path, engine="shell") == expected
+    assert find_chrome(dest=tmp_path, engine="shell") == expected

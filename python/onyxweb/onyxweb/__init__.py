@@ -28,14 +28,15 @@ speed; no Python HTML parsing round-trip.
 
 from __future__ import annotations
 
-import json
-import os
-import threading
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import cached_property
+from json import dumps, loads
+from os import PathLike, environ
+from os.path import abspath, dirname
 from pathlib import Path
+from threading import Lock
 from typing import Any, Final, Literal, Protocol, overload
 
 from pydantic import BaseModel as _BaseModel
@@ -167,15 +168,10 @@ __all__ = [
 
 # Ensure the Rust side can locate the bundled chrome binary by pointing at this
 # package's installed directory.
-os.environ.setdefault(
+environ.setdefault(
     "ONYXWEB_PKG_DIR",
-    os.path.dirname(os.path.abspath(__file__)),
+    dirname(abspath(__file__)),
 )
-
-
-# ----------------------------------------------------------------------------
-# Result types
-# ----------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -491,7 +487,7 @@ def _make_render_result(raw: _RenderOutput | _FetchOutput) -> RenderResult:
         for m in raw.console_messages
     ]
     errors = [m.text for m in console_messages if m.type == "error"]
-    post_load_results = [json.loads(s) if s is not None else None for s in raw.post_load_results]
+    post_load_results = [loads(s) if s is not None else None for s in raw.post_load_results]
     return RenderResult(
         errors=errors,
         console_messages=console_messages,
@@ -783,16 +779,16 @@ class RenderResult:
             "anti_bot": asdict(self.anti_bot) if self.anti_bot else None,
         }
 
-    def save(self, path: str | os.PathLike[str]) -> None:
+    def save(self, path: str | PathLike[str]) -> None:
         """Write a JSON snapshot that `load` reads back without Chrome or the network.
 
         Args:
             path: Destination file, overwritten if it exists.
         """
-        Path(path).write_text(json.dumps(self.snapshot(), ensure_ascii=False), encoding="utf-8")
+        Path(path).write_text(dumps(self.snapshot(), ensure_ascii=False), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> RenderResult:
+    def load(cls, path: str | PathLike[str]) -> RenderResult:
         """Read a result written by `save`; its buckets, search and text work offline.
 
         Args:
@@ -806,7 +802,7 @@ class RenderResult:
         """
         fix = "write one with RenderResult.save()"
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data = loads(Path(path).read_text(encoding="utf-8"))
         except ValueError as ve:
             raise ValueError(f"{path} is not an onyxweb snapshot; {fix}.") from ve
         if not isinstance(data, dict) or SNAPSHOT_KEY not in data:
@@ -938,11 +934,6 @@ class FetchResult:
             f"FetchResult(html=<{len(self.html)} chars>, png=<{len(self.png)} bytes>, "
             f"final_url={self.final_url!r}, elapsed_s={self.elapsed_s:.3f})"
         )
-
-
-# ----------------------------------------------------------------------------
-# Client
-# ----------------------------------------------------------------------------
 
 
 #: Dotted paths into ClientConfig that can only be set at Client creation.
@@ -1161,12 +1152,8 @@ class Client:
         self.close()
 
 
-# ----------------------------------------------------------------------------
-# Module-level convenience (shared default Client, lazy-init, thread-safe)
-# ----------------------------------------------------------------------------
-
 _default_client: Client | None = None
-_default_client_lock = threading.Lock()
+_default_client_lock = Lock()
 
 
 def _get_default_client() -> Client:
@@ -1208,11 +1195,6 @@ def fetch_all(
         quality=quality,
         **overrides,
     )
-
-
-# ----------------------------------------------------------------------------
-# AsyncClient — async peer of Client
-# ----------------------------------------------------------------------------
 
 
 class AsyncClient:
@@ -1506,12 +1488,8 @@ class AsyncClient:
         await self.aclose()
 
 
-# ----------------------------------------------------------------------------
-# Module-level async convenience (shared default AsyncClient, lazy-init)
-# ----------------------------------------------------------------------------
-
 _default_async_client: AsyncClient | None = None
-_default_async_client_lock = threading.Lock()
+_default_async_client_lock = Lock()
 
 
 def _get_default_async_client() -> AsyncClient:
@@ -1565,11 +1543,6 @@ async def afetch_all(
         quality=quality,
         **overrides,
     )
-
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
 
 
 _SCREENSHOT_KWARGS = {
@@ -1629,11 +1602,6 @@ def _merge_fetch_config(base: FetchConfig | None, overrides: dict[str, Any]) -> 
             )
         data[k] = v
     return FetchConfig.model_validate(data)
-
-
-# ----------------------------------------------------------------------------
-# Live-mutable config view — returned by Client.config / AsyncClient.config
-# ----------------------------------------------------------------------------
 
 
 class _ClientLike(Protocol):

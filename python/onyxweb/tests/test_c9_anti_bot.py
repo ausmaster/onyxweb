@@ -16,15 +16,14 @@ wrong reason.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any
 
-import onyxweb
 import pytest
 from conftest import reloaded
-from onyxweb import AntiBot
+from onyxweb import AntiBot, Client, RenderResult
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -68,7 +67,7 @@ def _block(vendor: str | None) -> AntiBot:
 
 # Row -> (response served, verdict expected, premise the capture must meet or None).
 VERDICTS: dict[
-    str, tuple[Served, AntiBot | None, Callable[[onyxweb.RenderResult], bool] | None]
+    str, tuple[Served, AntiBot | None, Callable[[RenderResult], bool] | None]
 ] = {
     # --- no signal ---------------------------------------------------------
     "clean": (Served("<html><body>hello world</body></html>"), None, None),
@@ -308,13 +307,13 @@ VERDICTS: dict[
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1) as c:
+def client() -> Iterator[Client]:
+    with Client(concurrency=1) as c:
         yield c
 
 
 @pytest.mark.parametrize("row", list(VERDICTS))
-def test_verdict(client: onyxweb.Client, httpserver: HTTPServer, row: str) -> None:
+def test_verdict(client: Client, httpserver: HTTPServer, row: str) -> None:
     """Each response maps to its verdict; detection runs with bypass off."""
     served, expected, premise = VERDICTS[row]
     assert (len(served.body.encode()) > STUB_MAX_BYTES) == served.full, (
@@ -334,9 +333,6 @@ def test_verdict(client: onyxweb.Client, httpserver: HTTPServer, row: str) -> No
         assert premise(r), "the capture doesn't meet the row's premise"
     assert r.anti_bot == expected
     assert reloaded(r).anti_bot == expected  # the verdict survives a snapshot
-
-
-# --- bypass scenarios --------------------------------------------------------
 
 
 @dataclass
@@ -499,12 +495,12 @@ def test_bypass_scenario(httpserver: HTTPServer, name: str) -> None:
     site = s.site()
     httpserver.expect_request("/").respond_with_handler(site.handler)
     url = httpserver.url_for("/")
-    with onyxweb.Client(concurrency=1, **s.client) as client:
+    with Client(concurrency=1, **s.client) as client:
         for kwargs in s.fetches[:-1]:
             client.fetch(url, **kwargs)
-        started = time.perf_counter()
+        started = perf_counter()
         r = client.fetch(url, **s.fetches[-1])
-        elapsed = time.perf_counter() - started
+        elapsed = perf_counter() - started
     assert r.status_code == s.status
     assert s.shows in r
     assert r.anti_bot == s.verdict

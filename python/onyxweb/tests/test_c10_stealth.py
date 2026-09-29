@@ -10,12 +10,12 @@ just automation tells stripped at launch).
 
 from __future__ import annotations
 
-import json
-import re
 from collections.abc import Iterator
+from json import loads
+from re import findall, search
 
-import onyxweb
 import pytest
+from onyxweb import Client, OnyxwebError
 from onyxweb.download import CHROME_VERSION
 from onyxweb.presets.shell import stealth as shell_stealth
 from pytest_httpserver import HTTPServer
@@ -24,42 +24,37 @@ BLANK = "data:text/html,<html><body>x</body></html>"
 CHROME_MAJOR = CHROME_VERSION.split(".")[0]
 
 
-def _probe(client: onyxweb.Client, scripts: list[str]) -> list[object]:
+def _probe(client: Client, scripts: list[str]) -> list[object]:
     """Evaluate JS on a blank page, return each script's return value."""
     return client.fetch(BLANK, post_load_scripts=scripts).post_load_results
 
 
 def _brands_from_header(raw: str) -> set[tuple[str, str]]:
     """Parse a Sec-CH-UA header into ``{(brand, version)}`` pairs."""
-    return set(re.findall(r'"([^"]+)";v="(\d+)"', raw))
+    return set(findall(r'"([^"]+)";v="(\d+)"', raw))
 
 
 @pytest.fixture(scope="module")
-def basic() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1, **shell_stealth.BASIC) as c:
+def basic() -> Iterator[Client]:
+    with Client(concurrency=1, **shell_stealth.BASIC) as c:
         yield c
 
 
 @pytest.fixture(scope="module")
-def fingerprint() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1, **shell_stealth.FINGERPRINT) as c:
+def fingerprint() -> Iterator[Client]:
+    with Client(concurrency=1, **shell_stealth.FINGERPRINT) as c:
         yield c
 
 
 @pytest.fixture(scope="module")
-def plain() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1) as c:
+def plain() -> Iterator[Client]:
+    with Client(concurrency=1) as c:
         yield c
-
-
-# ----------------------------------------------------------------------------
-# UA / UA-CH metadata — the preset's own shape, and what it produces live
-# ----------------------------------------------------------------------------
 
 
 def test_basic_ua_matches_chrome_version_and_full_metadata() -> None:
     """BASIC_UA's major, and every brand's full version, must match CHROME_VERSION."""
-    m = re.search(r"Chrome/(\d+)", shell_stealth.BASIC_UA)
+    m = search(r"Chrome/(\d+)", shell_stealth.BASIC_UA)
     assert m is not None, f"BASIC_UA has no Chrome/<n>: {shell_stealth.BASIC_UA!r}"
     assert m.group(1) == CHROME_MAJOR
     brand_versions = {b["brand"]: b["version"] for b in shell_stealth.BASIC_UA_METADATA["brands"]}
@@ -72,7 +67,7 @@ def test_basic_ua_matches_chrome_version_and_full_metadata() -> None:
 
 
 def test_basic_identity_agrees_on_wire_js_and_client_hints(
-    basic: onyxweb.Client, httpserver: HTTPServer
+    basic: Client, httpserver: HTTPServer
 ) -> None:
     """The HeadlessChrome-free wire UA, navigator.userAgent, and both the wire
     and JS client-hint brands must all describe the same one identity."""
@@ -94,16 +89,11 @@ def test_basic_identity_agrees_on_wire_js_and_client_hints(
 
     preset_brands = {(b["brand"], b["version"]) for b in shell_stealth.BASIC_UA_METADATA["brands"]}
     wire_brands = _brands_from_header(request.headers.get("Sec-CH-UA") or "")
-    js_brands = {(b["brand"], b["version"]) for b in json.loads(str(r.post_load_results[1]))}
+    js_brands = {(b["brand"], b["version"]) for b in loads(str(r.post_load_results[1]))}
     assert wire_brands == js_brands == preset_brands
 
 
-# ----------------------------------------------------------------------------
-# navigator.webdriver — must read false (a real boolean), not undefined
-# ----------------------------------------------------------------------------
-
-
-def test_webdriver_reports_false_not_undefined(basic: onyxweb.Client) -> None:
+def test_webdriver_reports_false_not_undefined(basic: Client) -> None:
     """Real Chrome exposes `webdriver` as `false`; `undefined` means the
     property was deleted or shadowed — a state no shipping browser is in."""
     value, present = _probe(basic, ["navigator.webdriver", "'webdriver' in navigator"])
@@ -111,7 +101,7 @@ def test_webdriver_reports_false_not_undefined(basic: onyxweb.Client) -> None:
     assert value is False, f"expected false, got {value!r}"
 
 
-def test_webdriver_descriptor_matches_real_chrome(basic: onyxweb.Client) -> None:
+def test_webdriver_descriptor_matches_real_chrome(basic: Client) -> None:
     """The real descriptor is an enumerable, configurable accessor on the prototype."""
     (desc,) = _probe(
         basic,
@@ -121,10 +111,10 @@ def test_webdriver_descriptor_matches_real_chrome(basic: onyxweb.Client) -> None
         ],
     )
     assert desc is not None, "webdriver must stay an own property of Navigator.prototype"
-    assert json.loads(str(desc)) == {"e": True, "c": True, "g": "function"}
+    assert loads(str(desc)) == {"e": True, "c": True, "g": "function"}
 
 
-def test_webdriver_getter_and_tostring_report_native(basic: onyxweb.Client) -> None:
+def test_webdriver_getter_and_tostring_report_native(basic: Client) -> None:
     """The patched getter — and our patched `toString` itself — stringify to
     `[native code]`, closing the arrow-getter `.toString()` tell."""
     getter_src, tostring_src, value = _probe(
@@ -140,10 +130,6 @@ def test_webdriver_getter_and_tostring_report_native(basic: onyxweb.Client) -> N
     assert value is False
 
 
-# ----------------------------------------------------------------------------
-# WebGL — Chrome/ANGLE dialect, no SwiftShader leak, and a real context exists
-# ----------------------------------------------------------------------------
-
 _WEBGL_VENDOR = (
     "(() => {const g=document.createElement('canvas').getContext('webgl');"
     "const e=g.getExtension('WEBGL_debug_renderer_info');"
@@ -156,7 +142,7 @@ _WEBGL_RENDERER = (
 )
 
 
-def test_webgl_renderer_uses_chrome_angle_dialect(fingerprint: onyxweb.Client) -> None:
+def test_webgl_renderer_uses_chrome_angle_dialect(fingerprint: Client) -> None:
     """Chrome on Linux reports ANGLE-wrapped strings, not WebKit's bare names."""
     vendor, renderer = _probe(fingerprint, [_WEBGL_VENDOR, _WEBGL_RENDERER])
     assert isinstance(vendor, str) and isinstance(renderer, str)
@@ -164,7 +150,7 @@ def test_webgl_renderer_uses_chrome_angle_dialect(fingerprint: onyxweb.Client) -
     assert renderer.startswith("ANGLE ("), f"not the Chrome dialect: {renderer!r}"
 
 
-def test_webgl_spoof_does_not_leak_swiftshader(fingerprint: onyxweb.Client) -> None:
+def test_webgl_spoof_does_not_leak_swiftshader(fingerprint: Client) -> None:
     """A claimed hardware GPU must not sit next to SwiftShader's own strings."""
     (joined,) = _probe(
         fingerprint,
@@ -184,8 +170,8 @@ def test_full_engine_has_webgl_context() -> None:
     from onyxweb.presets.full import stealth as full_stealth
 
     try:
-        client = onyxweb.Client(navigation_timeout_ms=15_000, **full_stealth.BASIC)
-    except onyxweb.OnyxwebError as e:
+        client = Client(navigation_timeout_ms=15_000, **full_stealth.BASIC)
+    except OnyxwebError as e:
         if "not found" in str(e).lower():
             pytest.skip(f"full Chrome unavailable: {e}")
         raise
@@ -208,14 +194,14 @@ def test_full_engine_ua_names_the_real_host_platform(httpserver: HTTPServer) -> 
     the full engine's real, unspoofed identity. ``test_full_engine_has_webgl_context`` fetches a
     ``data:`` URL, which never touches the network, so there is no wire ``User-Agent`` to read.
     """
-    import platform as host_platform
+    from platform import system
 
     httpserver.expect_request("/").respond_with_data(
         "<html><body>x</body></html>", content_type="text/html"
     )
     try:
-        client = onyxweb.Client(engine="full", concurrency=1, navigation_timeout_ms=15_000)
-    except onyxweb.OnyxwebError as e:
+        client = Client(engine="full", concurrency=1, navigation_timeout_ms=15_000)
+    except OnyxwebError as e:
         if "not found" in str(e).lower():
             pytest.skip(f"full Chrome unavailable: {e}")
         raise
@@ -224,13 +210,9 @@ def test_full_engine_ua_names_the_real_host_platform(httpserver: HTTPServer) -> 
     finally:
         client.close()
     wire_ua = httpserver.log[0][0].headers.get("User-Agent") or ""
-    token = _HOST_PLATFORM_TOKEN[host_platform.system()]
-    assert token in wire_ua, f"{wire_ua!r} does not name {host_platform.system()}"
+    token = _HOST_PLATFORM_TOKEN[system()]
+    assert token in wire_ua, f"{wire_ua!r} does not name {system()}"
 
-
-# ----------------------------------------------------------------------------
-# Canvas — stable across navigations, and toDataURL agrees with getImageData
-# ----------------------------------------------------------------------------
 
 _CANVAS_HASH = (
     "(() => {const c=document.createElement('canvas');c.width=200;c.height=50;"
@@ -240,7 +222,7 @@ _CANVAS_HASH = (
 )
 
 
-def test_canvas_fingerprint_is_stable_across_sessions(fingerprint: onyxweb.Client) -> None:
+def test_canvas_fingerprint_is_stable_across_sessions(fingerprint: Client) -> None:
     """One identity's canvas hash must not change navigation to navigation —
     a per-session random seed would itself be the anomaly."""
     (first,) = _probe(fingerprint, [_CANVAS_HASH])
@@ -248,7 +230,7 @@ def test_canvas_fingerprint_is_stable_across_sessions(fingerprint: onyxweb.Clien
     assert first == second, "canvas hash changed between fetches"
 
 
-def test_canvas_readback_agrees_with_dataurl(fingerprint: onyxweb.Client) -> None:
+def test_canvas_readback_agrees_with_dataurl(fingerprint: Client) -> None:
     """If `toDataURL` is perturbed, `getImageData` must be perturbed identically —
     vendors compare the two read paths, and disagreement is noise no GPU produces."""
     (agree,) = _probe(
@@ -266,13 +248,8 @@ def test_canvas_readback_agrees_with_dataurl(fingerprint: onyxweb.Client) -> Non
     assert agree is True, "toDataURL and getImageData disagree about the same pixels"
 
 
-# ----------------------------------------------------------------------------
-# Client hints GREASE — the placeholder brand must match this Chrome's own
-# ----------------------------------------------------------------------------
-
-
 def test_ua_ch_grease_brand_matches_the_real_browser(
-    plain: onyxweb.Client, httpserver: HTTPServer
+    plain: Client, httpserver: HTTPServer
 ) -> None:
     """Chrome periodically rotates the GREASE placeholder; a current UA paired
     with a retired GREASE brand is a contradiction real Chrome never emits.
@@ -287,19 +264,14 @@ def test_ua_ch_grease_brand_matches_the_real_browser(
         post_load_scripts=["JSON.stringify(navigator.userAgentData.brands)"],
     )
     real = r.post_load_results[0]
-    real_brands = {(b["brand"], b["version"]) for b in json.loads(str(real))}
+    real_brands = {(b["brand"], b["version"]) for b in loads(str(real))}
     real_grease = {b for b in real_brands if "Brand" in b[0]}
     preset_brands = {(b["brand"], b["version"]) for b in shell_stealth.BASIC_UA_METADATA["brands"]}
     preset_grease = {b for b in preset_brands if "Brand" in b[0]}
     assert preset_grease == real_grease, f"preset {preset_grease} != browser {real_grease}"
 
 
-# ----------------------------------------------------------------------------
-# Screen geometry — a real desktop has chrome around the page
-# ----------------------------------------------------------------------------
-
-
-def test_screen_is_larger_than_the_viewport(plain: onyxweb.Client) -> None:
+def test_screen_is_larger_than_the_viewport(plain: Client) -> None:
     """screen > outer >= inner; headless leaves screen.height == innerHeight
     and availTop == 0, which is a one-line check."""
     sw, sh, iw, ih, avail_top = _probe(

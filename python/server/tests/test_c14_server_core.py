@@ -14,16 +14,17 @@ browser, so nothing here launches Chrome.
 
 from __future__ import annotations
 
-import logging
-import os
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import partial
+from logging import INFO
+from os import environ
 from typing import Any
 
 import onyxweb
 import pytest
 from conftest import PUBLIC
+from onyxweb import FetchResult, OnyxwebError, RenderResult
 from onyxweb.testing import FakeClient, FakeClientFactory
 from onyxweb_server.core import (
     MAX_WAIT_MS,
@@ -49,7 +50,7 @@ def _body(size: int, char: str = "x") -> str:
     return f"<html><body>{char * size}</body></html>"
 
 
-CDP_FAILED = onyxweb.OnyxwebError("CDP: boom")
+CDP_FAILED = OnyxwebError("CDP: boom")
 CDP_FAILED.kind = "cdp"  # the browser tags its errors; the core counts failures by this
 
 
@@ -413,7 +414,7 @@ class _Mortal(FakeClient):
             self._factory.left -= 1
             self.die()
 
-    async def fetch(self, url: str, **kwargs: Any) -> onyxweb.RenderResult:
+    async def fetch(self, url: str, **kwargs: Any) -> RenderResult:
         self._maybe_die()
         return await super().fetch(url, **kwargs)
 
@@ -421,7 +422,7 @@ class _Mortal(FakeClient):
         self._maybe_die()
         return await super().screenshot(url, **kwargs)
 
-    async def fetch_all(self, url: str, **kwargs: Any) -> onyxweb.FetchResult:
+    async def fetch_all(self, url: str, **kwargs: Any) -> FetchResult:
         self._maybe_die()
         return await super().fetch_all(url, **kwargs)
 
@@ -460,9 +461,9 @@ def _token(item: object) -> str:
     if isinstance(item, Exception):
         return type(item).__name__
     return {
-        onyxweb.RenderResult: "page",
+        RenderResult: "page",
         bytes: "image",
-        onyxweb.FetchResult: "both",
+        FetchResult: "both",
     }.get(type(item), "list")
 
 
@@ -485,7 +486,7 @@ async def test_a_core_call_gives_its_outcome_and_every_effect(
     try:
         options, shot = FetchOptions(**row.options), ShotOptions(**row.shot)
         got: Any
-        with caplog.at_level(logging.INFO, logger="onyxweb_server"):
+        with caplog.at_level(INFO, logger="onyxweb_server"):
             try:
                 if row.op == "batch":
                     got = await core.batch(list(row.urls), options)
@@ -563,8 +564,6 @@ async def test_a_core_call_gives_its_outcome_and_every_effect(
         await core.aclose()
 
 
-# --- clients across calls ---------------------------------------------------------------------
-
 # Steps (an engine is a fetch through it; "die" kills the newest client) -> the engines built in
 # order, the restarts, which clients ended closed, and the health after each step.
 SEQUENCES: dict[
@@ -605,9 +604,6 @@ async def test_clients_are_built_once_per_engine_and_replaced_when_dead(name: st
     assert core.stats()["restarts"] == restarts
     assert tuple(c.closed for _, c in factory.built) == closed
     assert seen == healths
-
-
-# --- the pages held ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -684,8 +680,8 @@ EVICTIONS: dict[str, Eviction] = {
 }
 
 
-def _capture(name: str, pad: int = 0) -> onyxweb.RenderResult:
-    return onyxweb.RenderResult(
+def _capture(name: str, pad: int = 0) -> RenderResult:
+    return RenderResult(
         f"<html><body>{name.upper()}_BODY{'x' * pad}</body></html>",
         final_url=PUBLIC + name.split("@")[0],
     )
@@ -727,8 +723,6 @@ def test_the_store_holds_at_most_its_caps(name: str) -> None:
             with pytest.raises(ValueError, match="fetch the URL again"):
                 core.page(page_id)
 
-
-# --- limits through their entry paths ---------------------------------------------------------
 
 # Environment (or, when empty, keyword arguments) -> the limits it sets, or the message refusing it.
 ENV: dict[str, tuple[dict[str, str], dict[str, Any], dict[str, Any] | str]] = {
@@ -796,7 +790,7 @@ def test_the_limits_come_from_the_environment_or_arguments(
     monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     variables, kwargs, expected = ENV[name]
-    for var in [v for v in os.environ if v.startswith("ONYXWEB_SERVER_")]:
+    for var in [v for v in environ if v.startswith("ONYXWEB_SERVER_")]:
         monkeypatch.delenv(var)
     for var, value in variables.items():
         monkeypatch.setenv(var, value)

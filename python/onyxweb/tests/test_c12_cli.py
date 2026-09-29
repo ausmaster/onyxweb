@@ -1,7 +1,8 @@
 """C12 CLI — arguments map to an exit code, stdout, stderr and written files.
 
-``main(argv)`` runs in-process against a local page. Exit codes follow the module
-docstring: 0 success, 1 bad argument, 2 fetch error. ``BAD_ARGUMENTS`` never reach
+``main(argv)`` runs in-process against a local page, and ``main()`` with no
+arguments runs the console script's entry. Exit codes follow the module docstring:
+0 success, 1 bad argument, 2 fetch error. ``BAD_ARGUMENTS`` never reach
 Chrome: each exits 1 with a usage line and a message naming the problem, never a
 traceback. ``OUTPUTS`` fetch the page and route HTML, JSON, metadata and images to
 stdout, stderr or files. One subprocess case proves ``python -m onyxweb`` starts. ``--json``
@@ -11,14 +12,14 @@ queries a saved snapshot offline: no Chrome, no network.
 
 from __future__ import annotations
 
-import json
-import struct
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from json import loads
 from pathlib import Path
+from struct import unpack
+from subprocess import run
 
 import pytest
 from conftest import BUCKET_PAGE, JPEG_MAGIC, PNG_MAGIC, is_webp
@@ -176,7 +177,7 @@ def test_output(
     if row.stdout == "html":
         htmls.append(run.out)
     elif row.stdout == "json":
-        data = json.loads(run.out)
+        data = loads(run.out)
         assert (data["status_code"], data["final_url"], data["errors"]) == (200, url, [])
         # A snapshot, and still every key the old --json printed.
         assert data["url"] == url
@@ -203,7 +204,7 @@ def test_output(
         assert ("JS_RAN" in html) == row.js
     if row.size is not None:
         data = (tmp_path / "shot.png").read_bytes()
-        assert struct.unpack(">II", data[16:24]) == row.size  # IHDR width, height
+        assert unpack(">II", data[16:24]) == row.size  # IHDR width, height
 
 
 def test_headers_reach_the_server(
@@ -297,7 +298,7 @@ def test_module_entry_point_runs(tmp_path: Path) -> None:
         (["--help"], "python -m onyxweb ["),
         (["page", "--help"], "python -m onyxweb page"),
     ):
-        p = subprocess.run(
+        p = run(
             [sys.executable, "-m", "onyxweb", *args],
             capture_output=True,
             text=True,
@@ -306,6 +307,14 @@ def test_module_entry_point_runs(tmp_path: Path) -> None:
         )
         assert p.returncode == 0, p.stderr
         assert p.stdout.startswith(f"usage: {usage}")
+
+
+def test_the_console_entry_needs_no_arguments(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``onyxweb = onyxweb.__main__:main`` calls ``main()`` with nothing; it must accept that."""
+    monkeypatch.setattr(sys, "argv", ["onyxweb", "--version"])
+    assert main() == 0
 
 
 # `onyxweb page` arguments ({snap} is the saved BUCKET_PAGE) -> exit code, stdout, stderr.

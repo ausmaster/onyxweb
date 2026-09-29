@@ -10,7 +10,7 @@ All knobs live under ``ClientConfig``. Pydantic-settings auto-loads from env
 
 from __future__ import annotations
 
-import re
+from re import compile
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -49,7 +49,7 @@ which is the supported CDP path for navigation referrer.
 
 
 # A URLPattern constructor string opens with its scheme: `*://`, `https:`, `data:`.
-_URL_PATTERN_SCHEME: Final = re.compile(r"[^:/?#]+:")
+_URL_PATTERN_SCHEME: Final = compile(r"[^:/?#]+:")
 
 
 def _validate_block_urls(v: list[str]) -> list[str]:

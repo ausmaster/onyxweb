@@ -12,21 +12,19 @@ redirect, an https navigation and a script that each aim at a private host must 
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import ipaddress
 import socket
+from asyncio import StreamReader, StreamWriter, open_connection, start_server, wait_for
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from typing import Any
 
-import onyxweb
 import pytest
+from onyxweb import FetchResult, OnyxwebError
 from onyxweb_server.core import CoreConfig, FetchOptions, Refused, ServerCore, check_url
 from onyxweb_server.egress import EgressProxy, is_public
 from pytest_httpserver import HTTPServer
-
-# --- the URL guard ----------------------------------------------------------------------------
 
 _SCHEME = "only http and https"
 # URL -> fragment of the refusal. A refusal names the fix, so each is checked for it too.
@@ -111,8 +109,6 @@ def test_the_url_guard_refuses_what_is_not_public(
     assert "public" in message or "http" in message, "the refusal doesn't say what to do"
 
 
-# --- the proxy --------------------------------------------------------------------------------
-
 HOSTS_PROXY = {
     "internal.test": ["10.1.2.3"],
     "mixed.test": ["93.184.216.34", "10.1.2.3"],
@@ -132,14 +128,14 @@ class Resolves:
         self.calls.append(host)
         if self._rebinding:  # public the first time, private the second: a DNS rebind
             answer = "93.184.216.34" if len(self.calls) == 1 else "10.0.0.1"
-            return [ipaddress.ip_address(answer)]
+            return [ip_address(answer)]
         try:
-            return [ipaddress.ip_address(host)]
+            return [ip_address(host)]
         except ValueError:
             pass
         if host not in HOSTS_PROXY:
             raise socket.gaierror(socket.EAI_NONAME, "unknown host")
-        return [ipaddress.ip_address(a) for a in HOSTS_PROXY[host]]
+        return [ip_address(a) for a in HOSTS_PROXY[host]]
 
 
 class Connects:
@@ -151,9 +147,9 @@ class Connects:
 
     async def __call__(
         self, host: str, port: int
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    ) -> tuple[StreamReader, StreamWriter]:
         self.calls.append((host, port))
-        return await asyncio.open_connection("127.0.0.1", self._port or port)
+        return await open_connection("127.0.0.1", self._port or port)
 
 
 class Upstream:
@@ -166,7 +162,7 @@ class Upstream:
         self.port = 0
 
     @classmethod
-    @contextlib.asynccontextmanager
+    @asynccontextmanager
     async def serving(cls, kind: str) -> AsyncIterator[Upstream]:
         """A loopback origin of `kind` ("http", "echo"), or a closed port ("down")."""
         origin = cls(echo=kind == "echo")
@@ -176,7 +172,7 @@ class Upstream:
                 origin.port = sock.getsockname()[1]
             yield origin
             return
-        server = await asyncio.start_server(origin._handle, "127.0.0.1", 0)
+        server = await start_server(origin._handle, "127.0.0.1", 0)
         origin.port = server.sockets[0].getsockname()[1]
         try:
             yield origin
@@ -184,7 +180,7 @@ class Upstream:
             server.close()
             await server.wait_closed()
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle(self, reader: StreamReader, writer: StreamWriter) -> None:
         self.connections += 1
         try:
             if self.echo:
@@ -351,21 +347,21 @@ async def test_a_request_through_the_proxy_gets_its_answer_and_effects(name: str
         proxy = EgressProxy(is_allowed=_ALLOW[row.allow], resolve=resolves, connect=connects)
         url = await proxy.start()
         host, port = url.removeprefix("http://").rsplit(":", 1)
-        reader, writer = await asyncio.open_connection(host, int(port))
+        reader, writer = await open_connection(host, int(port))
         try:
             writer.write(row.raw.replace("{port}", str(origin.port)).encode() + row.body)
             await writer.drain()
-            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+            head = await wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             assert int(head.split(b" ", 2)[1]) == row.status, head
             assert (REFUSED_HEADER in head) == row.refused
             if row.tunnel:
                 for message in row.tunnel:
                     writer.write(message)
                     await writer.drain()
-                    assert await asyncio.wait_for(reader.readexactly(len(message)), 5) == message
+                    assert await wait_for(reader.readexactly(len(message)), 5) == message
             else:
                 rest = b""
-                while chunk := await asyncio.wait_for(reader.read(65536), 5):
+                while chunk := await wait_for(reader.read(65536), 5):
                     rest += chunk  # returns only once the proxy closes the connection
                 if row.status == 200:
                     assert rest.endswith(b"ok"), rest
@@ -399,10 +395,7 @@ async def test_a_closed_proxy_takes_no_more_connections() -> None:
     await proxy.aclose()
     host, port = url.removeprefix("http://").rsplit(":", 1)
     with pytest.raises(OSError):
-        await asyncio.open_connection(host, int(port))
-
-
-# --- a real Chrome through the core -----------------------------------------------------------
+        await open_connection(host, int(port))
 
 
 @pytest.fixture
@@ -493,17 +486,17 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
         else:
             try:
                 outcome = await getattr(core, op)(start, options)
-            except (Refused, onyxweb.OnyxwebError) as failure:
+            except (Refused, OnyxwebError) as failure:
                 outcome = failure
         if row.refused:
             assert isinstance(outcome, Refused), outcome
             assert outcome.code == "refused_url"
         elif row.down:
-            assert isinstance(outcome, onyxweb.OnyxwebError), outcome
+            assert isinstance(outcome, OnyxwebError), outcome
             assert not isinstance(outcome, Refused)
         else:
             assert not isinstance(outcome, Exception), outcome
-            page = outcome.html if isinstance(outcome, onyxweb.FetchResult) else outcome
+            page = outcome.html if isinstance(outcome, FetchResult) else outcome
             for fragment in row.shows:
                 assert fragment in page.html, page.html[:300]
         assert core.stats()["egress_refusals"] == proxy.refusals
@@ -512,7 +505,7 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
     assert secret.log == [], f"the internal service was reached: {secret.log}"
     host, port = proxy.url.removeprefix("http://").rsplit(":", 1)
     with pytest.raises(OSError):  # closing the core closed the proxy with it
-        await asyncio.open_connection(host, int(port))
+        await open_connection(host, int(port))
     if name == "a_public_page_and_its_own_image_load":
         assert "/pic.png" in {req.path for req, _ in httpserver.log}  # the positive control
     if row.refused or row.probes:

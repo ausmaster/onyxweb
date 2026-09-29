@@ -8,7 +8,7 @@ use the real browser, which needs a Chrome from ``onyxweb --install``.
 
 from __future__ import annotations
 
-import socket
+from socket import socket
 
 import pytest
 from pytest_httpserver import HTTPServer
@@ -80,7 +80,7 @@ _SUBRESOURCES: dict[str, tuple[str, str]] = {
 @pytest.fixture
 def refused_url() -> str:
     """A URL on a closed local port: its navigation reaches Chrome and fails there."""
-    with socket.socket() as sock:
+    with socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"http://127.0.0.1:{port}/"

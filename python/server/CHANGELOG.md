@@ -4,6 +4,9 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Changed
+- `CoreConfig.from_env` takes its optional mapping as `env` instead of `environ`; a caller passing it by keyword must rename the argument.
+
 ## [0.1.1] - 2026-09-23
 
 ### Fixed

@@ -12,14 +12,14 @@ error — intended. Install chromium to run the suite.
 
 from __future__ import annotations
 
-import base64
-import socket
-import tempfile
+from base64 import b64encode
 from collections.abc import Callable
 from pathlib import Path
+from socket import socket
+from tempfile import TemporaryDirectory
 
-import onyxweb
 import pytest
+from onyxweb import RenderResult
 from pytest_httpserver import HTTPServer
 
 DataUrl = Callable[[bytes], str]
@@ -34,12 +34,12 @@ def is_webp(data: bytes) -> bool:
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
-def reloaded(r: onyxweb.RenderResult) -> onyxweb.RenderResult:
+def reloaded(r: RenderResult) -> RenderResult:
     """The result after a save and a load, as a caller who cached it would see it."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with TemporaryDirectory() as tmp:
         path = Path(tmp) / "page.json"
         r.save(path)
-        return onyxweb.RenderResult.load(path)
+        return RenderResult.load(path)
 
 
 @pytest.fixture
@@ -51,7 +51,7 @@ def data_url() -> DataUrl:
     """
 
     def _make(html: bytes) -> str:
-        return "data:text/html;base64," + base64.b64encode(html).decode()
+        return "data:text/html;base64," + b64encode(html).decode()
 
     return _make
 
@@ -62,7 +62,7 @@ def refused_url() -> str:
 
     Port 1 won't do — Chrome refuses it as unsafe before connecting.
     """
-    with socket.socket() as sock:
+    with socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"http://127.0.0.1:{port}/"

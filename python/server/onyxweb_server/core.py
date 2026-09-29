@@ -9,23 +9,23 @@ vocabulary.
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import logging
-import os
-import re
-import time
+from asyncio import Lock, gather, to_thread
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from logging import getLogger
+from os import environ
+from re import compile
+from time import monotonic
 from types import TracebackType
 from typing import Any, Final, Literal, Protocol, Self, TypeVar, cast
 from urllib.parse import urlsplit
 
 import onyxweb
-import pydantic
 from onyxweb import FetchResult, RenderResult
 from onyxweb.config import FetchConfig, ScreenshotConfig
+from pydantic import ValidationError
 
 from onyxweb_server.egress import REFUSED_HEADER, EgressProxy, is_public, resolve_host
 
@@ -40,9 +40,9 @@ MAX_BLOCKS: Final = 50  # URL patterns a caller may block per fetch
 WAIT_MODES: Final = ("load", "domcontentloaded")
 IMAGE_FORMATS: Final = ("png", "jpeg", "webp")
 MAX_VIEWPORT: Final = 4096  # widest and tallest screenshot viewport, in pixels
-PAGE_ID: Final = re.compile(r"p[0-9a-f]{10}")
+PAGE_ID: Final = compile(r"p[0-9a-f]{10}")
 MB: Final = 1024 * 1024
-log = logging.getLogger("onyxweb_server")
+log = getLogger("onyxweb_server")
 T = TypeVar("T")
 
 
@@ -72,8 +72,6 @@ class TooLarge(Refused):
 
     code = "too_large"
 
-
-# --- limits ------------------------------------------------------------------------------
 
 # CoreConfig field -> (environment variable, smallest allowed value).
 _LIMITS: Final = {
@@ -112,23 +110,23 @@ class CoreConfig:
                 )
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> CoreConfig:
+    def from_env(cls, env: Mapping[str, str] | None = None) -> CoreConfig:
         """Read the limits from ``ONYXWEB_SERVER_*``, keeping a default for each one not set.
 
         Raises:
             ValueError: If a variable is not a whole number, is below its minimum, or
                 ``ONYXWEB_SERVER_EGRESS`` is not 1 or 0.
         """
-        environ = os.environ if environ is None else environ
+        env = environ if env is None else env
         values: dict[str, Any] = {}
         for name, (var, smallest) in _LIMITS.items():
-            if var not in environ:
+            if var not in env:
                 continue
             try:
-                number = int(environ[var])
+                number = int(env[var])
             except ValueError as ve:
                 raise ValueError(
-                    f"{var} must be a whole number, got {environ[var]!r}; set it to a count."
+                    f"{var} must be a whole number, got {env[var]!r}; set it to a count."
                 ) from ve
             if number < smallest:
                 raise ValueError(
@@ -136,15 +134,12 @@ class CoreConfig:
                     "set it to how many the server should allow."
                 )
             values[name] = number
-        if EGRESS_VAR in environ:
-            flag = environ[EGRESS_VAR].strip().lower()
+        if EGRESS_VAR in env:
+            flag = env[EGRESS_VAR].strip().lower()
             if flag not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
-                raise ValueError(f"{EGRESS_VAR} must be 1 or 0, got {environ[EGRESS_VAR]!r}.")
+                raise ValueError(f"{EGRESS_VAR} must be 1 or 0, got {env[EGRESS_VAR]!r}.")
             values["egress"] = flag in ("1", "true", "yes", "on")
         return cls(**values)
-
-
-# --- what a caller may ask for -----------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -201,7 +196,7 @@ class FetchOptions:
         try:
             # The library's own validators: forbidden headers, and URLPatterns Chrome can parse.
             FetchConfig(extra_headers=dict(self.headers), block_urls=list(self.block_urls))
-        except pydantic.ValidationError as ve:
+        except ValidationError as ve:
             raise RefusedOption(
                 "; ".join(e["msg"].removeprefix("Value error, ") for e in ve.errors())
             ) from ve
@@ -266,9 +261,6 @@ class ShotOptions:
         return wanted
 
 
-# --- URL guard ---------------------------------------------------------------------------
-
-
 def check_url(url: str) -> None:
     """Refuse a URL the server must not fetch.
 
@@ -313,9 +305,6 @@ def _where(url: str) -> str:
         return "?"
 
 
-# --- the pages held ----------------------------------------------------------------------
-
-
 class PageStore:
     """Pages fetched this session; the least recently used goes first past either limit."""
 
@@ -348,10 +337,10 @@ class PageStore:
                 f"the page is {size} bytes, over the store's {self._max_bytes}; "
                 "raise ONYXWEB_SERVER_MAX_STORE_BYTES, or fetch a smaller page."
             )
-        digest = hashlib.sha256(f"{page.final_url}\n{page.html}".encode()).hexdigest()
+        digest = sha256(f"{page.final_url}\n{page.html}".encode()).hexdigest()
         page_id = f"p{digest[:10]}"
         self._pages.pop(page_id, None)
-        self._pages[page_id] = (page, time.monotonic(), size)
+        self._pages[page_id] = (page, monotonic(), size)
         while len(self._pages) > self._max or self.held_bytes > self._max_bytes:
             self._pages.popitem(last=False)
         return page_id
@@ -373,11 +362,8 @@ class PageStore:
 
     def newest_first(self) -> list[tuple[str, RenderResult, float]]:
         """Every page held as (id, page, age in seconds), without counting a use."""
-        now = time.monotonic()
+        now = monotonic()
         return [(i, p, now - t) for i, (p, t, _) in reversed(self._pages.items())]
-
-
-# --- browser clients ---------------------------------------------------------------------
 
 
 class BrowserClient(Protocol):
@@ -439,7 +425,7 @@ class ClientPool:
         # Only clients the pool builds itself go through the proxy; a caller's own are theirs.
         self._egress = egress if make is None else None
         self._clients: dict[str, BrowserClient] = {}
-        self._building = asyncio.Lock()
+        self._building = Lock()
         self.restarts = 0  # clients replaced because their Chrome died
 
     def _build(self, engine: str) -> BrowserClient:
@@ -467,7 +453,7 @@ class ClientPool:
                     self.restarts += 1
                     log.warning(f"chrome for engine={engine} died; starting a new one")
                     await client.aclose()
-                self._clients[engine] = await asyncio.to_thread(self._make or self._build, engine)
+                self._clients[engine] = await to_thread(self._make or self._build, engine)
             return self._clients[engine]
 
     def health(self) -> dict[str, bool]:
@@ -480,9 +466,6 @@ class ClientPool:
             await client.aclose()
         if self._egress is not None:
             await self._egress.aclose()
-
-
-# --- one call ----------------------------------------------------------------------------
 
 
 class _EgressWatch:
@@ -537,7 +520,7 @@ class _Call:
         self._summary = ""
 
     def __enter__(self) -> Self:
-        self._started = time.monotonic()
+        self._started = monotonic()
         self._core._requests += self._count
         return self
 
@@ -547,7 +530,7 @@ class _Call:
         failure: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        elapsed = f"{(time.monotonic() - self._started) * 1000:.0f}ms"
+        elapsed = f"{(monotonic() - self._started) * 1000:.0f}ms"
         head = f"{self._op} {self._label} engine={self._engine}"
         if failure is None:
             log.info(f"{head} ok in {elapsed}{self._summary}")
@@ -612,9 +595,6 @@ class _Call:
                 f"the {what} is {size} bytes, over the {limit} limit; "
                 "fetch a smaller page, or raise ONYXWEB_SERVER_MAX_PAGE_BYTES."
             )
-
-
-# --- the core ----------------------------------------------------------------------------
 
 
 class ServerCore:
@@ -749,7 +729,7 @@ class ServerCore:
                 return None
 
             watch = _EgressWatch(self._egress)
-            verdicts = await asyncio.gather(*(asyncio.to_thread(verdict, url) for url in urls))
+            verdicts = await gather(*(to_thread(verdict, url) for url in urls))
             allowed = [url for url, refusal in zip(urls, verdicts, strict=True) if refusal is None]
             fetched = await self._batch(allowed, options, wanted) if allowed else []
             pending = iter(fetched)
@@ -784,7 +764,7 @@ class ServerCore:
         retried, since a fetch is idempotent but a timeout would only repeat. A navigation the
         egress proxy refused (a redirect, or a start URL on a private address) is `RefusedUrl`.
         """
-        await asyncio.to_thread(self._guard, url)
+        await to_thread(self._guard, url)
         watch = _EgressWatch(self._egress)
         try:
             client = await self._pool.get(options.engine)

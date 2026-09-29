@@ -16,16 +16,16 @@ A target that resolves to any non-public address is refused with a ``403`` marke
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import logging
 import socket
 from collections.abc import Awaitable, Callable
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from logging import getLogger
 from typing import Final
 from urllib.parse import urlsplit
 
-log = logging.getLogger("onyxweb_server")
+log = getLogger("onyxweb_server")
 
-Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+Address = IPv4Address | IPv6Address
 Streams = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 REFUSED_HEADER: Final = "X-Onyxweb-Egress"
@@ -67,13 +67,13 @@ def resolve_host(host: str) -> list[Address]:
         OSError: If the name cannot be resolved.
     """
     try:
-        return [ipaddress.ip_address(host)]
+        return [ip_address(host)]
     except ValueError:
         pass
     # Decimal (2130706433) and octal (0177.0.0.1) forms are names to Python but 127.0.0.1
     # to Chrome, so anything that is not a plain literal goes through the resolver.
     found = socket.getaddrinfo(host, None)
-    return [ipaddress.ip_address(str(info[4][0]).split("%")[0]) for info in found]
+    return [ip_address(str(info[4][0]).split("%")[0]) for info in found]
 
 
 class _Bad(Exception):

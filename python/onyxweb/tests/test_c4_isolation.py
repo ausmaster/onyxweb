@@ -12,18 +12,17 @@ navigation, and checks the earlier fetch really differed from the fresh one.
 
 from __future__ import annotations
 
-import json
-import random
-import threading
-import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from json import dumps
+from random import Random
+from threading import Lock
+from time import sleep
 from typing import Any
 
-import onyxweb
 import pytest
-from onyxweb import Click
+from onyxweb import Click, Client, OnyxwebError
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -52,7 +51,7 @@ class Gauge:
 
     now: int = 0
     peak: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: Lock = field(default_factory=Lock)
 
 
 @pytest.fixture(scope="module")
@@ -63,14 +62,14 @@ def gauge() -> Gauge:
 @pytest.fixture(scope="module")
 def server(gauge: Gauge) -> Iterator[HTTPServer]:
     def slow(_request: Request) -> Response:
-        time.sleep(SLOW_S)
+        sleep(SLOW_S)
         return Response("<html><body>late</body></html>", content_type="text/html")
 
     def who(request: Request) -> Response:
         with gauge.lock:
             gauge.now += 1
             gauge.peak = max(gauge.peak, gauge.now)
-        time.sleep(0.3)  # long enough for the other fetch to arrive meanwhile
+        sleep(0.3)  # long enough for the other fetch to arrive meanwhile
         with gauge.lock:
             gauge.now -= 1
         return Response(f"<html><body>{request.args['id']}</body></html>", content_type="text/html")
@@ -95,7 +94,7 @@ def server(gauge: Gauge) -> Iterator[HTTPServer]:
 
 
 def _observe(
-    client: onyxweb.Client, server: HTTPServer, url: str, **kwargs: Any
+    client: Client, server: HTTPServer, url: str, **kwargs: Any
 ) -> dict[str, object]:
     """Fetch and record everything a leftover setting could change."""
     seen = len(server.log)
@@ -174,7 +173,7 @@ _SOAK_PICKS = [
     if not row.client and row.path == "/leak" and not row.then
     for kwargs in row.earlier
 ]
-LEAKS["mixed_soak"] = Leak(tuple(random.Random(1234).choices(_SOAK_PICKS, k=30)), times_out=False)
+LEAKS["mixed_soak"] = Leak(tuple(Random(1234).choices(_SOAK_PICKS, k=30)), times_out=False)
 
 LEAK_CASES = [
     (name, earlier)
@@ -195,12 +194,12 @@ def test_fetch_after_earlier_fetches_matches_a_fresh_client(
 ) -> None:
     row = LEAKS[name]
     control = server.url_for("/leak") + row.then
-    key = json.dumps([row.client, control], sort_keys=True)
+    key = dumps([row.client, control], sort_keys=True)
     if key not in fresh:
-        with onyxweb.Client(concurrency=1, **row.client) as new:
+        with Client(concurrency=1, **row.client) as new:
             fresh[key] = _observe(new, server, control)
     expected = fresh[key]
-    with onyxweb.Client(concurrency=1, **row.client) as client:
+    with Client(concurrency=1, **row.client) as client:
         for turn, kwargs in enumerate(row.earlier):
             if earlier == "times_out":
                 # A distinct URL each turn: Chrome's cache holds a repeat until the first ends.
@@ -220,7 +219,7 @@ def test_simultaneous_fetches_keep_their_own_settings(server: HTTPServer, gauge:
     """
     gauge.peak = 0
     seen = len(server.log)
-    with onyxweb.Client(concurrency=2) as client, ThreadPoolExecutor(max_workers=2) as pool:
+    with Client(concurrency=2) as client, ThreadPoolExecutor(max_workers=2) as pool:
         for _ in range(3):
             futures = {
                 who: pool.submit(
@@ -240,11 +239,11 @@ def test_simultaneous_fetches_keep_their_own_settings(server: HTTPServer, gauge:
     assert gauge.peak == 2, "the fetches never overlapped, so this proves nothing"
 
 
-def _full_client() -> onyxweb.Client:
+def _full_client() -> Client:
     """A full-engine Client; skips the test when full Chrome is absent."""
     try:
-        return onyxweb.Client(engine="full", concurrency=1, navigation_timeout_ms=20_000)
-    except onyxweb.OnyxwebError as e:
+        return Client(engine="full", concurrency=1, navigation_timeout_ms=20_000)
+    except OnyxwebError as e:
         if "not found" in str(e).lower():
             pytest.skip(f"full Chrome unavailable: {e}")
         raise
