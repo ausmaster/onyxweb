@@ -19,6 +19,7 @@ bad network, a bad archive or an unsupported platform: each raises
 
 from __future__ import annotations
 
+import signal
 import sys
 import urllib.request
 from collections.abc import Callable
@@ -29,7 +30,6 @@ from os import environ, getpid, kill, listdir, pathsep
 from os.path import isdir
 from pathlib import Path
 from shutil import copy, which
-from signal import SIGKILL, SIGSTOP
 from subprocess import Popen, run
 from threading import Thread, current_thread
 from time import monotonic, perf_counter, sleep
@@ -126,7 +126,7 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
     assert client.alive
     if killed:  # a Chrome that died under a live client is named on every call, then still closes
         for pid in launched:
-            kill(pid, SIGKILL)
+            kill(pid, signal.SIGKILL)
         assert _settled(launched, within_s=5.0), "Chrome survived SIGKILL"
         assert not client.alive
         await _assert_dead_chrome_is_named(client)
@@ -156,7 +156,7 @@ def test_close_is_bounded_when_chrome_stops_responding(
     launched = _chrome_children() - before
     assert launched, "expected this Client to start a Chrome process"
     for pid in launched:
-        kill(pid, SIGSTOP)  # a frozen Chrome never answers shutdown commands
+        kill(pid, signal.SIGSTOP)  # a frozen Chrome never answers shutdown commands
     # Close on a thread: an unbounded close then fails fast instead of hanging the run.
     closer = Thread(target=client.close, daemon=True)
     try:
@@ -165,7 +165,7 @@ def test_close_is_bounded_when_chrome_stops_responding(
         finished = not closer.is_alive()
     finally:
         for pid in launched:
-            kill(pid, SIGKILL)  # also unblocks a close that overran
+            kill(pid, signal.SIGKILL)  # also unblocks a close that overran
         closer.join(5.0)
     assert finished, f"close() still running {CLOSE_TIMEOUT_S + 1.0} s after Chrome froze"
     # The warning proves the budget was actually hit, so the bound above isn't vacuous.
