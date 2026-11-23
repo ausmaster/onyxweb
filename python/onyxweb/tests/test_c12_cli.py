@@ -234,7 +234,8 @@ def test_fetch_error_exits_2(capsys: pytest.CaptureFixture[str], refused_url: st
     run = _run([refused_url], capsys)
     assert run.code == 2
     assert run.err.startswith("onyxweb: ")
-    assert "ERR_CONNECTION_REFUSED" in run.err
+    # The message names the cause in words a person reads, not only Chrome's error code.
+    assert "nothing accepted a connection" in run.err
 
 
 def test_informational_flags(capsys: pytest.CaptureFixture[str]) -> None:

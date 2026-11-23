@@ -275,7 +275,7 @@ impl Buckets {
         bucket: &str,
         where_: Option<&str>,
         queries: Option<Vec<Query>>,
-    ) -> PyResult<Vec<PyObject>> {
+    ) -> PyResult<Vec<Py<PyAny>>> {
         check_request(bucket, where_)?;
         let matchers = compile(queries)?;
         self.core.with_parsed(|p| {
@@ -332,6 +332,23 @@ impl Buckets {
         Ok(self
             .core
             .with_parsed(|p| p.html.select(&sel).next().map(collect_text)))
+    }
+
+    /// The page's main content as text: navigation, headers, footers, asides and forms left
+    /// out, and the block holding the most non-link text chosen as the content.
+    ///
+    /// The same HTML always yields the same text — the choice is by score, with a tie going to
+    /// the earlier block in document order — because callers store this and compare against it.
+    fn main_text(&self) -> String {
+        self.core.with_parsed(|p| main_content(&p.html))
+    }
+
+    /// The date the page states it was published, as ``(YYYY-MM-DD, source)``.
+    ///
+    /// Checked in one fixed order — JSON-LD, then a date `<meta>`, then `<time datetime>` — so
+    /// a page with several claims always reports the same one. `None` when it states none.
+    fn published(&self) -> Option<(String, String)> {
+        self.core.with_parsed(|p| published_date(&p.html))
     }
 
     /// Every bucket sized from the parse, building no record: display-ordered
@@ -394,7 +411,7 @@ impl Buckets {
         width: usize,
         where_: Option<&str>,
         queries: Option<Vec<Query>>,
-    ) -> PyResult<Vec<PyObject>> {
+    ) -> PyResult<Vec<Py<PyAny>>> {
         check_request(bucket, where_)?;
         let matchers = compile(queries)?;
         self.core.with_parsed(|p| {
@@ -456,7 +473,7 @@ impl Buckets {
         where_: Option<&str>,
         queries: Option<Vec<Query>>,
         width: Option<usize>,
-    ) -> PyResult<Vec<PyObject>> {
+    ) -> PyResult<Vec<Py<PyAny>>> {
         check_request(bucket, where_)?;
         let matchers = compile(queries)?;
         let Some(target) = compile(Some(vec![query]))?.pop() else {
@@ -1112,7 +1129,7 @@ struct Row {
 }
 
 /// A table row as the Python renderer reads it.
-fn table_row(py: Python<'_>, row: Row) -> PyResult<PyObject> {
+fn table_row(py: Python<'_>, row: Row) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     d.set_item("index", row.index)?;
     d.set_item("where", row.side)?;
@@ -1123,7 +1140,7 @@ fn table_row(py: Python<'_>, row: Row) -> PyResult<PyObject> {
 }
 
 /// Decode a `serde_json::Value` into Python natives.
-fn json_to_py(py: Python<'_>, v: &Value) -> PyResult<PyObject> {
+fn json_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
     Ok(match v {
         Value::Null => py.None(),
         Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any().unbind(),
@@ -1350,6 +1367,237 @@ fn push_text(out: &mut String, text: &str, raw: bool) {
             out.push(' ');
         }
     }
+}
+
+/// Tags whose text is code or data, never content.
+const TEXT_SKIP: &[&str] = &["script", "style", "noscript", "template"];
+
+/// Tags that are furniture around a page's content.
+const FURNITURE_TAGS: &[&str] = &[
+    "nav", "header", "footer", "aside", "form", "button", "select", "svg",
+];
+
+/// Landmark roles that mark furniture, whatever the tag.
+const FURNITURE_ROLES: &[&str] = &[
+    "navigation",
+    "banner",
+    "contentinfo",
+    "complementary",
+    "search",
+];
+
+/// True when `e` is part of the furniture around the content rather than the content.
+fn is_furniture(e: &ElementRef<'_>) -> bool {
+    let v = e.value();
+    FURNITURE_TAGS.contains(&v.name())
+        || v.attr("role")
+            .is_some_and(|role| FURNITURE_ROLES.contains(&role))
+        || v.attr("aria-hidden") == Some("true")
+}
+
+/// Characters of text in `e` that are neither link text nor furniture: the score that picks the
+/// content block. A page's navigation and menus are made of links, so they score nothing.
+fn content_score(e: ElementRef<'_>) -> usize {
+    let mut score = 0;
+    for node in e.children() {
+        match node.value() {
+            Node::Text(t) => score += t.text.trim().len(),
+            Node::Element(el) => {
+                if el.name() == "a" || TEXT_SKIP.contains(&el.name()) {
+                    continue;
+                }
+                let Some(child) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                if !is_furniture(&child) {
+                    score += content_score(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    score
+}
+
+/// Every element a content block could be, for a page with no landmark to point at one.
+fn content_candidates(html: &Html) -> Vec<ElementRef<'_>> {
+    let body = Selector::parse("body").ok();
+    let root = body
+        .as_ref()
+        .and_then(|s| html.select(s).next())
+        .unwrap_or_else(|| html.root_element());
+    root.descendants().filter_map(ElementRef::wrap).collect()
+}
+
+/// The element holding the page's content: a landmark when the page marks one, otherwise the
+/// block with the most non-link text. A tie keeps the earlier block, so the choice is stable.
+fn content_root(html: &Html) -> Option<ElementRef<'_>> {
+    let marked = Selector::parse("main, [role=\"main\"], article").ok();
+    let candidates = marked
+        .as_ref()
+        .map(|sel| {
+            html.select(sel)
+                .filter(|e| !is_furniture(e))
+                .collect::<Vec<_>>()
+        })
+        .filter(|found| !found.is_empty())
+        .unwrap_or_else(|| content_candidates(html));
+    let (score, chosen) =
+        candidates
+            .into_iter()
+            .fold(None::<(usize, ElementRef<'_>)>, |best, e| {
+                let score = content_score(e);
+                match best {
+                    Some((best_score, _)) if best_score >= score => best,
+                    _ => Some((score, e)),
+                }
+            })?;
+    Some(descend_to_text(chosen, score))
+}
+
+/// Follow the one child that holds nearly all of `e`'s text, if there is one.
+///
+/// A wrapper scores at least as high as everything inside it, so the highest score alone would
+/// always pick the outermost box — `<body>` around one article. Where a single child holds the
+/// content, that child is the content; where the text is spread across children (a real
+/// article), the walk stops at the block that holds them all.
+fn descend_to_text<'a>(mut chosen: ElementRef<'a>, mut score: usize) -> ElementRef<'a> {
+    loop {
+        let next = chosen
+            .children()
+            .filter_map(ElementRef::wrap)
+            .find(|child| {
+                !is_furniture(child) && !TEXT_SKIP.contains(&child.value().name()) && {
+                    let inner = content_score(*child);
+                    inner > 0 && inner * 10 >= score * 9
+                }
+            });
+        let Some(child) = next else {
+            return chosen;
+        };
+        score = content_score(child);
+        chosen = child;
+    }
+}
+
+/// Append `e`'s text, leaving out furniture and code.
+fn walk_content(e: ElementRef<'_>, out: &mut String, pre: usize) {
+    for node in e.children() {
+        match node.value() {
+            Node::Text(t) => push_text(out, &t.text, pre > 0),
+            Node::Element(el) => {
+                if TEXT_SKIP.contains(&el.name()) {
+                    continue;
+                }
+                let Some(child) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                if is_furniture(&child) {
+                    continue;
+                }
+                let sep = separator(el.name());
+                push_sep(out, sep);
+                walk_content(child, out, pre + usize::from(el.name() == "pre"));
+                push_sep(out, sep);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The page's main content, as text.
+fn main_content(html: &Html) -> String {
+    match content_root(html) {
+        Some(root) => {
+            let mut out = String::new();
+            walk_content(root, &mut out, 0);
+            out.trim().to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Keys a page states its own date under, in the order they are trusted.
+const DATE_KEYS: &[&str] = &[
+    "article:published_time",
+    "datepublished",
+    "datecreated",
+    "date",
+    "pubdate",
+    "publish-date",
+    "dc.date",
+];
+
+/// The first `YYYY-MM-DD` in `raw`, which is how every source below states a date.
+fn iso_date(raw: &str) -> Option<String> {
+    let b = raw.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    for i in 0..=b.len() - 10 {
+        let w = &b[i..i + 10];
+        let digits = |r: std::ops::Range<usize>| w[r].iter().all(u8::is_ascii_digit);
+        if w[4] == b'-' && w[7] == b'-' && digits(0..4) && digits(5..7) && digits(8..10) {
+            return Some(raw[i..i + 10].to_string());
+        }
+    }
+    None
+}
+
+/// A date inside decoded JSON-LD, looking in the usual keys and then nested values.
+fn json_date(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in ["datePublished", "dateCreated", "uploadDate"] {
+                if let Some(Value::String(s)) = map.get(key)
+                    && let Some(date) = iso_date(s)
+                {
+                    return Some(date);
+                }
+            }
+            map.values().find_map(json_date)
+        }
+        Value::Array(items) => items.iter().find_map(json_date),
+        _ => None,
+    }
+}
+
+/// The date the page states it was published, and which source said it: JSON-LD, then a date
+/// `<meta>`, then `<time datetime>`. One fixed order, so a page claiming several reports one.
+fn published_date(html: &Html) -> Option<(String, String)> {
+    if let Ok(sel) = Selector::parse(r#"script[type="application/ld+json"]"#) {
+        for block in html.select(&sel) {
+            let raw = collect_text(block);
+            if let Ok(value) = serde_json::from_str::<Value>(&raw)
+                && let Some(date) = json_date(&value)
+            {
+                return Some((date, "json_ld".to_string()));
+            }
+        }
+    }
+    if let Ok(sel) = Selector::parse("meta") {
+        for meta in html.select(&sel) {
+            let v = meta.value();
+            let name = v
+                .attr("property")
+                .or_else(|| v.attr("name"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if DATE_KEYS.contains(&name.as_str())
+                && let Some(date) = v.attr("content").and_then(iso_date)
+            {
+                return Some((date, "meta".to_string()));
+            }
+        }
+    }
+    if let Ok(sel) = Selector::parse("time[datetime]") {
+        for time in html.select(&sel) {
+            if let Some(date) = time.value().attr("datetime").and_then(iso_date) {
+                return Some((date, "time".to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Translate BS4-style kwargs into a single CSS selector.

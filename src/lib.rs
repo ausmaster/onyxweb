@@ -44,6 +44,12 @@ fn init_logger() {
         .try_init();
 }
 
+/// Every failure kind the library can raise, for a front-end that must map each one.
+#[pyfunction]
+fn _error_kinds() -> Vec<&'static str> {
+    error::ALL_KINDS.to_vec()
+}
+
 /// Change Rust-side log level at runtime. Called from Python's
 /// `onyxweb.set_log_level()`. Accepts: trace | debug | info | warn | error | off.
 #[pyfunction]
@@ -66,7 +72,9 @@ fn _set_rust_log_level(level: &str) -> PyResult<()> {
     Ok(())
 }
 
-#[pymodule]
+// PyO3 0.28 made modules declare they run without the GIL by default. onyxweb is untested on a
+// free-threaded interpreter, so the module still asks one to turn the GIL on, as it did before.
+#[pymodule(gil_used = true)]
 #[pyo3(name = "_onyxweb")]
 fn onyxweb_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_logger();
@@ -91,5 +99,6 @@ fn onyxweb_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<error::QueueTimeoutError>(),
     )?;
     m.add_function(wrap_pyfunction!(_set_rust_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(_error_kinds, m)?)?;
     Ok(())
 }

@@ -369,7 +369,7 @@ async def test_parallel_calls_fill_the_pool_and_no_more(
     for url, r in zip(urls, results, strict=True):
         if url == refused_url:
             assert isinstance(r, OnyxwebError), repr(r)
-            assert r.kind == "cdp"
+            assert r.kind == "connection_refused"  # a closed port, not "the browser broke"
         else:
             assert isinstance(r, RenderResult), repr(r)
             assert "SLOW_PAGE" in r

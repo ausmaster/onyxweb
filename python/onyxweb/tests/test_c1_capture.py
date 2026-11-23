@@ -425,6 +425,54 @@ def tserver() -> Iterator[HTTPServer]:
         yield server
 
 
+def _self_navigating(server: HTTPServer) -> str:
+    """A page whose own script replaces it after ``?d=<ms>``, as a redirect page does."""
+
+    def handler(request: Request) -> Response:
+        if request.path == "/landed":
+            return Response(
+                "<html><head><title>landed</title></head><body>LANDED</body></html>",
+                content_type="text/html",
+            )
+        delay = int(request.args.get("d", "0"))
+        return Response(
+            "<html><head><title>leaving</title></head><body>LEAVING<script>"
+            f"setTimeout(() => location.replace('/landed'), {delay});</script></body></html>",
+            content_type="text/html",
+        )
+
+    server.expect_request("/leaving").respond_with_handler(handler)
+    server.expect_request("/landed").respond_with_handler(handler)
+    return server.url_for("/leaving")
+
+
+@pytest.mark.parametrize("engine", ["shell", "full"])
+def test_a_page_that_replaces_itself_at_the_wait_point_is_captured_whole(
+    tserver: HTTPServer, engine: str
+) -> None:
+    """A page that navigates itself just as it is read gives one whole page, never an error.
+
+    Whichever document the capture lands on, its URL, status and HTML describe that one
+    document. A read of the document being replaced used to fail with ``Cannot find context
+    with specified id`` or come back empty.
+
+    New test: a race needs a sweep of timings around the capture point, not one row.
+    """
+    leaving = _self_navigating(tserver)
+    with Client(concurrency=1, engine=engine) as client:
+        for _ in range(3):
+            for wait in (0, 300):
+                for skew in (-20, -5, 0, 5, 20):
+                    url = f"{leaving}?d={max(0, wait + skew)}"
+                    r = client.fetch(url, wait_after_ms=wait, timeout_ms=15_000)
+                    assert r.status_code == 200, (url, r.status_code)
+                    if r.final_url.endswith("/landed"):
+                        assert r.title == "landed" and "LANDED" in r, (url, r.title)
+                    else:
+                        assert r.final_url == url, (url, r.final_url)
+                        assert r.title == "leaving" and "LEAVING" in r, (url, r.title)
+
+
 def _serve_iframe_page(server: HTTPServer) -> str:
     server.expect_request("/iframe").respond_with_data(
         "<html><body>main<iframe src='/slow'></iframe></body></html>", content_type="text/html"

@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from ipaddress import ip_address
+from threading import Thread
 from typing import Any
 
 import pytest
@@ -407,6 +408,54 @@ def secret() -> Iterator[HTTPServer]:
         yield server
 
 
+class Datagrams:
+    """A UDP socket on the internal host that counts what reaches it."""
+
+    def __init__(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.2", 0))
+        self.sock.settimeout(0.1)
+        self.port: int = self.sock.getsockname()[1]
+        self.received = 0
+        self._open = True
+        self._thread = Thread(target=self._count, daemon=True)
+        self._thread.start()
+
+    def _count(self) -> None:
+        while self._open:
+            try:
+                self.sock.recvfrom(2048)
+                self.received += 1
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+
+    def close(self) -> None:
+        self._open = False
+        self._thread.join()
+        self.sock.close()
+
+
+@pytest.fixture
+def datagrams() -> Iterator[Datagrams]:
+    """The internal host's UDP side: a page's WebRTC aims here, around any proxy."""
+    canary = Datagrams()
+    yield canary
+    canary.close()
+
+
+# A page's WebRTC sends STUN over UDP, which no proxy carries: only the browser itself can stop it.
+_WEBRTC = (
+    "<html><body>PUBLIC_OK<script>"
+    "const pc = new RTCPeerConnection({iceServers: [{urls: 'stun:127.0.0.2:{stun_port}'}]});"
+    "pc.createDataChannel('x');"
+    "pc.createOffer().then(o => pc.setLocalDescription(o))"
+    ".then(() => document.body.append('ICE_STARTED'));"
+    "</script></body></html>"
+)
+
+
 @dataclass(frozen=True)
 class Attack:
     """A page the public origin serves, and what the fetch must do with it."""
@@ -419,6 +468,8 @@ class Attack:
     wait_ms: int = 0
     shows: tuple[str, ...] = ()  # fragments the fetched page must carry
     extra: dict[str, str] = field(default_factory=dict)  # more public paths: path -> html
+    udp: bool = False  # the page aims UDP at the private host, which the proxy never sees
+    engine: str = "full"
 
 
 ATTACKS: dict[str, Attack] = {
@@ -446,18 +497,25 @@ ATTACKS: dict[str, Attack] = {
     "an_https_url_on_a_private_host_is_refused": Attack(
         "", start="https://127.0.0.2:{secret_port}/", refused=True
     ),
+    "a_page_s_webrtc_cannot_reach_a_private_host": Attack(
+        _WEBRTC, wait_ms=2500, shows=("PUBLIC_OK", "ICE_STARTED"), udp=True
+    ),
+    "a_page_s_webrtc_cannot_reach_a_private_host_on_the_shell_engine": Attack(
+        _WEBRTC, wait_ms=2500, shows=("PUBLIC_OK", "ICE_STARTED"), udp=True, engine="shell"
+    ),
 }
 
 
 @pytest.mark.parametrize("op", ["fetch", "batch", "fetch_all"])
 @pytest.mark.parametrize("name", list(ATTACKS))
 async def test_a_browser_cannot_reach_a_private_host_through_the_core(
-    httpserver: HTTPServer, secret: HTTPServer, name: str, op: str
+    httpserver: HTTPServer, secret: HTTPServer, datagrams: Datagrams, name: str, op: str
 ) -> None:
     row = ATTACKS[name]
     origin = f"http://127.0.0.2:{secret.port}"
     httpserver.expect_request("/page").respond_with_data(
-        row.page.replace("{secret}", origin), content_type="text/html"
+        row.page.replace("{secret}", origin).replace("{stun_port}", str(datagrams.port)),
+        content_type="text/html",
     )
     httpserver.expect_request("/pic.png").respond_with_data(b"", content_type="image/png")
     httpserver.expect_request("/go").respond_with_data(
@@ -478,7 +536,7 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
     # test server is loopback, so the proxy is what stands between the browser and the secret.
     proxy = EgressProxy(is_allowed=_ALLOW["reachable"])
     core = ServerCore(egress=proxy, url_guard=lambda url: None, config=CoreConfig(egress=True))
-    options = FetchOptions(wait_ms=row.wait_ms)
+    options = FetchOptions(wait_ms=row.wait_ms, engine=row.engine)
     outcome: Any
     try:
         if op == "batch":  # a batch returns the same refusal in the URL's place
@@ -503,6 +561,7 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
     finally:
         await core.aclose()
     assert secret.log == [], f"the internal service was reached: {secret.log}"
+    assert datagrams.received == 0, f"{datagrams.received} datagram(s) reached the internal host"
     host, port = proxy.url.removeprefix("http://").rsplit(":", 1)
     with pytest.raises(OSError):  # closing the core closed the proxy with it
         await open_connection(host, int(port))
@@ -510,5 +569,5 @@ async def test_a_browser_cannot_reach_a_private_host_through_the_core(
         assert "/pic.png" in {req.path for req, _ in httpserver.log}  # the positive control
     if row.refused or row.probes:
         assert proxy.refusals >= 1, "the proxy never saw the attempt, so this proves nothing"
-    else:
+    elif not row.udp:  # STUN may also try TURN-style TCP through the proxy, which it refuses
         assert proxy.refusals == 0

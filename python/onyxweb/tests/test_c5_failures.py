@@ -12,8 +12,10 @@ that fails is not the page failing.
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Thread
 from time import perf_counter, sleep
 from typing import Any, Literal
@@ -49,6 +51,10 @@ def server() -> Iterator[HTTPServer]:
         s.expect_request("/slow").respond_with_handler(_slow)
         s.expect_request("/ok").respond_with_data(
             "<html><body>ok</body></html>", content_type="text/html"
+        )
+        # A redirect that only ever points at itself: Chrome gives up on the loop.
+        s.expect_request("/loop").respond_with_response(
+            Response(status=302, headers={"Location": "/loop"})
         )
         yield s
 
@@ -90,9 +96,20 @@ FAILURES: dict[str, Failure] = {
         "example.com", OnyxwebError, "invalid_url", ("https://",)
     ),
     "invalid_url_empty_host": Failure("http://", OnyxwebError, "invalid_url"),
-    # Reaches Chrome and fails in its network stack.
+    # Reaches Chrome and fails in its network stack: each cause the browser names gets its
+    # own kind, so a caller branches on what happened rather than on "browser trouble".
     "connection_refused": Failure(
-        REFUSED, OnyxwebError, "cdp", ("ERR_CONNECTION_REFUSED",)
+        REFUSED, OnyxwebError, "connection_refused", ("nothing accepted a connection",)
+    ),
+    "a_host_that_does_not_resolve": Failure(
+        "https://this-host-does-not-exist-onyxweb.invalid/",
+        OnyxwebError,
+        "dns_failure",
+        ("cannot resolve",),
+        within_s=5.0,
+    ),
+    "a_redirect_that_only_points_at_itself": Failure(
+        "/loop", OnyxwebError, "redirect_loop", ("redirected too many times",), within_s=5.0
     ),
     # The message carries the URL, the awaited lifecycle event and the timeout.
     "navigation_stuck": Failure(
@@ -281,3 +298,82 @@ def test_subframe_failure_is_not_page_failure(
     r = client.fetch(httpserver.url_for("/"), wait_after_ms=500)
     assert r.status_code == 200
     assert _MAIN in r
+
+
+# Error statuses an origin can answer with and then send no body at all for. Chrome refuses
+# to render such a response and fails the navigation, so the status must survive as the cause.
+_EMPTY_STATUSES = {"not_found": 404, "too_many_requests": 429, "unavailable": 503}
+
+
+@pytest.mark.parametrize(("name", "status"), list(_EMPTY_STATUSES.items()))
+def test_an_empty_error_status_is_the_origins_answer(
+    httpserver: HTTPServer, name: str, status: int
+) -> None:
+    """An error status with no body is ``http_status`` carrying the origin's code.
+
+    New test: ``FAILURES`` drives one shell client for every cause, and only the full engine
+    loses the status (the shell completes the navigation), so this needs a client of its own —
+    and a positive control that the same status *with* a body is still an ordinary page.
+    """
+    httpserver.expect_request(f"/empty-{name}").respond_with_data(
+        "", status=status, content_type="text/html"
+    )
+    httpserver.expect_request(f"/body-{name}").respond_with_data(
+        "<p>a body</p>", status=status, content_type="text/html"
+    )
+    httpserver.expect_request("/ok").respond_with_data(
+        "<html><body>ok</body></html>", content_type="text/html"
+    )
+    with Client(engine="full", concurrency=1) as client:
+        with pytest.raises(OnyxwebError) as exc:
+            client.fetch(httpserver.url_for(f"/empty-{name}"))
+        err = exc.value
+        assert not isinstance(err, TimeoutError)  # a refusal is not a timeout
+        assert err.kind == "http_status"
+        assert err.status_code == status  # the origin's own code
+        assert err.url == httpserver.url_for(f"/empty-{name}")
+        assert str(status) in str(err), str(err)
+        # The same status with a body is the page the origin sent, however unwelcome.
+        page = client.fetch(httpserver.url_for(f"/body-{name}"))
+        assert (page.status_code, page.text.strip()) == (status, "a body")
+        # A failed navigation leaves the tab serving.
+        assert "ok" in client.fetch(httpserver.url_for("/ok"))
+
+
+def test_the_shell_engine_renders_an_empty_error_status(httpserver: HTTPServer) -> None:
+    """The shell finishes the navigation the full engine aborts, so it returns the empty page.
+
+    New test: the difference is the engines', not onyxweb's, and a caller choosing ``shell``
+    must see it stated — the status is still right, there is simply no ``http_status`` cause.
+    """
+    httpserver.expect_request("/empty").respond_with_data(
+        "", status=429, content_type="text/html"
+    )
+    with Client(engine="shell", concurrency=1) as client:
+        page = client.fetch(httpserver.url_for("/empty"))
+    assert page.status_code == 429
+    assert page.text == ""
+
+
+def test_a_refused_certificate_is_not_a_browser_fault() -> None:
+    """A certificate Chrome rejects is ``tls_failure``, naming the switch that allows it.
+
+    New test: it needs an HTTPS server, which no other case here uses. It also pins the one
+    setting that decides whether certificates are checked at all — the default trusts them
+    (Chromium's own client does), and ``ignore_https_errors=False`` is what validates.
+    """
+    certs = Path(__file__).parent / "fixtures"
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certs / "self_signed_cert.pem", certs / "self_signed_key.pem")
+    with HTTPServer(ssl_context=context) as secure:
+        secure.expect_request("/").respond_with_data("<p>secret</p>", content_type="text/html")
+        url = secure.url_for("/")
+        with Client(concurrency=1) as trusting:  # the default: any certificate is accepted
+            assert "secret" in trusting.fetch(url).text
+        with Client(concurrency=1, ignore_https_errors=False) as checking:
+            with pytest.raises(OnyxwebError) as exc:
+                checking.fetch(url)
+            err = exc.value
+            assert err.kind == "tls_failure"
+            assert err.url == url
+            assert "ignore_https_errors" in str(err), str(err)  # names the switch

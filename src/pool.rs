@@ -182,6 +182,11 @@ pub struct ResponseState {
     redirects: Vec<RedirectHopRs>,
     /// Main-document network failure (DNS, connection refused, ...), if any.
     nav_error: Option<String>,
+    /// The status of the last main-document response this fetch saw, from
+    /// `responseReceivedExtraInfo` — which arrives even when Chrome then aborts the load over
+    /// an empty-bodied error, where `responseReceived` never fires. Read only when a failure
+    /// is that abort, so an ordinary fetch's status here is never mistaken for a cause.
+    main_doc_status: Option<u16>,
     /// Frame id per in-flight Document request. `loadingFailed` carries no
     /// frame, so this is how a failed subframe is told from the main document.
     doc_frames: HashMap<String, String>,
@@ -356,6 +361,7 @@ impl PagePool {
             rs.doc_frames.clear();
             rs.redirects.clear();
             rs.nav_error = None;
+            rs.main_doc_status = None;
         }
         log::trace!(
             target: "onyxweb::pool",
@@ -483,6 +489,19 @@ impl PageGuard {
             .lock()
             .nav_error
             .clone()
+    }
+
+    /// The origin's own status for the main document this fetch requested, when Chrome
+    /// reported one — the cause behind a navigation it aborted. `None` for a failure no
+    /// response preceded (DNS, connection refused), so an origin refusal is told from a
+    /// browser fault rather than assumed.
+    pub fn main_doc_status(&self) -> Option<u16> {
+        self.page
+            .as_ref()
+            .expect("guard drained")
+            .response
+            .lock()
+            .main_doc_status
     }
 
     /// Tab's currently-loaded URL, tracked via long-lived listeners on
@@ -886,6 +905,7 @@ async fn create_pooled_page(
         // the current main-doc request, merge in; if the main doc isn't known
         // yet, stage by request id; otherwise (a subresource) drop it.
         let extra_cl = response.clone();
+        let main_frame_for_extra = main_frame_id.clone();
         let mut extra_stream = page
             .event_listener::<EventResponseReceivedExtraInfo>()
             .await
@@ -897,7 +917,14 @@ async fn create_pooled_page(
                 let ei = ExtraInfoRs {
                     headers: headers_to_vec(&evt.headers),
                 };
+                // Read the main frame before taking the response lock. This event arrives even
+                // when Chrome then aborts the load over an empty-bodied error — the one case
+                // where `responseReceived` never fires and the status would otherwise be lost.
+                let main = main_frame_for_extra.lock().clone();
                 let mut rs = extra_cl.lock();
+                if rs.doc_frames.get(&rid) == main.as_ref() {
+                    rs.main_doc_status = Some(status);
+                }
                 match rs.main.as_mut() {
                     // Same request AND same status → this is the final
                     // response's extraInfo; merge it in.

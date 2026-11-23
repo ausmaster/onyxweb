@@ -13,11 +13,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from struct import unpack
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from conftest import PNG_MAGIC, DataUrl, reloaded
-from onyxweb import Client, RenderResult, fetch
+from onyxweb import Client, Dom, Published, RenderResult, fetch
 from onyxweb.records import HEAD_ROWS, PAGE_BUCKETS, PREVIEW_WIDTH, Overview, size_str
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
@@ -717,6 +717,25 @@ def test_unknown_bucket_names_the_valid_ones(page: RenderResult) -> None:
     assert "scripts" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    ("call", "argument"),
+    [(lambda dom: dom.query(1), "selector"), (lambda dom: dom.find_all("p", limit="2"), "limit")],
+    ids=["query", "find_all"],
+)
+def test_a_wrong_argument_type_names_the_argument(
+    call: Callable[[Dom], object], argument: str
+) -> None:
+    """A wrong type for a ``dom`` argument is a ``TypeError`` whose note names the argument.
+
+    New test: every other ``dom`` case passes well-typed arguments. PyO3 checks these types, so
+    this pins what a PyO3 upgrade can change.
+    """
+    with pytest.raises(TypeError) as exc:
+        call(RenderResult("<p>x</p>").dom)
+    notes = getattr(exc.value, "__notes__", [])
+    assert any(f"'{argument}'" in note for note in notes), (str(exc.value), notes)
+
+
 def test_query_and_query_one(page: RenderResult) -> None:
     ps = page.dom.query("p")
     assert len(ps) == 2  # "Body sentence." + #accents
@@ -1031,3 +1050,101 @@ def test_fetch_all_shares_the_same_output_model(httpserver: HTTPServer) -> None:
     assert fr.png[:8] == PNG_MAGIC
     width, height = unpack(">II", fr.png[16:24])
     assert (width, height) == (1200, 800)
+
+
+# A page with the furniture a real article carries, so the extraction has something to drop.
+_FURNITURE_PAGE = """<html><head><title>Furniture</title></head><body>
+<nav><a href="/a">NAV_HOME</a></nav>
+<header>HEADER_TEXT</header>
+<main><h1>Real Heading</h1><p>REAL_SENTENCE_ONE</p><p>REAL_SENTENCE_TWO</p></main>
+<aside>ASIDE_TEXT</aside>
+<form><input name="q"><button>SEARCH_BUTTON</button></form>
+<footer>FOOTER_TEXT</footer>
+</body></html>"""
+
+
+def test_main_text_leaves_out_the_furniture(httpserver: HTTPServer) -> None:
+    """``main_text`` is the content; ``text`` is the whole page, furniture included.
+
+    New test: no other case reads ``main_text``, and the difference between it and ``text`` is
+    the whole point — one keeps navigation, the other drops it.
+    """
+    httpserver.expect_request("/f.html").respond_with_data(
+        _FURNITURE_PAGE, content_type="text/html"
+    )
+    page = fetch(httpserver.url_for("/f.html"))
+    main = page.main_text
+    for kept in ("Real Heading", "REAL_SENTENCE_ONE", "REAL_SENTENCE_TWO"):
+        assert kept in main, kept
+    for gone in ("NAV_HOME", "HEADER_TEXT", "ASIDE_TEXT", "SEARCH_BUTTON", "FOOTER_TEXT"):
+        assert gone not in main, gone
+    # The whole-page text still has the furniture: only the main text is narrowed.
+    assert "NAV_HOME" in page.text and "FOOTER_TEXT" in page.text
+    # Same HTML, same text — on a second read and after a snapshot round trip.
+    assert main == page.main_text == reloaded(page).main_text
+
+
+def test_main_text_picks_the_densest_block_when_none_is_marked() -> None:
+    """A page marking no landmark still gets its content, not the box around it.
+
+    New test: the fixture pages all carry a landmark, and the plain case is where a wrapper
+    would otherwise win — it scores at least as high as everything inside it.
+    """
+    prose = "Prose sentence about the subject. " * 30
+    page = RenderResult(
+        "<html><body>"
+        '<div id="nav"><a href="/a">NAV_LINK</a></div>'
+        f"<div><div><p>{prose}</p></div></div>"
+        "<footer>FOOTER_TEXT</footer>"
+        "</body></html>"
+    )
+    assert page.main_text.startswith("Prose sentence about the subject.")
+    assert "NAV_LINK" not in page.main_text
+    assert "FOOTER_TEXT" not in page.main_text
+
+
+# Where a page states its date, in the order the extraction trusts: structured data, a date
+# meta tag, then a <time> element.
+_DATED: dict[str, tuple[str, str, str]] = {
+    "json_ld": (
+        '<script type="application/ld+json">'
+        '{"@type":"Article","datePublished":"2024-05-02T10:11:12Z"}</script>',
+        "2024-05-02",
+        "json_ld",
+    ),
+    "meta_property": (
+        '<meta property="article:published_time" content="2023-01-09T08:00:00Z">',
+        "2023-01-09",
+        "meta",
+    ),
+    "meta_name": ('<meta name="date" content="2022-12-31">', "2022-12-31", "meta"),
+    "time_element": ('<time datetime="2021-07-04">July 4</time>', "2021-07-04", "time"),
+}
+
+
+@pytest.mark.parametrize(("name", "head", "date", "source"), [(n, *v) for n, v in _DATED.items()])
+def test_published_reports_the_date_and_its_source(
+    name: str, head: str, date: str, source: Literal["json_ld", "meta", "time"]
+) -> None:
+    """A stated date is reported with the claim it came from.
+
+    New test: nothing else reads ``published``, and a caller needs both halves — the date, and
+    whether the page stated it in structured data or somewhere looser.
+    """
+    page = RenderResult(f"<html><head>{head}</head><body><p>x</p></body></html>")
+    assert page.published == Published(date=date, source=source)
+    assert reloaded(page).published == page.published  # it survives a snapshot
+
+
+def test_published_prefers_structured_data_and_says_nothing_when_unsure() -> None:
+    """One fixed order decides between competing claims, and no claim means ``None``.
+
+    New test: each source is covered above one at a time; this is the page that states several.
+    """
+    every = "".join(head for head, _, _ in _DATED.values())
+    page = RenderResult(f"<html><head>{every}</head><body><p>x</p></body></html>")
+    assert page.published == Published(date="2024-05-02", source="json_ld")
+    assert RenderResult("<html><body><p>x</p></body></html>").published is None
+    # A date-shaped string that is not a date is not a date.
+    vague = RenderResult('<html><head><meta name="date" content="spring 2024"></head></html>')
+    assert vague.published is None

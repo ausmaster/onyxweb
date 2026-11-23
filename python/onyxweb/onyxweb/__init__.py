@@ -37,7 +37,7 @@ from os import PathLike, environ
 from os.path import abspath, dirname
 from pathlib import Path
 from threading import Lock
-from typing import Any, Final, Literal, Protocol, overload
+from typing import Any, Final, Literal, Protocol, cast, overload
 
 from pydantic import BaseModel as _BaseModel
 
@@ -49,6 +49,7 @@ from onyxweb._onyxweb import (
     Element as Element,
     OnyxwebError as OnyxwebError,
     QueueTimeoutError as QueueTimeoutError,
+    _error_kinds,
     _FetchOutput,
     _RenderOutput,
 )
@@ -126,6 +127,7 @@ __all__ = [
     "ChromeExitedError",
     "OnyxwebError",
     "QueueTimeoutError",
+    "error_kinds",
     "CertInfo",
     "Click",
     "Client",
@@ -137,6 +139,7 @@ __all__ = [
     "Hashes",
     "Hover",
     "RedirectHop",
+    "Published",
     "RenderResult",
     "ResponseHeaders",
     "ResponseMetadata",
@@ -219,7 +222,7 @@ class AntiBot:
     Attributes:
         vendor: Detected vendor — ``"akamai"`` / ``"cloudflare"`` /
             ``"datadome"`` / ``"perimeterx"`` / ``"imperva"`` / ``"aws"`` /
-            ``"kasada"`` / ``"recaptcha"`` / ``"hcaptcha"`` — or ``None`` for a
+            ``"kasada"`` / ``"google"`` / ``"recaptcha"`` / ``"hcaptcha"`` — or ``None`` for a
             generic challenge with no identifiable vendor.
         kind: ``"challenge"`` (a JS interstitial or captcha gate) or ``"block"``
             (a hard 403/429/406). Interactive captchas are ``"challenge"`` with
@@ -232,6 +235,21 @@ class AntiBot:
     vendor: str | None
     kind: Literal["challenge", "block"]
     resolved: bool
+
+
+@dataclass(frozen=True)
+class Published:
+    """The date a page states it was published, and where that came from.
+
+    Attributes:
+        date: The date as ``YYYY-MM-DD``.
+        source: Which claim won — ``"json_ld"`` (structured data), ``"meta"`` (a date meta tag)
+            or ``"time"`` (a ``<time datetime>`` element). The order is fixed, so a page that
+            states several dates always reports the same one.
+    """
+
+    date: str
+    source: Literal["json_ld", "meta", "time"]
 
 
 @dataclass(frozen=True)
@@ -415,6 +433,19 @@ class ResponseHeaders(Mapping[str, str]):
 
     def __repr__(self) -> str:
         return f"ResponseHeaders({dict(self)!r})"
+
+
+def error_kinds() -> tuple[str, ...]:
+    """Every failure ``kind`` a fetch can carry.
+
+    A failure carries ``.kind`` (and usually ``.url``, sometimes ``.status_code``); this is the
+    closed list those values come from. Code that maps a cause to its own policy — retry, back
+    off, surface to a user — can cover them all, and notice when a release adds one.
+
+    Returns:
+        The kinds as strings, in a stable order.
+    """
+    return tuple(_error_kinds())
 
 
 def _make_response_headers(raw: _RenderOutput | _FetchOutput) -> ResponseHeaders:
@@ -691,6 +722,31 @@ class RenderResult:
     def title(self) -> str | None:
         """The ``<title>`` text, or ``None`` when the page has none."""
         return self.dom.buckets.title()
+
+    @property
+    def main_text(self) -> str:
+        """The page's main content as text, without navigation, headers, footers or forms.
+
+        The block holding the most non-link text is the content — a ``<main>``, ``article`` or
+        ``role="main"`` element when the page marks one, otherwise the densest block — and
+        everything around it is left out. Use ``.text`` for the whole visible page instead.
+
+        The same HTML always yields the same text, so it is safe to store and compare against.
+        """
+        return self.dom.buckets.main_text()
+
+    @property
+    def published(self) -> Published | None:
+        """The date the page says it was published, and which source said it.
+
+        Checked in one fixed order — JSON-LD, then a date ``<meta>``, then ``<time datetime>`` —
+        so a page stating several dates always reports the same one.
+        """
+        found = self.dom.buckets.published()
+        if found is None:
+            return None
+        source = cast(Literal["json_ld", "meta", "time"], found[1])
+        return Published(date=found[0], source=source)
 
     @overload
     def overview(self, prnt: Literal[False] = False) -> Overview: ...

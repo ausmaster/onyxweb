@@ -24,6 +24,7 @@ import sys
 import urllib.request
 from collections.abc import Callable
 from contextlib import suppress
+from gc import collect
 from inspect import isawaitable
 from io import BytesIO
 from os import environ, getpid, kill, listdir, pathsep
@@ -31,6 +32,7 @@ from os.path import isdir
 from pathlib import Path
 from shutil import copy, which
 from subprocess import Popen, run
+from tempfile import gettempdir
 from threading import Thread, current_thread
 from time import monotonic, perf_counter, sleep
 from typing import Any, Literal, cast
@@ -144,6 +146,49 @@ async def test_close_is_prompt_stops_chrome_and_is_final(shape: Shape, killed: b
             await client.fetch("data:text/html,x")
         else:
             client.fetch("data:text/html,x")
+
+
+Ending = Literal["close", "context_manager", "aclose", "freed_without_close"]
+
+
+def _own_profiles() -> set[Path]:
+    """The temporary profiles this process's clients made (named ``onyxweb-<pid>-<n>``)."""
+    return set(Path(gettempdir()).glob(f"onyxweb-{getpid()}-*"))
+
+
+@pytest.mark.parametrize("engine", ["shell", "full"])
+@pytest.mark.parametrize("ending", ["close", "context_manager", "aclose", "freed_without_close"])
+async def test_a_client_leaves_no_profile_behind(engine: str, ending: Ending) -> None:
+    """However a client ends, the temporary profile it made for Chrome goes with it.
+
+    A client freed without ``close`` used to leave its profile on disk for good, even after
+    the process exited: a few megabytes in the temp dir per client, never reclaimed.
+    """
+    before = _own_profiles()
+    client: Client | AsyncClient
+    if ending == "aclose":
+        client = AsyncClient(concurrency=1, engine=engine)
+        await client.fetch("data:text/html,x")
+    else:
+        client = Client(concurrency=1, engine=engine)
+        if ending == "context_manager":
+            client.__enter__()
+        client.fetch("data:text/html,x")
+    made = _own_profiles() - before
+    assert len(made) == 1, f"expected one profile for this client: {made}"
+
+    if isinstance(client, AsyncClient):
+        await client.aclose()
+    elif ending == "context_manager":
+        client.__exit__(None, None, None)
+    elif ending == "close":
+        client.close()
+    del client
+    collect()
+    deadline = monotonic() + 5.0
+    while made & _own_profiles() and monotonic() < deadline:
+        sleep(0.05)
+    assert not made & _own_profiles(), f"profile left behind after {ending}: {made}"
 
 
 @needs_proc

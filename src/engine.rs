@@ -20,13 +20,14 @@ use chromiumoxide::cdp::browser_protocol::page::{
     EventDomContentEventFired, EventFrameNavigated, EventLoadEventFired, NavigateParams,
     ReferrerPolicy, RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier,
 };
+use chromiumoxide::error::CdpError;
 use futures::StreamExt;
 
 use crate::config::{
     ActionErrorPolicy, ActionRs, ClientConfigRs, FetchConfigRs, HashNavigation, ImageFormat,
     ScreenshotConfigRs, WaitUntil,
 };
-use crate::error::{OnyxError, Result};
+use crate::error::{OnyxError, Result, navigation_failure};
 use crate::pool::{CertInfoRs, PageGuard, SCREEN_CHROME_PADDING_PX, block_patterns};
 use crate::result::ConsoleMessageRs;
 
@@ -393,7 +394,17 @@ pub async fn capture_page(
                     }
                 };
                 tokio::select! {
-                    r = nav_fut => { r?; }
+                    r = nav_fut => {
+                        if let Err(e) = r {
+                            // A CDP timeout stays a timeout; every other cause is classified
+                            // where the browser names it, so both routes agree.
+                            return Err(if matches!(e, CdpError::Timeout) {
+                                OnyxError::Timeout(e.to_string())
+                            } else {
+                                navigation_failure(&e.to_string(), guard.main_doc_status(), url)
+                            });
+                        }
+                    }
                     _ = lifecycle => {}
                 }
             }
@@ -404,9 +415,10 @@ pub async fn capture_page(
             );
 
             // A main-doc network failure (DNS, connection refused) still fires a
-            // lifecycle event via its error page, so surface it explicitly.
+            // lifecycle event via its error page, so surface it explicitly — through the one
+            // classifier, so this route and the `goto` one can never disagree.
             if !same_doc_nav && let Some(err) = guard.nav_error() {
-                return Err(OnyxError::Cdp(err));
+                return Err(navigation_failure(&err, guard.main_doc_status(), url));
             }
             reached_lifecycle.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -434,25 +446,76 @@ pub async fn capture_page(
                 let mut probe = page.content().await.unwrap_or_default();
                 if let Some(vendor) = challenge_vendor(&probe) {
                     challenge_hit = Some(vendor);
+                    // A challenge served with an error status is a refusal wearing a page: the
+                    // host answered once, and waiting on it again only costs the caller time.
+                    // One served on 200 is a gate, and gates are worth waiting for.
+                    let refused = guard.main_doc_status().is_some_and(|status| status >= 400);
+                    let captcha = is_interactive_captcha(&probe);
+                    let waitable = !captcha && !refused;
                     log::debug!(
                         target: "onyxweb::engine",
-                        "[{url}] anti-bot challenge ({vendor}) detected — waiting up to {CHALLENGE_MAX_WAIT_MS}ms to resolve"
+                        "[{url}] anti-bot challenge ({vendor}) detected — {}",
+                        if !waitable {
+                            "reported as it stands: waiting cannot pass it".to_string()
+                        } else {
+                            format!("waiting up to {CHALLENGE_MAX_WAIT_MS}ms to resolve")
+                        }
                     );
                     let deadline = Instant::now() + Duration::from_millis(CHALLENGE_MAX_WAIT_MS);
-                    let mut last_len = 0usize;
-                    while Instant::now() < deadline {
+                    let wait_start = Instant::now();
+                    let mut last_len = probe.len();
+                    let mut moved = false;
+                    let mut pressed = false;
+                    // The controls this challenge is holding closed, by position among the
+                    // page's controls. Looked at before the wait, so a gate that opens its
+                    // control early is still seen closed first.
+                    let mut held: Vec<u32> = Vec::new();
+                    if waitable {
+                        press_opened_control(page, &mut held).await;
+                    }
+                    while waitable && Instant::now() < deadline {
                         tokio::time::sleep(Duration::from_millis(CHALLENGE_POLL_MS)).await;
                         probe = page.content().await.unwrap_or_default();
+                        if probe.len() != last_len {
+                            moved = true;
+                        }
+                        let stable = probe.len() == last_len;
+                        last_len = probe.len();
+                        // A gate ignores a click until its own check has finished and it opens
+                        // its control, so the control is watched on every poll and pressed
+                        // once, when the page opens it. Nothing else on the page is touched.
+                        if !pressed && press_opened_control(page, &mut held).await {
+                            pressed = true;
+                            log::debug!(
+                                target: "onyxweb::engine",
+                                "[{url}] {vendor} challenge opened its control: pressed it"
+                            );
+                        }
                         // Done once it's no longer a challenge AND the resolved
                         // real page has stopped growing (two equal polls). The
                         // challenge reload lands a thin early page (title only);
                         // without the stability check we'd capture that.
-                        let stable = probe.len() == last_len;
-                        last_len = probe.len();
                         if !looks_like_challenge(&probe)
                             && stable
                             && probe.len() > RESOLVED_PAGE_MIN_BYTES
                         {
+                            break;
+                        }
+                        // Nothing held closed and nothing moving: a wall, not a gate. A rate-limit
+                        // page or an interactive captcha cannot pass by waiting — its own page
+                        // says as much — so report it now instead of spending the whole budget.
+                        // A page that is holding a control closed is still working, and is
+                        // given the wait.
+                        if !pressed
+                            && !moved
+                            && held.is_empty()
+                            && wait_start.elapsed() >= WALL_PROBE_TIMEOUT
+                        {
+                            log::debug!(
+                                target: "onyxweb::engine",
+                                "[{url}] {vendor} challenge never moved and offers no control — \
+                                 reporting it as it stands"
+                            );
                             break;
                         }
                     }
@@ -646,26 +709,70 @@ pub async fn capture_page(
                 }
             }
 
-            let final_url = page
-                .url()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| url.to_string());
-            // Main-doc response from the pool's Network.responseReceived listener —
-            // captured on response headers, independent of wait_until choice.
-            // Same-document navs don't trigger a new HTTP response, so fall back to
-            // the prior fetch's response (the document hasn't actually changed).
-            let main_resp = guard
-                .main_response()
-                .or_else(|| {
-                    if same_doc_nav {
-                        guard.prev_main_response()
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            // URL, response and HTML are read as one snapshot of one document. A page can replace
+            // itself just as it is read — a script that navigates on a timer, as a redirect page
+            // does — and then a read of the old document fails or comes back from the blank one in
+            // between. The document that replaced it is what the caller gets, read once it has
+            // loaded, so every field describes the same page.
+            let mut replaced = 0;
+            let (final_url, main_resp, html) = loop {
+                let final_url = page
+                    .url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| url.to_string());
+                // Main-doc response from the pool's Network.responseReceived listener —
+                // captured on response headers, independent of wait_until choice.
+                // Same-document navs don't trigger a new HTTP response, so fall back to
+                // the prior fetch's response (the document hasn't actually changed).
+                let main_resp = guard
+                    .main_response()
+                    .or_else(|| {
+                        if same_doc_nav {
+                            guard.prev_main_response()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                if !matches!(mode, CaptureMode::Html | CaptureMode::Both) {
+                    break (final_url, main_resp, None);
+                }
+                let t_html = Instant::now();
+                let read = if base.include.shadow_dom || base.include.iframes {
+                    capture_html(page, base.include.shadow_dom, base.include.iframes).await
+                } else {
+                    page.content().await.map_err(OnyxError::from)
+                };
+                let moved = page
+                    .url()
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|now| now != final_url);
+                // Gone: the read targeted a document that no longer exists. Empty: it landed on
+                // the new one before that had any content, which no loaded page serializes to.
+                let gone = matches!(&read, Err(e) if document_replaced(e));
+                let empty = matches!(&read, Ok(html) if html.is_empty());
+                if (moved || gone || empty) && replaced < MAX_DOCUMENT_REPLACEMENTS {
+                    replaced += 1;
+                    log::debug!(
+                        target: "onyxweb::engine",
+                        "[{url}] the page replaced itself while it was read; reading the new one"
+                    );
+                    settle_replacement(page).await;
+                    continue;
+                }
+                let html = read?;
+                log::trace!(
+                    target: "onyxweb::engine",
+                    "[{url}] content: {} bytes in {:?}",
+                    html.len(),
+                    t_html.elapsed()
+                );
+                break (final_url, main_resp, Some(html));
+            };
 
             let redirect_chain: Vec<(String, u16, Option<String>)> = guard
                 .redirects()
@@ -674,7 +781,8 @@ pub async fn capture_page(
                 .collect();
 
             let mut out = CaptureOutput {
-                html: None,
+                content_length: html.as_ref().map_or(0, String::len),
+                html,
                 png: None,
                 console_messages: Vec::new(),
                 final_url,
@@ -688,28 +796,10 @@ pub async fn capture_page(
                 remote_port: main_resp.remote_port,
                 headers: main_resp.headers,
                 cert_info: main_resp.cert_info,
-                content_length: 0,
                 elapsed_s: 0.0,
                 post_load_results,
                 anti_bot: None,
             };
-
-            if matches!(mode, CaptureMode::Html | CaptureMode::Both) {
-                let t_html = Instant::now();
-                let html = if base.include.shadow_dom || base.include.iframes {
-                    capture_html(page, base.include.shadow_dom, base.include.iframes).await?
-                } else {
-                    page.content().await?
-                };
-                log::trace!(
-                    target: "onyxweb::engine",
-                    "[{url}] content: {} bytes in {:?}",
-                    html.len(),
-                    t_html.elapsed()
-                );
-                out.content_length = html.len();
-                out.html = Some(html);
-            }
 
             // Anti-bot indicator for a challenge we waited out (challenge_hit set
             // above). `resolved` reflects whether the captured page is still a
@@ -894,13 +984,45 @@ pub async fn capture_page(
 const RESET_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Max time to wait for an anti-bot challenge interstitial to self-resolve.
-const CHALLENGE_MAX_WAIT_MS: u64 = 12_000;
+///
+/// Most resolve in a few hundred milliseconds. The headroom is for a gate that holds its own
+/// control closed for a while before it can be pressed — ten seconds is a figure seen in the
+/// wild — plus the navigation and load that follow, so this must exceed that delay by enough
+/// to let the page arrive.
+const CHALLENGE_MAX_WAIT_MS: u64 = 20_000;
 /// Poll interval while waiting for a challenge to resolve.
 const CHALLENGE_POLL_MS: u64 = 500;
+/// How long a challenge gets to show something before it is taken as a wall.
+///
+/// A gate either offers a control to press or moves on its own; one that does neither is a
+/// refusal dressed as a page (a rate limit, an interactive captcha), and waiting cannot pass it.
+const WALL_PROBE_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 /// A real page behind these WAFs is large; a challenge interstitial is a tiny
 /// stub. Signals that ALSO leak onto normal pages only count below this size.
 const CHALLENGE_STUB_MAX_BYTES: usize = 30_720;
+
+/// Whether `html` carries an interactive captcha: a widget a person must solve.
+///
+/// Waiting cannot pass one and neither can a press, so the bypass never waits on it — it reports
+/// the challenge as it stands, which is the honest answer. Nothing here is vendor policy: it is
+/// the same class of gate `AntiBot` reports as a challenge that is never auto-solvable.
+fn is_interactive_captcha(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let widget = lower.contains("data-sitekey")
+        || lower.contains("api2/anchor")
+        || lower.contains("api2/bframe")
+        || lower.contains("hcaptcha.com/captcha")
+        // The rendered checkbox is cross-origin, so the top document only shows the loader and
+        // its prompt; that pair is what the detector already reads as an interactive captcha.
+        || lower.contains("g-recaptcha")
+        || lower.contains("grecaptcha");
+    let ask = lower.contains("i'm not a robot")
+        || lower.contains("i\u{2019}m not a robot")
+        || lower.contains("select all images")
+        || lower.contains("recaptcha challenge");
+    widget && ask
+}
 
 /// Smallest page the bypass wait accepts as the resolved one; less after a
 /// challenge reload is still the thin early page. Kept apart from
@@ -932,6 +1054,16 @@ fn challenge_vendor(html: &str) -> Option<&'static str> {
         && any(&["token.awswaf.com", "awswafintegration", "checkforcerefresh"])
     {
         return Some("aws");
+    }
+
+    // Google's waiting room ("Verifying your request"): a 200 with no WAF vendor and no captcha,
+    // holding its own Continue control closed while it checks. Its wording is translated and
+    // its element ids differ on every response, so it is known by its script: these three names
+    // appear together in every capture of the gate and in no capture of a results page. None
+    // of them means anything alone — a `continueBtn` is on checkout pages everywhere. The gate
+    // is about 88 KB, so this is size-independent.
+    if has("continuebtn") && has("delaymillis") && has("targeturl") {
+        return Some("google");
     }
 
     // Interstitial-exclusive: absent from real pages. Any size.
@@ -1033,6 +1165,79 @@ fn challenge_vendor(html: &str) -> Option<&'static str> {
     None
 }
 
+/// Press a control the challenge held closed and has now opened, if there is one.
+///
+/// A waiting room that gates the real page on a click keeps that control closed until its own
+/// check finishes, and never navigates by itself: waiting alone cannot pass it, and a click that
+/// comes early does nothing. Being held closed and then opened by the page is also what tells
+/// the gate's control from everything else on it, whatever the vendor and whatever language it
+/// is labelled in. `held` remembers the controls seen closed, by position among the page's
+/// controls, and only one of those is ever pressed — a control the page never held is not the
+/// gate's, and is left alone.
+///
+/// The control is marked only for the moment of the click, which goes through the same trusted
+/// path the actions use, so nothing of this is left in the page that gets captured.
+///
+/// Best effort by design: a challenge with no such control is left to the wait.
+async fn press_opened_control(page: &chromiumoxide::Page, held: &mut Vec<u32>) -> bool {
+    // Returns `[opened, ...closed]`: whether a held control is now open and has been marked,
+    // then the positions of the controls closed at this moment.
+    const FIND: &str = r#"(held) => {
+        const controls = [...document.querySelectorAll(
+            'button, [role=button], input[type=submit], input[type=button]')];
+        const shut = (el) => el.disabled === true || el.hasAttribute('disabled')
+            || el.getAttribute('aria-disabled') === 'true';
+        let opened = 0;
+        for (const i of held) {
+            const el = controls[i];
+            if (!el || shut(el)) continue;
+            const box = el.getBoundingClientRect();
+            if (box.width < 4 || box.height < 4) continue;  // nothing a mouse could land on
+            const style = getComputedStyle(el);
+            if (style.visibility === 'hidden' || style.display === 'none') continue;
+            if (style.pointerEvents === 'none') continue;
+            el.setAttribute('data-onyxweb-heal', '');
+            opened = 1;
+            break;
+        }
+        const closed = [];
+        controls.forEach((el, i) => { if (shut(el)) closed.push(i); });
+        return [opened, ...closed];
+    }"#;
+    const CLEAR: &str = "(() => { const el = document.querySelector('[data-onyxweb-heal]'); \
+                         if (el) el.removeAttribute('data-onyxweb-heal'); })()";
+
+    let seen = page
+        .evaluate(format!("({FIND})({held:?})"))
+        .await
+        .ok()
+        .and_then(|value| value.into_value::<Vec<u32>>().ok())
+        .unwrap_or_default();
+    let Some((&opened, closed)) = seen.split_first() else {
+        return false;
+    };
+    for position in closed {
+        if !held.contains(position) {
+            held.push(*position);
+        }
+    }
+    if opened == 0 {
+        return false;
+    }
+    let clicked = click_if_present(page, "[data-onyxweb-heal]").await;
+    let _ = page.evaluate(CLEAR).await;
+    clicked
+}
+
+/// Click `selector` through the same trusted path the actions use; `false` when the page has no
+/// such element. A challenge's control is a hint, never a requirement.
+async fn click_if_present(page: &chromiumoxide::Page, selector: &str) -> bool {
+    match page.find_element(selector).await {
+        Ok(element) => element.click().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 fn looks_like_challenge(html: &str) -> bool {
     challenge_vendor(html).is_some()
 }
@@ -1079,6 +1284,40 @@ async fn capture_html(
         Some(html) => Ok(html),
         None => page.content().await.map_err(OnyxError::from),
     }
+}
+
+/// How many times one capture follows a page that replaces itself while it is read. A page that
+/// keeps replacing itself is read as it stands after this many, rather than chased.
+const MAX_DOCUMENT_REPLACEMENTS: u32 = 3;
+
+/// Longest a capture waits for a document that replaced the page to finish loading. The fetch's
+/// own timeout still bounds the whole capture.
+const REPLACEMENT_SETTLE_MAX: Duration = Duration::from_secs(10);
+
+/// Waits for the document that replaced the page to finish loading, by asking it. A navigation
+/// the page started itself is not one the driver tracks, so its own wait returns at once; until
+/// the new document's context exists, the question fails and is asked again.
+async fn settle_replacement(page: &chromiumoxide::Page) {
+    let deadline = Instant::now() + REPLACEMENT_SETTLE_MAX;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(CHALLENGE_POLL_MS / 10)).await;
+        let state = page
+            .evaluate("document.readyState")
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<String>().ok());
+        if state.as_deref() == Some("complete") {
+            return;
+        }
+    }
+}
+
+/// Whether a read failed because the document it targeted was replaced under it: the page
+/// navigated, so its JavaScript context is gone.
+fn document_replaced(e: &OnyxError) -> bool {
+    let msg = e.to_string();
+    msg.contains("Cannot find context with specified id")
+        || msg.contains("Execution context was destroyed")
 }
 
 /// True when Turnstile has issued a token — the challenge passed. The token lands

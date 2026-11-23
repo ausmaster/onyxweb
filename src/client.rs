@@ -3,7 +3,7 @@
 //!
 //! Two callable shapes, one implementation:
 //! - **Sync methods** (`fetch`, `screenshot`, `fetch_all`, `batch`, `close`)
-//!   release the GIL via `py.allow_threads()` and `block_on()` the work on
+//!   release the GIL via `py.detach()` and `block_on()` the work on
 //!   the shared runtime. N Python threads can call them concurrently and
 //!   make real parallel progress; the page-pool semaphore caps in-flight
 //!   pages at `concurrency`.
@@ -11,7 +11,7 @@
 //!   `batch_async`, `close_async`) bridge to Python via
 //!   `pyo3_async_runtimes::tokio::future_into_py`. They return Python
 //!   awaitables that callers `await` from an asyncio event loop. No
-//!   `allow_threads` needed — the bridge handles GIL release.
+//!   `detach` needed — the bridge handles GIL release.
 //!
 //! Both forms route through the same `do_*_inner` async helpers, so there's
 //! exactly one implementation of each operation and two callable shapes.
@@ -130,56 +130,119 @@ impl From<CaptureOutput> for RawFetchOutput {
     }
 }
 
-/// Legacy launch flags for the bundled `chrome-headless-shell` engine. Kept
-/// verbatim (including the `--`-prefixed args, which chromiumoxide renders
-/// inertly) so the default engine's behavior is unchanged.
+/// Switches whose value is a comma list Chrome reads as one set: a caller's entries join the
+/// engine's own. Any other switch a caller passes replaces the engine's value for it.
+const LIST_SWITCHES: &[&str] = &[
+    "disable-features",
+    "enable-features",
+    "disable-blink-features",
+    "enable-blink-features",
+];
+
+/// One launch's switches, each name once, in the order first given.
+///
+/// chromiumoxide renders its arguments from a hash map, in no fixed order, and Chrome keeps the
+/// last of a repeated switch: a switch given twice took whichever value happened to land last,
+/// so a caller's `--lang` or `--user-agent` won on some launches and lost on others. Holding
+/// each name once makes a command line mean the same thing on every launch.
+#[derive(Default)]
+struct Switches(Vec<(String, Vec<String>)>);
+
+impl Switches {
+    /// Adds `name[=value]`, with or without a leading `--` (chromiumoxide adds its own, so one
+    /// left on would reach Chrome as `----name`, which Chrome ignores).
+    fn add(&mut self, switch: &str) {
+        let switch = switch.strip_prefix("--").unwrap_or(switch);
+        let (name, value) = match switch.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (switch, None),
+        };
+        let values: Vec<String> = if LIST_SWITCHES.contains(&name) {
+            value
+                .unwrap_or("")
+                .split(',')
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect()
+        } else {
+            value.map(str::to_string).into_iter().collect()
+        };
+        match self.0.iter_mut().find(|(n, _)| n == name) {
+            Some((_, held)) if LIST_SWITCHES.contains(&name) => {
+                for v in values {
+                    if !held.contains(&v) {
+                        held.push(v);
+                    }
+                }
+            }
+            Some((_, held)) => *held = values,
+            None => self.0.push((name.to_string(), values)),
+        }
+    }
+
+    fn apply(self, mut b: BrowserConfigBuilder) -> BrowserConfigBuilder {
+        for (name, values) in self.0 {
+            b = if values.is_empty() {
+                b.arg(name)
+            } else {
+                let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                b.arg((name.as_str(), values.as_slice()))
+            };
+        }
+        b
+    }
+}
+
+/// The switches the `chrome-headless-shell` engine has always launched with: chromiumoxide
+/// 0.9's defaults (Puppeteer's list). Held here rather than left to chromiumoxide so that a
+/// caller's own value for one replaces it instead of racing it.
+///
+/// The engine once also passed a list of its own, written with their leading `--`, so every one
+/// reached Chrome as `----x` and was ignored: that list never took effect, and every measurement
+/// of this engine was made without it. It is gone rather than switched on, which would have
+/// changed the engine under its own numbers.
+const SHELL_SWITCHES: &[&str] = &[
+    "disable-background-networking",
+    "enable-features=NetworkService,NetworkServiceInProcess",
+    "disable-background-timer-throttling",
+    "disable-backgrounding-occluded-windows",
+    "disable-breakpad",
+    "disable-client-side-phishing-detection",
+    "disable-component-extensions-with-background-pages",
+    "disable-default-apps",
+    "disable-dev-shm-usage",
+    "disable-features=TranslateUI",
+    "disable-hang-monitor",
+    "disable-ipc-flooding-protection",
+    "disable-popup-blocking",
+    "disable-prompt-on-repost",
+    "disable-renderer-backgrounding",
+    "disable-sync",
+    "force-color-profile=srgb",
+    "metrics-recording-only",
+    "no-first-run",
+    "enable-automation",
+    "password-store=basic",
+    "use-mock-keychain",
+    "enable-blink-features=IdleDetection",
+    "lang=en_US",
+];
+
 fn build_shell_launch(builder: BrowserConfigBuilder, cfg: &ClientConfigRs) -> BrowserConfigBuilder {
-    let mut b = builder
-        .arg("--headless=new")
-        .arg("--disable-gpu")
-        .arg("--hide-scrollbars")
-        .arg("--disable-dev-shm-usage")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-background-networking")
-        .arg("--disable-background-timer-throttling")
-        .arg("--disable-backgrounding-occluded-windows")
-        .arg("--disable-breakpad")
-        .arg("--disable-client-side-phishing-detection")
-        .arg("--disable-component-extensions-with-background-pages")
-        .arg("--disable-component-update")
-        .arg("--disable-default-apps")
-        .arg("--disable-domain-reliability")
-        .arg("--disable-extensions")
-        .arg("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,IsolateOrigins,site-per-process")
-        .arg("--disable-hang-monitor")
-        .arg("--disable-ipc-flooding-protection")
-        .arg("--disable-popup-blocking")
-        .arg("--disable-prompt-on-repost")
-        .arg("--disable-renderer-backgrounding")
-        .arg("--disable-sync")
-        .arg("--metrics-recording-only")
-        .arg("--mute-audio")
-        .arg("--password-store=basic")
-        .arg("--use-mock-keychain")
-        .arg(format!(
-            "--window-size={},{}",
-            cfg.viewport.width, cfg.viewport.height
-        ));
-    if cfg.network.ignore_https_errors {
-        b = b.arg("--ignore-certificate-errors");
+    let mut switches = Switches::default();
+    for switch in SHELL_SWITCHES {
+        switches.add(switch);
     }
     for arg in &cfg.chrome.args {
-        b = b.arg(arg.clone());
+        switches.add(arg);
     }
-    b
+    switches.apply(builder.disable_default_args())
 }
 
 /// Full-Chrome launch (`--headless=new`): drop chromiumoxide's default
 /// `--enable-automation`, disable the `AutomationControlled` blink feature (so
 /// `navigator.webdriver === false`), and set a real Chrome UA via a launch flag
-/// (a CDP UA override presents differently and gets flagged). Flag keys are
-/// passed WITHOUT `--` so chromiumoxide renders them correctly.
+/// (a CDP UA override presents differently and gets flagged).
 fn build_full_launch(
     builder: BrowserConfigBuilder,
     cfg: &ClientConfigRs,
@@ -191,35 +254,29 @@ fn build_full_launch(
         .clone()
         .or_else(|| derive_chrome_ua(chrome_path))
         .unwrap_or_else(fallback_full_ua);
-    let mut b = builder
-        .new_headless_mode()
-        .disable_default_args()
-        .arg("disable-gpu")
-        // Software WebGL: without it --disable-gpu leaves getContext('webgl')
-        // === null, itself a headless tell.
-        .arg("enable-unsafe-swiftshader")
-        .arg("disable-dev-shm-usage")
-        .arg("disable-blink-features=AutomationControlled")
-        .arg(format!("user-agent={ua}"))
-        .arg(format!(
-            "window-size={},{}",
-            cfg.viewport.width, cfg.viewport.height
-        ));
+    let mut switches = Switches::default();
+    switches.add("disable-gpu");
+    // Software WebGL: without it --disable-gpu leaves getContext('webgl') === null, itself a
+    // headless tell.
+    switches.add("enable-unsafe-swiftshader");
+    switches.add("disable-dev-shm-usage");
+    switches.add("disable-blink-features=AutomationControlled");
+    switches.add(&format!("user-agent={ua}"));
+    switches.add(&format!(
+        "window-size={},{}",
+        cfg.viewport.width, cfg.viewport.height
+    ));
     if cfg.network.ignore_https_errors {
-        b = b.arg("ignore-certificate-errors");
+        switches.add("ignore-certificate-errors");
     }
     // No navigation here ever goes back, but full Chrome keeps each page a tab leaves in its
-    // back/forward cache, in a renderer process of its own: a tab grew ~14 MB per fetch. Chrome
-    // keeps only the last `--disable-features`, so a caller's own list is merged into ours.
-    let mut disabled = vec!["BackForwardCache".to_string()];
+    // back/forward cache, in a renderer process of its own: a tab grew ~14 MB per fetch. A
+    // caller's own `disable-features` joins this rather than replacing it.
+    switches.add("disable-features=BackForwardCache");
     for arg in &cfg.chrome.args {
-        let a = arg.strip_prefix("--").unwrap_or(arg);
-        match a.strip_prefix("disable-features=") {
-            Some(features) => disabled.push(features.to_string()),
-            None => b = b.arg(a.to_string()),
-        }
+        switches.add(arg);
     }
-    b.arg(format!("disable-features={}", disabled.join(",")))
+    switches.apply(builder.new_headless_mode().disable_default_args())
 }
 
 /// A Chrome that exits before it is ready most often has a sandbox that cannot start: running
@@ -319,8 +376,48 @@ struct ClientState {
     handler_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     config: Arc<parking_lot::RwLock<ClientConfigRs>>,
     closed: std::sync::atomic::AtomicBool,
-    /// Profile dir to delete on close; None when the caller supplied their own.
-    ephemeral_profile: Option<PathBuf>,
+    /// The profile made for this launch. Last on purpose: fields drop in order, so it goes after
+    /// the browser, whose drop kills a Chrome that `Drop for ClientState` could not stop.
+    profile: EphemeralProfile,
+}
+
+/// A profile directory onyxweb made for one launch, deleted when the client goes: by `close`,
+/// or when a client that was never closed is freed. `None` when the caller supplied their own.
+struct EphemeralProfile(Option<PathBuf>);
+
+impl EphemeralProfile {
+    /// Best effort: a leftover temp dir must never surface as an error. `attempts` above one
+    /// is for a Chrome only just killed, whose processes can still write for a moment.
+    fn remove(&self, attempts: u32) {
+        let Some(dir) = &self.0 else { return };
+        for attempt in 1..=attempts {
+            let _ = std::fs::remove_dir_all(dir);
+            if !dir.exists() || attempt == attempts {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for EphemeralProfile {
+    fn drop(&mut self) {
+        self.remove(20);
+    }
+}
+
+impl Drop for ClientState {
+    /// A client freed without `close` is closed here the same way, before its fields drop: the
+    /// browser, then the profile, so nothing of Chrome is left to write into the profile. Inside
+    /// the runtime (an async call held the last reference) nothing may block, so Chrome is left to
+    /// the browser's own drop, which kills it.
+    fn drop(&mut self) {
+        if self.is_closed() || tokio::runtime::Handle::try_current().is_ok() {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        runtime.block_on(stop_chrome(self));
+    }
 }
 
 impl ClientState {
@@ -506,6 +603,15 @@ async fn do_batch_inner(
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 async fn do_close_inner(state: Arc<ClientState>) {
+    stop_chrome(&state).await;
+    state.profile.remove(1);
+}
+
+/// Asks Chrome to exit and waits for it, within `CLOSE_TIMEOUT`: what `close` does, and what a
+/// client freed without it gets too. Asked, Chrome shuts its helper processes down in order;
+/// killed, they outlive it for a moment, and one can still write into the profile after the
+/// profile was removed.
+async fn stop_chrome(state: &ClientState) {
     // One budget for the whole shutdown: a frozen Chrome answers none of these
     // commands, and chromiumoxide's own request timeout doesn't bound them.
     let shutdown = async {
@@ -531,10 +637,6 @@ async fn do_close_inner(state: Arc<ClientState>) {
             target: "onyxweb::client",
             "Chrome did not shut down within {CLOSE_TIMEOUT:?}; it will be killed when the Client is freed"
         );
-    }
-    // Best-effort: a leftover temp dir must never surface as a close() error.
-    if let Some(dir) = &state.ephemeral_profile {
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -590,7 +692,9 @@ impl Client {
         // Launch flags diverge by engine: the bundled shell keeps its legacy
         // flag set; the full engine gets a clean new-headless launch with the
         // automation tells stripped (see build_full_launch).
-        let (user_data_dir, ephemeral_profile) = resolve_user_data_dir(&config_rs);
+        let (user_data_dir, ephemeral) = resolve_user_data_dir(&config_rs);
+        // Owned from here, so a launch that fails still takes the profile it started with it.
+        let profile = EphemeralProfile(ephemeral.then(|| user_data_dir.clone()));
         // The wrapper makes Chrome die with an abruptly-killed process; absent (dev
         // build, unsupported platform), Chrome launches directly and unprotected.
         let wrapper_path = chrome::resolve_wrapper();
@@ -610,6 +714,11 @@ impl Client {
             ChromeEngine::HeadlessShell => build_shell_launch(builder, &config_rs),
             ChromeEngine::Full => build_full_launch(builder, &config_rs, &chrome_path),
         };
+        // Chromium's own CDP client ignores certificate errors unless told otherwise, so the
+        // config field has to be passed on for `ignore_https_errors=False` to mean anything.
+        if !config_rs.network.ignore_https_errors {
+            builder = builder.respect_https_errors();
+        }
         if !config_rs.chrome.sandbox {
             builder = builder.no_sandbox();
         }
@@ -633,7 +742,7 @@ impl Client {
         let shared_config = Arc::new(parking_lot::RwLock::new(config_rs));
         let pool_config = shared_config.clone();
         let (browser, handler_task, pool) = py
-            .allow_threads(|| {
+            .detach(|| {
                 runtime.block_on(async {
                     let (browser, mut handler) = tokio::time::timeout(
                         Duration::from_millis(launch_ms),
@@ -667,7 +776,7 @@ impl Client {
             handler_task: parking_lot::Mutex::new(Some(handler_task)),
             config: shared_config,
             closed: std::sync::atomic::AtomicBool::new(false),
-            ephemeral_profile: ephemeral_profile.then_some(user_data_dir),
+            profile,
         };
 
         Ok(Self {
@@ -690,7 +799,7 @@ impl Client {
     }
 
     // -----------------------------------------------------------------------
-    // Sync API — `py.allow_threads + block_on(do_*_inner(...))`.
+    // Sync API — `py.detach + block_on(do_*_inner(...))`.
     // -----------------------------------------------------------------------
 
     /// Fetch URL → RawRenderOutput (HTML only).
@@ -705,7 +814,7 @@ impl Client {
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
         let url_err = url.clone();
-        py.allow_threads(move || runtime.block_on(do_fetch_inner(state, url, fetch_cfg)))
+        py.detach(move || runtime.block_on(do_fetch_inner(state, url, fetch_cfg)))
             .map_err(|e| e.into_py_err(py, &url_err))
     }
 
@@ -722,7 +831,7 @@ impl Client {
         let runtime = state.runtime.clone();
         let url_err = url.clone();
         let png = py
-            .allow_threads(move || runtime.block_on(do_screenshot_inner(state, url, shot_cfg)))
+            .detach(move || runtime.block_on(do_screenshot_inner(state, url, shot_cfg)))
             .map_err(|e| e.into_py_err(py, &url_err))?;
         Ok(PyBytes::new(py, &png))
     }
@@ -741,10 +850,8 @@ impl Client {
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
         let url_err = url.clone();
-        py.allow_threads(move || {
-            runtime.block_on(do_fetch_all_inner(state, url, fetch_cfg, shot_cfg))
-        })
-        .map_err(|e| e.into_py_err(py, &url_err))
+        py.detach(move || runtime.block_on(do_fetch_all_inner(state, url, fetch_cfg, shot_cfg)))
+            .map_err(|e| e.into_py_err(py, &url_err))
     }
 
     /// Batch of URLs (parallel inside Rust tokio). Returns list of results
@@ -768,8 +875,8 @@ impl Client {
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
 
-        let outputs = py
-            .allow_threads(move || runtime.block_on(do_batch_inner(state, urls, fetch_cfg, mode)));
+        let outputs =
+            py.detach(move || runtime.block_on(do_batch_inner(state, urls, fetch_cfg, mode)));
 
         let results = PyList::empty(py);
         for (url, r) in outputs {
@@ -790,7 +897,7 @@ impl Client {
             .store(true, std::sync::atomic::Ordering::Release);
         let state = self.inner.clone();
         let runtime = state.runtime.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             runtime.block_on(do_close_inner(state));
         });
         Ok(())
@@ -811,9 +918,9 @@ impl Client {
     fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<PyObject>,
-        _exc_val: Option<PyObject>,
-        _exc_tb: Option<PyObject>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         self.close(py)
     }
@@ -837,7 +944,7 @@ impl Client {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             do_fetch_inner(state, url, fetch_cfg)
                 .await
-                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))
+                .map_err(|e| Python::attach(|py| e.into_py_err(py, &url_err)))
         })
     }
 
@@ -855,10 +962,8 @@ impl Client {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let bytes = do_screenshot_inner(state, url, shot_cfg)
                 .await
-                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))?;
-            Python::with_gil(|py| -> PyResult<Py<PyBytes>> {
-                Ok(PyBytes::new(py, &bytes).unbind())
-            })
+                .map_err(|e| Python::attach(|py| e.into_py_err(py, &url_err)))?;
+            Python::attach(|py| -> PyResult<Py<PyBytes>> { Ok(PyBytes::new(py, &bytes).unbind()) })
         })
     }
 
@@ -878,7 +983,7 @@ impl Client {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             do_fetch_all_inner(state, url, fetch_cfg, shot_cfg)
                 .await
-                .map_err(|e| Python::with_gil(|py| e.into_py_err(py, &url_err)))
+                .map_err(|e| Python::attach(|py| e.into_py_err(py, &url_err)))
         })
     }
 
@@ -901,7 +1006,7 @@ impl Client {
         let state = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let outputs = do_batch_inner(state, urls, fetch_cfg, mode).await;
-            Python::with_gil(|py| -> PyResult<Py<PyList>> {
+            Python::attach(|py| -> PyResult<Py<PyList>> {
                 let results = PyList::empty(py);
                 for (url, r) in outputs {
                     batch_item_to_py(py, &url, r, mode, &results)?;

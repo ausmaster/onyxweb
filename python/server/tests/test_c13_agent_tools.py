@@ -835,7 +835,7 @@ ERRORS: dict[str, Error] = {
     ),
     "unknown_engine": Error("fetch", {"url": "{url}", "engine": "turbo"}, ("'shell'", "'full'")),
     # The browser's own failure reaches the caller instead of a silent empty page.
-    "unreachable_url": Error("fetch", {"url": "{refused}"}, ("ERR_CONNECTION_REFUSED",)),
+    "unreachable_url": Error("fetch", {"url": "{refused}"}, ("nothing accepted a connection",)),
 }
 
 
@@ -1187,7 +1187,7 @@ async def test_a_batch_holds_its_pages_for_later_calls(
     assert "2 of 3 fetched" in out, out
     alpha, beta = PAGE_ID.findall(out)
     failed = next(line for line in out.splitlines() if line.startswith("FAILED"))
-    assert refused_url in failed and "ERR_CONNECTION_REFUSED" in failed, failed
+    assert refused_url in failed and "nothing accepted a connection" in failed, failed
     assert out.index(alpha) < out.index("FAILED") < out.index(beta), out
     listed = await call(server, "pages")
     assert alpha in listed and beta in listed, listed

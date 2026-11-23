@@ -99,6 +99,21 @@ r.scripts.matches(r'"apiKey":"(\w+)"', regex=True)[0].value   # just the capture
 
 Every URL-bearing record carries `url` (absolute) and `raw` (as authored). Search patterns use Rust's `regex` crate: linear time, no lookaround.
 
+## Reading a page
+
+Every view reads one parse, so they cannot disagree, and each is deterministic for a given HTML: the same page always yields the same bytes, which is what makes a stored copy checkable.
+
+```python
+r.text                                # everything the page displays, furniture included
+r.main_text                           # the content block, with navigation, headers, footers and forms out
+r.title                               # the <title> text
+r.published                           # Published(date="2024-05-02", source="json_ld"), or None
+```
+
+`main_text` is the block holding the most non-link text — a `<main>`, `article` or `role="main"` element when the page marks one, otherwise the densest block, followed down into the single child that holds nearly all of it — with the furniture around it dropped. A page whose prose lives in one wrapper and whose menus are links therefore reads as prose.
+
+`published` takes the date a page states it was published, as `YYYY-MM-DD`, and names the claim it came from: JSON-LD first, then a date `<meta>`, then `<time datetime>`. One fixed order, so a page stating several dates always reports the same one, and a page stating none is `None` rather than a guess.
+
 ## Snapshots
 
 A snapshot is one JSON file holding a page and its response. Save it once, then read it later with no Chrome and no network.
@@ -177,7 +192,7 @@ options:
 r.anti_bot   # AntiBot(vendor="cloudflare", kind="challenge", resolved=True) or None
 ```
 
-`bypass_anti_bot=True` waits out challenge interstitials and self-heals hard blocks by dropping only the anti-bot cookies, then retrying once. Vendor-agnostic (Akamai, Cloudflare, DataDome, PerimeterX, Imperva).
+`bypass_anti_bot=True` waits out challenge interstitials, presses the control an interstitial holds closed until its own check passes, and self-heals hard blocks by dropping only the anti-bot cookies, then retrying once. The control is recognised by what the page does with it, not by its name or language, and no other control is touched. Recognised vendors: Akamai, Cloudflare, DataDome, PerimeterX, Imperva, and Google's own waiting room.
 
 In testing the full engine cleared Akamai, DataDome, PerimeterX, and Cloudflare on sites like tesla.com and ticketmaster. It does not beat Kasada or an interactive captcha, and says so through `.anti_bot` instead of handing back a challenge stub.
 
@@ -236,6 +251,12 @@ onyxweb.Client(viewport=(1920, 1080), locale="en-GB", proxy="http://user:pass@ho
 
 `client.config` is a live view: assign at any depth and the next fetch uses it. Launch-only fields (concurrency, chrome options) raise `ValueError` instead of failing silently. Full field list with docs: [`python/onyxweb/onyxweb/config.py`](python/onyxweb/onyxweb/config.py).
 
+`chrome_args` adds Chrome switches at launch, written with or without the leading `--`. Where the engine sets the same switch, yours replaces it, and a feature list such as `--disable-features=...` joins the engine's own instead of replacing it.
+
+```python
+onyxweb.Client(chrome_args=["--lang=de-DE", "--disable-features=Translate"])
+```
+
 Two knobs worth knowing, both off by default, since `outerHTML` drops this content:
 
 ```python
@@ -271,6 +292,8 @@ except TimeoutError:                # navigation + CDP timeouts, and QueueTimeou
 except onyxweb.OnyxwebError:        # subclasses RuntimeError; carries .url and .kind
     ...
 ```
+
+A fetch that fails because of the origin or the network says which: `.kind` is `http_status` (with the origin's code on `.status_code`), `dns_failure`, `connection_refused`, `tls_failure` or `redirect_loop`, and only a cause onyxweb does not recognise stays `cdp`. `onyxweb.error_kinds()` lists them all, for code that maps a cause to its own policy. `ignore_https_errors` is on by default, as it always effectively was; set it to `False` to reject bad certificates instead of trusting them.
 
 `client.alive` is `False` once Chrome has exited or the client is closed, and checking it costs no fetch. `Client(queue_timeout_ms=5000)` makes `fetch`, `screenshot` and `fetch_all` raise `QueueTimeoutError` (a `TimeoutError`) after 5 s without a free tab, instead of waiting; `batch` ignores it.
 

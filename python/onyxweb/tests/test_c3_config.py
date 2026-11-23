@@ -127,7 +127,7 @@ FLAT_KWARGS: dict[str, tuple[tuple[str, ...], Any]] = {
     "proxy": (("network", "proxy"), "http://127.0.0.1:9"),
     "proxy_bypass_list": (("network", "proxy_bypass_list"), "<-loopback>"),
     "extra_headers": (("network", "extra_headers"), {"X-Table": "1"}),
-    "ignore_https_errors": (("network", "ignore_https_errors"), True),
+    "ignore_https_errors": (("network", "ignore_https_errors"), False),
     "block_urls": (("network", "block_urls"), ["*://*/*.png"]),
     "disable_cache": (("network", "disable_cache"), True),
     "offline": (("network", "offline"), True),
@@ -290,7 +290,7 @@ _CLIENT_DEFAULTS: dict[str, Any] = {
         "proxy": None,
         "proxy_bypass_list": None,
         "extra_headers": {},
-        "ignore_https_errors": False,
+        "ignore_https_errors": True,
         "block_urls": [],
         "disable_cache": False,
         "offline": False,
@@ -988,7 +988,9 @@ def test_explicit_profile_dir_is_used(tmp_path: Path) -> None:
 @pytest.mark.parametrize("engine", ["shell", "full"])
 @pytest.mark.parametrize("sandbox", [True, False])
 @pytest.mark.parametrize(
-    "args", [[], ["disable-features=Translate"]], ids=["no_extra_args", "own_disable_features"]
+    "args",
+    [[], ["disable-features=Translate"], ["--disable-features=Translate", "--lang=de-DE"]],
+    ids=["no_extra_args", "own_disable_features", "dashed_caller_flags"],
 )
 def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) -> None:
     """The flags a launch asks for are on Chrome's command line, on either engine.
@@ -998,9 +1000,13 @@ def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) 
     the last such flag, and each cached page holds a renderer process, so one tab's memory grew
     about 14 MB with every fetch (11 to 15 renderers after 60 fetches, 5 to 8 without it).
 
+    A caller's ``chrome_args`` reach Chrome as written, with or without their leading ``--``,
+    and every flag on the line is one Chrome reads: the launcher adds the ``--`` itself, so a
+    flag passed with its own once reached Chrome as ``----x``, which Chrome ignores. That made
+    every shell-engine flag, a caller's included, do nothing. Whatever features the engine
+    keeps off stay off beside the caller's own list.
+
     New test: a launch-only knob can't go through ``EFFECTS``, which changes a running client.
-    The shell engine's own copy of ``--no-sandbox`` once reached Chrome as ``----no-sandbox``,
-    which Chrome ignores, so its sandbox could not be switched off.
     """
     before = {p.pid for p in Process().children()}
     try:
@@ -1018,12 +1024,21 @@ def test_launch_flags_reach_chrome(engine: str, sandbox: bool, args: list[str]) 
         assert launched, "expected this client to start a Chrome process"
         # Off Linux the wrapper supervises Chrome, so it is the child, with the same flags.
         flags = min(launched, key=lambda p: p.pid).cmdline()
+    assert not [f for f in flags if f.startswith("---")], f"flags Chrome ignores: {flags}"
     assert ("--no-sandbox" in flags) == (not sandbox), flags
-    if engine == "full":
-        disabled = [f for f in flags if f.startswith("--disable-features=")]
-        assert len(disabled) == 1, f"Chrome keeps only the last --disable-features: {disabled}"
-        assert "BackForwardCache" in disabled[0], disabled
-        assert ("Translate" in disabled[0]) == bool(args), disabled
+    # Chrome keeps the last of a repeated switch, and the launcher orders them at random, so
+    # each name is on the line once: a caller's value replaces the engine's (`--lang` has one
+    # on the shell engine) and a caller's feature list joins the engine's.
+    names = [f.split("=", 1)[0] for f in flags if f.startswith("--")]
+    assert len(names) == len(set(names)), f"a switch given twice: {flags}"
+    for arg in args:
+        if "disable-features" not in arg:
+            assert "--" + arg.removeprefix("--") in flags, flags
+    disabled = [f for f in flags if f.startswith("--disable-features=")]
+    assert len(disabled) == 1, disabled
+    assert ("Translate" in disabled[0].replace("TranslateUI", "")) == bool(args), disabled
+    kept_off = "BackForwardCache" if engine == "full" else "TranslateUI"
+    assert kept_off in disabled[0], disabled
 
 
 def test_launch_timeout_ms_bounds_the_browser_launch(tmp_path: Path) -> None:

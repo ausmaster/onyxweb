@@ -13,9 +13,10 @@ error — intended. Install chromium to run the suite.
 from __future__ import annotations
 
 from base64 import b64encode
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from socket import socket
+from ssl import SSLContext
 from tempfile import TemporaryDirectory
 
 import pytest
@@ -127,6 +128,32 @@ _SUBRESOURCES: dict[str, tuple[str, str]] = {
     "/pic.png": ("", "image/png"),
     "/inner.html": ("<html><body><p>FRAME_INNER</p></body></html>", "text/html"),
 }
+
+
+@pytest.fixture(scope="session")
+def make_httpserver(
+    httpserver_listen_address: tuple[str | None, int | None],
+    httpserver_ssl_context: SSLContext | None,
+) -> Iterator[HTTPServer]:
+    """The plugin's session server, serving connections concurrently as any real origin does.
+
+    The plugin's own serves one connection at a time and blocks reading it. Chrome may open a
+    connection and send nothing on it, so the page's request then waits unaccepted behind that
+    one until the browser gives up: a capture that times out at random. Same inputs as the
+    plugin's, plus ``threaded``.
+    """
+    host, port = httpserver_listen_address
+    server = HTTPServer(
+        host=host or HTTPServer.DEFAULT_LISTEN_HOST,
+        port=port or HTTPServer.DEFAULT_LISTEN_PORT,
+        ssl_context=httpserver_ssl_context,
+        threaded=True,
+    )
+    server.start()
+    yield server
+    server.clear()
+    if server.is_running():
+        server.stop()
 
 
 @pytest.fixture
