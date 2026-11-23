@@ -13,20 +13,22 @@ onyxweb-server http --port 8000              # binds 127.0.0.1
 
 | Route | Returns |
 |---|---|
-| `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it |
+| `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it. With `select`, only the views named: `{"onyxweb_page", "final_url", "status_code", "anti_bot", ...}` |
 | `POST /screenshot` | the image itself, as `image/png`, `image/jpeg` or `image/webp` |
 | `POST /fetch_all` | `{"snapshot": {...}, "image": "<base64>", "format": "png"}`: the page and its image from one visit |
-| `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, or `{"url", "error"}` for a URL that failed |
+| `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, `{"url", "page"}` with `select`, or `{"url", "error"}` for a URL that failed |
 | `GET /health` | `{"status": "ok", "engines": {"full": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
 
 Every body is a JSON object sent with `Content-Type: application/json`. A route accepts the fields below and refuses any other by name:
 
 | Route | Fields |
 |---|---|
-| `/fetch` | `url`, `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `block_urls`, `bypass_anti_bot` |
+| `/fetch` | `url`, `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `block_urls`, `bypass_anti_bot`, `select` |
 | `/screenshot` | `url`, `engine`, `wait_ms`, `timeout_ms`, `wait_until`, `headers`, `full_page`, `format`, `quality`, `viewport` |
-| `/fetch_all` | the `/fetch` fields, plus `full_page`, `format` and `quality` |
+| `/fetch_all` | the `/fetch` fields but `select`, plus `full_page`, `format` and `quality` |
 | `/batch` | `urls` in place of `url`, and the other `/fetch` fields, applied to every URL |
+
+`select` asks for views of the page instead of the page: a list of names, answered with one key per name. The names are the page's own views, in the order they come back after `final_url`, `status_code` and `anti_bot`: `title`; `published`, the date the page states it was published, as `{"date", "source"}` with the claim it came from; `main_text`, the content block with navigation, headers, footers and forms left out; `text`, everything the page displays; `html`; `elapsed_s`; `errors`; `console_messages`; `metadata`; `headers`; and the buckets `scripts`, `styles`, `iframes`, `comments`, `forms`, `meta`, `json_ld`, `links` and `images`, each a list of its records. Each is encoded as the snapshot encodes it. `final_url`, `status_code` and `anti_bot` come with every selection, so a challenge page is never read as content without its verdict beside it, and `"select": []` answers with those three alone. Only the views named are computed, and the keys come in that fixed order however they were named, so the same names over the same HTML give the same bytes. `ONYXWEB_SERVER_MAX_PAGE_BYTES` measures the selection rather than the page, so a page too large to send whole can still answer with its text. A name that is no view is refused with the list of those that are. A selection is not a snapshot, and `RenderResult.load` does not read one; a view the library gains is one row in `onyxweb_server.core.VIEWS`.
 
 Send `Accept-Encoding: zstd` to get JSON compressed (about 9x on a 7 MB page). A batch is compressed as it is written, and an image never is. `scripts`, `post_load_scripts` and `actions` are refused with a 400, because the server never runs caller-supplied JavaScript, and so is a private, loopback or link-local address. The server holds nothing between requests.
 
@@ -38,7 +40,7 @@ A failure is `{"error": {"kind": ..., "message": ..., "url": ...}}` with a statu
 | 401 | `unauthorized` |
 | 413 | `too_large` |
 | 422 | `invalid_request` (a body that is not a JSON object, or a missing or unknown field) |
-| 502 | `cdp`, `io` |
+| 502 | `http_status` (the origin's own code in `error.status`), `dns_failure`, `connection_refused`, `tls_failure`, `redirect_loop`, `cdp`, `io` |
 | 503 | `chrome_exited`, `queue_timeout`, `launch_failed`, `chrome_not_found` |
 | 504 | `navigation_timeout`, `timeout` |
 | 500 | `internal`, and any kind not listed |
@@ -55,7 +57,7 @@ Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_
 |---|---:|---|
 | `MAX_PAGES` | 50 | pages held per session |
 | `MAX_STORE_BYTES` | 268435456 | bytes of html held; the least recently used page goes first |
-| `MAX_PAGE_BYTES` | 20971520 | largest page or image one call may return |
+| `MAX_PAGE_BYTES` | 20971520 | largest page, image or selection one call may return |
 | `MAX_BATCH` | 50 | URLs in one batch |
 | `MAX_WAIT_MS` | 30000 | longest settle after the page loads |
 | `MAX_TIMEOUT_MS` | 60000 | longest navigation budget |
@@ -63,9 +65,9 @@ Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_
 | `CONCURRENCY` | 4 | tabs per engine |
 | `EGRESS` | 1 | `0` turns the egress proxy off |
 
-A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling. A Chrome that dies mid-call is replaced and the call retried once.
+A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling, and choose what comes back with `select`. A Chrome that dies mid-call is replaced and the call retried once.
 
-The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A full Chrome opens one connection to `www.google.com` per tab when it starts. The proxy allows it, since the address is public. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
+The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A proxy carries only TCP, so the browser is also told to send no UDP it cannot proxy: a page's WebRTC cannot go around the proxy either. A full Chrome opens one connection to `www.google.com` per tab when it starts. The proxy allows it, since the address is public. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
 
 ## MCP
 

@@ -18,31 +18,26 @@ ONYXWEB_NAV_TIMEOUT_MS (10000, per-URL cap).
 
 from __future__ import annotations
 
-import os
-import random
-import statistics
-import time
 from concurrent.futures import ThreadPoolExecutor
+from os import environ
 from pathlib import Path
+from random import Random
+from statistics import median
+from time import perf_counter
 from typing import Literal
 
-import onyxweb
 import pytest
+from onyxweb import Client, FetchResult, OnyxwebError, RenderResult
 from onyxweb.presets.shell import stealth
 
 pytestmark = [pytest.mark.benchmark, pytest.mark.real_sites]
-
-
-# ---------------------------------------------------------------------------
-# STEALTH — Akamai's UA first-byte-match, guarding the C10 preset
-# ---------------------------------------------------------------------------
 
 
 def test_stealth_basic_preset_fetches_cnn() -> None:
     """Without stealth, cnn.com returns ~250 B ``Unknown Error`` because Akamai
     first-byte-matches ``HeadlessChrome`` in the UA. With ``stealth.BASIC``,
     the real 5 MB homepage comes through."""
-    with onyxweb.Client(**stealth.BASIC, navigation_timeout_ms=20_000) as c:
+    with Client(**stealth.BASIC, navigation_timeout_ms=20_000) as c:
         html = c.fetch("https://cnn.com")
     assert len(html) > 1_000_000, (
         f"cnn.com with stealth.BASIC returned only {len(html)} bytes — "
@@ -50,19 +45,15 @@ def test_stealth_basic_preset_fetches_cnn() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# GAUNTLET — real-site throughput benchmarks
-# ---------------------------------------------------------------------------
-
 URL_FILE = Path(__file__).resolve().parent / "urls_bench_big.txt"
-SWEEP_URL_COUNT = int(os.environ.get("ONYXWEB_GAUNTLET_URLS", "100"))
-BIG_URL_COUNT = int(os.environ.get("ONYXWEB_GAUNTLET_BIG", "500"))
-MAX_CONCURRENCY = int(os.environ.get("ONYXWEB_GAUNTLET_MAX_C", "128"))
-PYTHON_THREADS = int(os.environ.get("ONYXWEB_GAUNTLET_THREADS", "32"))
-NAV_TIMEOUT_MS = int(os.environ.get("ONYXWEB_NAV_TIMEOUT_MS", "10000"))
+SWEEP_URL_COUNT = int(environ.get("ONYXWEB_GAUNTLET_URLS", "100"))
+BIG_URL_COUNT = int(environ.get("ONYXWEB_GAUNTLET_BIG", "500"))
+MAX_CONCURRENCY = int(environ.get("ONYXWEB_GAUNTLET_MAX_C", "128"))
+PYTHON_THREADS = int(environ.get("ONYXWEB_GAUNTLET_THREADS", "32"))
+NAV_TIMEOUT_MS = int(environ.get("ONYXWEB_NAV_TIMEOUT_MS", "10000"))
 
 
-def _classify(r: onyxweb.RenderResult | onyxweb.FetchResult | Exception) -> str:
+def _classify(r: RenderResult | FetchResult | Exception) -> str:
     """ok = real 2xx/3xx response; http4xx = got bytes but error status; fail = nav dead."""
     if isinstance(r, Exception):
         return "fail"
@@ -74,7 +65,7 @@ def _classify(r: onyxweb.RenderResult | onyxweb.FetchResult | Exception) -> str:
 
 
 def _count_ok(
-    results: list[onyxweb.RenderResult | onyxweb.FetchResult | bytes | Exception],
+    results: list[RenderResult | FetchResult | bytes | Exception],
     capture: str,
 ) -> int:
     if capture == "png":
@@ -90,7 +81,7 @@ def _expand(clean: list[str], n: int) -> list[str]:
     out: list[str] = []
     while len(out) < n:
         out.extend(clean)
-    random.Random(42).shuffle(out)
+    Random(42).shuffle(out)
     return out[:n]
 
 
@@ -106,7 +97,7 @@ def raw_urls() -> list[str]:
     pool: list[str] = []
     while len(pool) < SWEEP_URL_COUNT:
         pool.extend(base)
-    random.Random(42).shuffle(pool)
+    Random(42).shuffle(pool)
     return pool[:SWEEP_URL_COUNT]
 
 
@@ -119,11 +110,11 @@ def clean_urls(raw_urls: list[str]) -> list[str]:
     uniq = sorted(set(raw_urls))
     _banner(f"prewarm + filter — probing {len(uniq)} unique URLs (2 passes)")
     survivors = set(uniq)
-    with onyxweb.Client(concurrency=16, navigation_timeout_ms=NAV_TIMEOUT_MS) as client:
+    with Client(concurrency=16, navigation_timeout_ms=NAV_TIMEOUT_MS) as client:
         for pass_n in (1, 2):
-            t = time.perf_counter()
+            t = perf_counter()
             results = client.batch(uniq, capture="html")
-            elapsed = time.perf_counter() - t
+            elapsed = perf_counter() - t
             bad = {
                 url
                 for url, r in zip(uniq, results, strict=True)
@@ -150,10 +141,10 @@ def sweep_result(clean_urls: list[str]) -> tuple[int, float]:
     print(f"  {'concurrency':>11}  {'URL/s':>7}  {'ok':>7}  {'elapsed':>7}")
     best_c, best_rate = 0, 0.0
     for c in levels:
-        with onyxweb.Client(concurrency=c, navigation_timeout_ms=NAV_TIMEOUT_MS) as client:
-            t0 = time.perf_counter()
+        with Client(concurrency=c, navigation_timeout_ms=NAV_TIMEOUT_MS) as client:
+            t0 = perf_counter()
             results = client.batch(urls, capture="html")
-            elapsed = time.perf_counter() - t0
+            elapsed = perf_counter() - t0
         rate = len(urls) / elapsed
         ok = _count_ok(results, "html")
         marker = " ★" if rate > best_rate else ""
@@ -178,12 +169,12 @@ def test_capture_modes(clean_urls: list[str], best_concurrency: int) -> None:
     _banner(f"capture-mode comparison at concurrency={best_concurrency}")
     print(f"  {'mode':>6}  {'URL/s':>7}  {'ok':>7}  {'elapsed':>7}")
     for mode in ("html", "png", "both"):
-        with onyxweb.Client(
+        with Client(
             concurrency=best_concurrency, navigation_timeout_ms=NAV_TIMEOUT_MS
         ) as client:
-            t0 = time.perf_counter()
+            t0 = perf_counter()
             results = client.batch(urls, capture=mode)
-            elapsed = time.perf_counter() - t0
+            elapsed = perf_counter() - t0
         rate = len(urls) / elapsed
         ok = _count_ok(results, mode)
         print(f"  {mode:>6}  {rate:>6.2f}   {ok:>3d}/{len(urls):<3d}  {elapsed:>6.2f}s")
@@ -197,28 +188,28 @@ def test_python_threads_drive(clean_urls: list[str], best_concurrency: int) -> N
     )
     latencies: list[float] = []
     errors = 0
-    with onyxweb.Client(
+    with Client(
         concurrency=best_concurrency, navigation_timeout_ms=NAV_TIMEOUT_MS
     ) as client:
 
         def work(url: str) -> float:
-            t = time.perf_counter()
+            t = perf_counter()
             try:
                 r = client.fetch(url)
                 if _classify(r) != "ok":
                     return -1.0
             except Exception:
                 return -1.0
-            return time.perf_counter() - t
+            return perf_counter() - t
 
-        t0 = time.perf_counter()
+        t0 = perf_counter()
         with ThreadPoolExecutor(max_workers=PYTHON_THREADS) as pool:
             for lat in pool.map(work, urls):
                 if lat >= 0:
                     latencies.append(lat)
                 else:
                     errors += 1
-        elapsed = time.perf_counter() - t0
+        elapsed = perf_counter() - t0
     rate = len(urls) / elapsed
     print(f"  {rate:.2f} URL/s   {len(urls) - errors}/{len(urls)} ok   {elapsed:.2f}s")
     if latencies:
@@ -228,7 +219,7 @@ def test_python_threads_drive(clean_urls: list[str], best_concurrency: int) -> N
             return s[min(int(len(s) * q), len(s) - 1)]
 
         print(
-            f"  per-URL latency: p50={statistics.median(s):.2f}s  "
+            f"  per-URL latency: p50={median(s):.2f}s  "
             f"p95={pctile(0.95):.2f}s  p99={pctile(0.99):.2f}s"
         )
     assert errors < len(urls) // 2, f"too many errors: {errors}/{len(urls)}"
@@ -243,12 +234,12 @@ def test_max_throughput(
     """Headline number — a big run at the winning concurrency."""
     urls = _expand(clean_urls, BIG_URL_COUNT)
     _banner(f"MAX THROUGHPUT — {len(urls)} URLs, concurrency={best_concurrency}, capture={capture}")
-    with onyxweb.Client(
+    with Client(
         concurrency=best_concurrency, navigation_timeout_ms=NAV_TIMEOUT_MS
     ) as client:
-        t0 = time.perf_counter()
+        t0 = perf_counter()
         results = client.batch(urls, capture=capture)
-        elapsed = time.perf_counter() - t0
+        elapsed = perf_counter() - t0
     rate = len(urls) / elapsed
     buckets = {"ok": 0, "fail": 0, "http4xx": 0}
     for r in results:
@@ -260,16 +251,13 @@ def test_max_throughput(
         f"wall {elapsed:.1f}s"
     )
     if capture == "both":
-        fetches = [r for r in results if isinstance(r, onyxweb.FetchResult)]
+        fetches = [r for r in results if isinstance(r, FetchResult)]
         html_mb = sum(len(r.html) for r in fetches) / 1e6
         png_mb = sum(len(r.png) for r in fetches) / 1e6
         print(f"  payload: {html_mb:.1f} MB html + {png_mb:.1f} MB png")
     assert buckets["fail"] < len(urls) // 2, f"too many failures: {buckets}"
 
 
-# ---------------------------------------------------------------------------
-# TURNSTILE — live Cloudflare widget, integration cover for the C9 mocks
-# ---------------------------------------------------------------------------
 #
 # tests/test_c9_anti_bot.py pins detection/self-heal against local fixtures;
 # these prove the same verdicts against a live Cloudflare widget with a real
@@ -281,15 +269,15 @@ _TURNSTILE_SETTLE_MS = 15_000
 _TOKEN_SEL = 'input[name="cf-turnstile-response"]'
 
 
-def _fetch_turnstile(path: str, **kw: object) -> onyxweb.RenderResult:
+def _fetch_turnstile(path: str, **kw: object) -> RenderResult:
     try:
-        with onyxweb.Client(engine="full", navigation_timeout_ms=40_000) as c:
+        with Client(engine="full", navigation_timeout_ms=40_000) as c:
             return c.fetch(_TURNSTILE_BASE + path, wait_after_ms=_TURNSTILE_SETTLE_MS, **kw)  # type: ignore[arg-type]
-    except (onyxweb.OnyxwebError, TimeoutError) as e:
+    except (OnyxwebError, TimeoutError) as e:
         pytest.skip(f"{_TURNSTILE_BASE}{path} unreachable: {e}")
 
 
-def _turnstile_token(r: onyxweb.RenderResult) -> str:
+def _turnstile_token(r: RenderResult) -> str:
     el = r.dom.query_one(_TOKEN_SEL)
     return (el.attr("value") or "") if el else ""
 
@@ -325,19 +313,16 @@ def test_include_shadow_dom_recovers_real_widget_markup() -> None:
     assert "challenges.cloudflare.com/cdn-cgi" not in plain.html
 
     try:
-        with onyxweb.Client(
+        with Client(
             engine="full", navigation_timeout_ms=40_000, include_shadow_dom=True
         ) as c:
             deep = c.fetch(_TURNSTILE_BASE + "managed.html", wait_after_ms=_TURNSTILE_SETTLE_MS)
-    except (onyxweb.OnyxwebError, TimeoutError) as e:
+    except (OnyxwebError, TimeoutError) as e:
         pytest.skip(f"unreachable: {e}")
     assert "challenges.cloudflare.com/cdn-cgi" in deep.html
     assert deep.dom.query_one("iframe") is not None
 
 
-# ---------------------------------------------------------------------------
-# SHADOW DOM — real web components, integration cover for C8's shadow buckets
-# ---------------------------------------------------------------------------
 #
 # The mocked C8/C1 tests pin the ``include_shadow_dom`` mechanism; this proves
 # the gap and the fix are real on a production site. lit.dev renders ~76 shadow
@@ -356,9 +341,9 @@ _COUNT_HOSTS = """
 
 def _fetch_shadow(
     *, post_load_scripts: list[str] | None = None, **client_kw: object
-) -> onyxweb.RenderResult:
+) -> RenderResult:
     try:
-        with onyxweb.Client(
+        with Client(
             engine="full",
             navigation_timeout_ms=45_000,
             **client_kw,  # type: ignore[arg-type]
@@ -368,7 +353,7 @@ def _fetch_shadow(
                 wait_after_ms=_SHADOW_SETTLE_MS,
                 post_load_scripts=post_load_scripts or [],
             )
-    except (onyxweb.OnyxwebError, TimeoutError) as e:
+    except (OnyxwebError, TimeoutError) as e:
         pytest.skip(f"{_SHADOW_URL} unreachable: {e}")
 
 

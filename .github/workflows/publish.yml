@@ -89,7 +89,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: "2_28"
           working-directory: python/onyxweb
-          args: --release --out ../../dist -i 3.11 3.12 3.13
+          args: --release --out ../../dist -i 3.11 3.12 3.13 3.14 3.15
           sccache: true
           # Built in the wheel's manylinux container, so the glibc baselines match.
           # No sccache there yet, hence RUSTC_WRAPPER=.

@@ -14,22 +14,28 @@ per route carries a real page. The server holds nothing between requests.
 
 from __future__ import annotations
 
-import base64
-import json
-import struct
-import tempfile
+from base64 import b64decode
 from dataclasses import dataclass, field
+from json import dumps, loads
 from pathlib import Path
+from struct import unpack
+from tempfile import TemporaryDirectory
 from typing import Any
 
-import onyxweb
 import pytest
-import zstandard
 from conftest import PUBLIC
 from fastapi.testclient import TestClient
+from onyxweb import (
+    SNAPSHOT_VERSION,
+    ChromeExitedError,
+    OnyxwebError,
+    QueueTimeoutError,
+    RenderResult,
+)
 from onyxweb.testing import FakeClientFactory
-from onyxweb_server.core import CoreConfig, ServerCore
-from onyxweb_server.http import build_app
+from onyxweb_server.core import ALWAYS, PAGE_KEY, PAGE_VERSION, CoreConfig, ServerCore
+from onyxweb_server.http import STATUS, build_app
+from zstandard import ZstdDecompressor
 
 OK: dict[str, Any] = {"url": PUBLIC + "ok"}
 TWO: dict[str, Any] = {"urls": [PUBLIC + "one", PUBLIC + "two"]}
@@ -196,6 +202,32 @@ REQUESTS: dict[str, Request] = {
     "fetch_all_refuses_actions": Request(
         {**OK, "actions": []}, 400, "refused_field", ("actions", _JS), (), path="/fetch_all"
     ),
+    # `select` answers with the views named instead of the page, and always with the verdict.
+    "fetch_selects_views": Request({**OK, "select": ["title", "main_text"]}, asked={}),
+    "fetch_select_takes_every_fetch_option": Request(
+        {**OK, **_PAGE, "select": ["text"]}, engines=("shell",), asked=_PAGE_ASKED
+    ),
+    "fetch_select_of_nothing_is_the_verdict_alone": Request({**OK, "select": []}),
+    "fetch_select_of_no_view": Request(
+        {**OK, "select": ["dom"]},
+        400,
+        "invalid_request",
+        ("'dom'", "main_text"),
+        (),
+        names=OK["url"],
+    ),
+    "fetch_select_takes_a_list": Request(
+        {**OK, "select": "title"}, 422, "invalid_request", ("select",), ()
+    ),
+    "a_selection_over_the_size_cap": Request(
+        {**OK, "select": ["text"]},
+        413,
+        "too_large",
+        ("select fewer views", "ONYXWEB_SERVER_MAX_PAGE_BYTES"),
+        ("full",),
+        config={"max_page_bytes": 10},
+        then=413,
+    ),
     "a_batch_is_a_line_per_url_in_the_order_given": Request(
         TWO, lines=("snapshot", "snapshot"), asked={}, path="/batch"
     ),
@@ -215,6 +247,12 @@ REQUESTS: dict[str, Request] = {
     ),
     "a_page_over_the_cap_is_a_line_in_its_place": Request(
         TWO, lines=("too_large", "too_large"), config={"max_page_bytes": 10}, path="/batch"
+    ),
+    "a_batch_selects_for_every_url": Request(
+        {**TWO, "select": ["title"]}, lines=("page", "page"), asked={}, path="/batch"
+    ),
+    "a_batch_select_of_no_view": Request(
+        {**TWO, "select": ["bogus"]}, 400, "invalid_request", ("'bogus'",), (), path="/batch"
     ),
     "a_batch_of_no_urls": Request(
         {"urls": []}, 400, "invalid_request", ("urls holds 0",), (), path="/batch"
@@ -334,22 +372,29 @@ def test_request(name: str) -> None:
             assert r.content.startswith(MAGIC[row.format])
         elif row.path == "/batch":
             assert r.headers["content-type"].startswith("application/x-ndjson")
-            got = [json.loads(line) for line in r.text.splitlines()]
+            got = [loads(line) for line in r.text.splitlines()]
             assert [g["url"] for g in got] == row.body["urls"]  # type: ignore[index]
-            assert [g["error"]["kind"] if "error" in g else "snapshot" for g in got] == list(
-                row.lines
-            )
+            assert [
+                g["error"]["kind"] if "error" in g else "page" if "page" in g else "snapshot"
+                for g in got
+            ] == list(row.lines)
             assert all(
-                g["snapshot"]["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+                g["snapshot"]["onyxweb_snapshot"] == SNAPSHOT_VERSION
                 for g in got
                 if "snapshot" in g
             )
+            assert all(g["page"][PAGE_KEY] == PAGE_VERSION for g in got if "page" in g)
+        elif isinstance(row.body, dict) and "select" in row.body:
+            body = r.json()
+            assert body[PAGE_KEY] == PAGE_VERSION
+            assert set(body) == {PAGE_KEY, *ALWAYS, *row.body["select"]}
+            assert body["final_url"] == row.body["url"]
         else:
             assert r.headers["content-type"].startswith("application/json")
-            assert SNAPSHOTS[row.path](r.json())["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+            assert SNAPSHOTS[row.path](r.json())["onyxweb_snapshot"] == SNAPSHOT_VERSION
             if row.path == "/fetch_all":
                 assert row.format == r.json()["format"]
-                assert base64.b64decode(r.json()["image"]).startswith(MAGIC[row.format])
+                assert b64decode(r.json()["image"]).startswith(MAGIC[row.format])
         for fragment in row.says:
             assert fragment in r.text, r.text[:300]
         assert factory.engines == list(row.engines), "clients built beyond what the row says"
@@ -362,7 +407,7 @@ def test_request(name: str) -> None:
         assert _post(client, BODIES[row.path], path=row.path).status_code == row.then
 
 
-def _failure(kind: str | None, cls: type[BaseException] = onyxweb.OnyxwebError) -> BaseException:
+def _failure(kind: str | None, cls: type[BaseException] = OnyxwebError) -> BaseException:
     err = cls("boom")
     if kind is not None:
         err.kind = kind  # type: ignore[attr-defined]
@@ -372,11 +417,16 @@ def _failure(kind: str | None, cls: type[BaseException] = onyxweb.OnyxwebError) 
 
 # What a fetch can raise -> the status and kind the caller sees.
 FAILURES: dict[str, tuple[BaseException, int, str]] = {
-    "chrome_exited": (_failure("chrome_exited", onyxweb.ChromeExitedError), 503, "chrome_exited"),
-    "queue_timeout": (_failure("queue_timeout", onyxweb.QueueTimeoutError), 503, "queue_timeout"),
+    "chrome_exited": (_failure("chrome_exited", ChromeExitedError), 503, "chrome_exited"),
+    "queue_timeout": (_failure("queue_timeout", QueueTimeoutError), 503, "queue_timeout"),
     "navigation_timeout": (_failure("navigation_timeout", TimeoutError), 504, "navigation_timeout"),
     "timeout": (_failure("timeout", TimeoutError), 504, "timeout"),
     "cdp": (_failure("cdp"), 502, "cdp"),
+    "http_status": (_failure("http_status"), 502, "http_status"),
+    "dns_failure": (_failure("dns_failure"), 502, "dns_failure"),
+    "connection_refused": (_failure("connection_refused"), 502, "connection_refused"),
+    "tls_failure": (_failure("tls_failure"), 502, "tls_failure"),
+    "redirect_loop": (_failure("redirect_loop"), 502, "redirect_loop"),
     "io": (_failure("io"), 502, "io"),
     "invalid_url": (_failure("invalid_url"), 400, "invalid_url"),
     "invalid_config": (_failure("invalid_config"), 400, "invalid_config"),
@@ -399,7 +449,7 @@ def test_failure(name: str, path: str) -> None:
         r = _post(client, BODIES[path], path=path)
         if path == "/batch":  # a batch never fails as a whole: each URL carries its own failure
             assert r.status_code == 200, r.text
-            errors = [json.loads(line)["error"] for line in r.text.splitlines()]
+            errors = [loads(line)["error"] for line in r.text.splitlines()]
             assert [e["kind"] for e in errors] == [kind, kind]
             assert all("boom" in e["message"] for e in errors)
         else:
@@ -408,6 +458,56 @@ def test_failure(name: str, path: str) -> None:
         factory.built[0][1].error = None
         ok = _post(client, BODIES[path], path=path)
         assert ok.status_code == 200, "an error left the server unable to serve"
+
+
+def test_an_origin_refusal_carries_its_status() -> None:
+    """A cause that is the origin's own answer names that status beside its kind.
+
+    New test: every row above fails for the browser's own reasons; only this cause carries a
+    second fact a caller acts on (429 means back off or try another engine), and a cause
+    without one must not gain the field.
+    """
+    refused = OnyxwebError("boom")
+    refused.kind = "http_status"
+    refused.status_code = 429
+    refused.url = PUBLIC + "ok"
+    for path in BODIES:
+        client, _, _ = _client(FakeClientFactory(error=refused))
+        with client:
+            r = _post(client, BODIES[path], path=path)
+        # A batch always answers 200: each URL carries its own failure as a line.
+        assert r.status_code == (200 if path == "/batch" else 502), r.text
+        errors = (
+            [loads(line)["error"] for line in r.text.splitlines()]
+            if path == "/batch"
+            else [r.json()["error"]]
+        )
+        assert [e["kind"] for e in errors] == ["http_status"] * len(errors)
+        assert [e["status"] for e in errors] == [429] * len(errors)
+
+    plain = OnyxwebError("boom")  # a browser failure says nothing about the origin
+    plain.kind = "cdp"
+    plain.url = PUBLIC + "ok"
+    client, _, _ = _client(FakeClientFactory(error=plain))
+    with client:
+        r = _post(client, OK)
+    assert "status" not in r.json()["error"]
+
+
+def test_every_kind_the_library_raises_has_a_status() -> None:
+    """Every cause the library can name has a deliberate status, never the server's own fault.
+
+    New test: ``STATUS`` is written by hand, and a kind it lacks falls through to 500 — the
+    server blaming itself for a caller's or an origin's problem. Reading the library's own
+    list is what keeps the two from drifting apart when a cause is added.
+    """
+    from onyxweb import error_kinds
+
+    kinds = set(error_kinds())
+    assert len(kinds) > 10, "the library's kind list is empty or truncated"
+    assert not (missing := kinds - set(STATUS)), f"STATUS has no row for {sorted(missing)}"
+    # `internal` really is the server's own failure; no origin or caller cause may answer 500.
+    assert [k for k in kinds if STATUS[k] == 500] == ["internal"]
 
 
 # Accept-Encoding -> the Content-Encoding the response must carry, or None for identity.
@@ -431,8 +531,8 @@ def test_encoding(name: str, path: str) -> None:
     assert r.status_code == 200
     assert r.headers.get("content-encoding") == expected
     assert "accept-encoding" in r.headers["vary"].lower()
-    first = SNAPSHOTS[path](json.loads(r.text.splitlines()[0]))
-    assert first["onyxweb_snapshot"] == onyxweb.SNAPSHOT_VERSION
+    first = SNAPSHOTS[path](loads(r.text.splitlines()[0]))
+    assert first["onyxweb_snapshot"] == SNAPSHOT_VERSION
 
 
 @pytest.mark.parametrize("path", list(SNAPSHOTS))
@@ -448,8 +548,8 @@ def test_zstd_actually_compresses(path: str) -> None:
         client.stream("POST", path, json=BODIES[path], headers={"accept-encoding": "zstd"}) as r,
     ):
         raw = b"".join(r.iter_raw())
-    plain = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
-    assert SNAPSHOTS[path](json.loads(plain.splitlines()[0]))["final_url"].startswith(PUBLIC)
+    plain = ZstdDecompressor().decompressobj().decompress(raw)
+    assert SNAPSHOTS[path](loads(plain.splitlines()[0]))["final_url"].startswith(PUBLIC)
     assert len(raw) < len(plain)
     if path == "/batch":
         assert len(plain.splitlines()) == 2, "the stream lost a line"
@@ -475,10 +575,10 @@ def test_health_reports_each_built_engine_and_the_counters() -> None:
         assert client.get("/health").json()["engines"] == {"full": False}
 
 
-@pytest.mark.parametrize("path", ["/fetch", "/fetch_all", "/batch", "/screenshot"])
+@pytest.mark.parametrize("path", ["/fetch", "/fetch_all", "/batch", "/screenshot", "select"])
 def test_a_real_page_over_http(bucket_page: str, path: str) -> None:
-    """A real page through each route: a snapshot loads back as a full ``RenderResult``, and an
-    image is a PNG of the size asked for.
+    """A real page through each route: a snapshot loads back as a full ``RenderResult``, a
+    selection holds the views it names, and an image is a PNG of the size asked for.
 
     New test: every row above runs on a fake browser, and this one needs the real one.
     """
@@ -487,32 +587,38 @@ def test_a_real_page_over_http(bucket_page: str, path: str) -> None:
     body: dict[str, Any] = {"urls": [bucket_page]} if path == "/batch" else {"url": bucket_page}
     if path == "/screenshot":
         body["viewport"] = [640, 480]
+    if path == "select":  # views of the page, read from the real browser's capture
+        path, body["select"] = "/fetch", ["title", "scripts"]
     with TestClient(build_app(core)) as client:
         r = client.post(path, json=body, headers={"accept-encoding": "zstd"})
     assert r.status_code == 200, r.text[:300]
     if path == "/screenshot":
         assert r.content.startswith(PNG)
-        assert struct.unpack(">II", r.content[16:24]) == (640, 480)
+        assert unpack(">II", r.content[16:24]) == (640, 480)
+    elif "select" in body:
+        got = r.json()
+        assert (got["title"], len(got["scripts"]), got["status_code"]) == ("Bucket Fixture", 4, 200)
+        assert got["final_url"] == bucket_page
     else:
-        first = json.loads(r.text.splitlines()[0])
-        with tempfile.TemporaryDirectory() as tmp:
+        first = loads(r.text.splitlines()[0])
+        with TemporaryDirectory() as tmp:
             saved = Path(tmp) / "page.json"
-            saved.write_text(json.dumps(SNAPSHOTS[path](first)))
-            page = onyxweb.RenderResult.load(saved)
+            saved.write_text(dumps(SNAPSHOTS[path](first)))
+            page = RenderResult.load(saved)
         assert (page.title, len(page.scripts), page.status_code) == ("Bucket Fixture", 4, 200)
         assert page.final_url == bucket_page
         if path == "/fetch_all":
-            assert base64.b64decode(first["image"]).startswith(PNG)
+            assert b64decode(first["image"]).startswith(PNG)
     assert core.pages() == []
 
 
 _KNOBS = {"engine", "wait_ms", "timeout_ms", "wait_until", "headers"}
 _IMAGE = {"full_page", "format", "quality"}
 SCHEMAS: dict[str, set[str]] = {
-    "/fetch": {"url", "block_urls", "bypass_anti_bot"} | _KNOBS,
+    "/fetch": {"url", "block_urls", "bypass_anti_bot", "select"} | _KNOBS,
     "/fetch_all": {"url", "block_urls", "bypass_anti_bot"} | _IMAGE | _KNOBS,
     "/screenshot": {"url", "viewport"} | _IMAGE | _KNOBS,
-    "/batch": {"urls", "block_urls", "bypass_anti_bot"} | _KNOBS,
+    "/batch": {"urls", "block_urls", "bypass_anti_bot", "select"} | _KNOBS,
 }
 
 

@@ -447,7 +447,7 @@ pub fn parse_fetch_config(py_dict: &Bound<'_, PyAny>) -> Result<FetchConfigRs> {
             && !v.is_none()
         {
             let list = v
-                .downcast::<PyList>()
+                .cast::<PyList>()
                 .map_err(|_| OnyxError::InvalidConfig("actions: expected list".to_string()))?;
             for item in list.iter() {
                 cfg.actions.push(parse_action(&item)?);
@@ -577,7 +577,7 @@ fn parse_hash_navigation(v: &Bound<'_, PyAny>) -> Result<HashNavigation> {
 /// discriminator.
 fn parse_action(v: &Bound<'_, PyAny>) -> Result<ActionRs> {
     let d = v
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| OnyxError::InvalidConfig("action: expected dict".to_string()))?;
     let type_str: String = d
         .get_item("type")
@@ -664,7 +664,7 @@ fn as_dict<'py>(v: &Bound<'py, PyAny>) -> Result<Option<Bound<'py, PyDict>>> {
     if v.is_none() {
         return Ok(None);
     }
-    v.downcast::<PyDict>()
+    v.cast::<PyDict>()
         .map(|d| Some(d.clone()))
         .map_err(|_| OnyxError::InvalidConfig("expected dict".to_string()))
 }
@@ -862,7 +862,7 @@ fn parse_chrome(v: &Bound<'_, PyAny>) -> Result<ChromeRs> {
 
 fn parse_user_agent_brand_version(v: &Bound<'_, PyAny>) -> Result<UserAgentBrandVersionRs> {
     let d = v
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| OnyxError::InvalidConfig("user_agent brand entry must be dict".to_string()))?;
     let brand: String = d
         .get_item("brand")?
@@ -878,7 +878,7 @@ fn parse_user_agent_brand_version(v: &Bound<'_, PyAny>) -> Result<UserAgentBrand
 }
 
 fn parse_brand_list(v: &Bound<'_, PyAny>) -> Result<Vec<UserAgentBrandVersionRs>> {
-    let lst = v.downcast::<PyList>().map_err(|_| {
+    let lst = v.cast::<PyList>().map_err(|_| {
         OnyxError::InvalidConfig("brands must be list of {brand,version} dicts".to_string())
     })?;
     lst.iter()
@@ -888,7 +888,7 @@ fn parse_brand_list(v: &Bound<'_, PyAny>) -> Result<Vec<UserAgentBrandVersionRs>
 
 fn parse_user_agent_metadata(v: &Bound<'_, PyAny>) -> Result<UserAgentMetadataRs> {
     let d = v
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| OnyxError::InvalidConfig("user_agent_metadata must be dict".to_string()))?;
 
     let brands = if let Some(x) = d.get_item("brands")? {
@@ -1004,7 +1004,7 @@ fn parse_url_scoped(v: &Bound<'_, PyAny>) -> Result<HashMap<String, Vec<String>>
         return Ok(HashMap::new());
     }
     let d = v
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| OnyxError::InvalidConfig("url_scoped must be dict".to_string()))?;
     let mut out = HashMap::with_capacity(d.len());
     for (k, val) in d.iter() {
@@ -1020,7 +1020,7 @@ fn parse_headers(v: &Bound<'_, PyAny>) -> Result<HashMap<String, String>> {
         return Ok(HashMap::new());
     }
     let d = v
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| OnyxError::InvalidConfig("extra_headers must be dict".to_string()))?;
     let mut out = HashMap::with_capacity(d.len());
     for (k, val) in d.iter() {
@@ -1036,7 +1036,7 @@ fn parse_str_list(v: &Bound<'_, PyAny>) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let lst = v
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| OnyxError::InvalidConfig("expected list of strings".to_string()))?;
     lst.iter()
         .map(|item| item.extract::<String>().map_err(to_internal))
@@ -1045,7 +1045,7 @@ fn parse_str_list(v: &Bound<'_, PyAny>) -> Result<Vec<String>> {
 
 fn parse_pair(v: &Bound<'_, PyAny>) -> Result<(u32, u32)> {
     let tuple = v
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| OnyxError::InvalidConfig("expected (w, h) tuple".to_string()))?;
     if tuple.len() != 2 {
         return Err(OnyxError::InvalidConfig(
@@ -1067,7 +1067,7 @@ fn parse_pair(v: &Bound<'_, PyAny>) -> Result<(u32, u32)> {
 
 fn parse_pair_f64(v: &Bound<'_, PyAny>) -> Result<(f64, f64)> {
     let tuple = v
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| OnyxError::InvalidConfig("expected (a, b) tuple".to_string()))?;
     if tuple.len() != 2 {
         return Err(OnyxError::InvalidConfig(

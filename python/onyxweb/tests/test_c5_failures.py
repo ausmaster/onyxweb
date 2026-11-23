@@ -1,7 +1,7 @@
 """C5 failures — a failure cause maps to one exception, soon, with a tab left working.
 
 ``FAILURES`` names a cause and the exception a fetch must raise: ``TimeoutError``
-for a timeout (deliberately not a ``RuntimeError``), ``onyxweb.OnyxwebError``
+for a timeout (deliberately not a ``RuntimeError``), ``OnyxwebError``
 (a ``RuntimeError``) for everything else, each carrying ``.url`` and an exact
 ``.kind`` plus a message that says what went wrong. Every case then fetches again
 on the same one-tab Client, which must work at once: a failure never wedges the
@@ -12,15 +12,24 @@ that fails is not the page failing.
 
 from __future__ import annotations
 
-import threading
-import time
+import ssl
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
+from threading import Thread
+from time import perf_counter, sleep
 from typing import Any, Literal
 
-import onyxweb
 import pytest
-from onyxweb import Click
+from onyxweb import (
+    Click,
+    Client,
+    FetchConfig,
+    FetchResult,
+    OnyxwebError,
+    QueueTimeoutError,
+    RenderResult,
+)
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -31,7 +40,7 @@ REFUSED = "{refused}"  # stands in for the refused_url fixture
 
 
 def _slow(_request: Request) -> Response:
-    time.sleep(3)  # far past TIMEOUT_MS, so the navigation is still stuck when it fires
+    sleep(3)  # far past TIMEOUT_MS, so the navigation is still stuck when it fires
     return Response("<html><body>late</body></html>", content_type="text/html")
 
 
@@ -43,12 +52,16 @@ def server() -> Iterator[HTTPServer]:
         s.expect_request("/ok").respond_with_data(
             "<html><body>ok</body></html>", content_type="text/html"
         )
+        # A redirect that only ever points at itself: Chrome gives up on the loop.
+        s.expect_request("/loop").respond_with_response(
+            Response(status=302, headers={"Location": "/loop"})
+        )
         yield s
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1) as c:
+def client() -> Iterator[Client]:
+    with Client(concurrency=1) as c:
         yield c
 
 
@@ -77,15 +90,26 @@ _STUCK = {"timeout_ms": TIMEOUT_MS}
 FAILURES: dict[str, Failure] = {
     # Rejected before the tab is touched; the message names the fix.
     "invalid_url_no_scheme_or_host": Failure(
-        "not-a-url", onyxweb.OnyxwebError, "invalid_url", ("https://",)
+        "not-a-url", OnyxwebError, "invalid_url", ("https://",)
     ),
     "invalid_url_bare_host": Failure(
-        "example.com", onyxweb.OnyxwebError, "invalid_url", ("https://",)
+        "example.com", OnyxwebError, "invalid_url", ("https://",)
     ),
-    "invalid_url_empty_host": Failure("http://", onyxweb.OnyxwebError, "invalid_url"),
-    # Reaches Chrome and fails in its network stack.
+    "invalid_url_empty_host": Failure("http://", OnyxwebError, "invalid_url"),
+    # Reaches Chrome and fails in its network stack: each cause the browser names gets its
+    # own kind, so a caller branches on what happened rather than on "browser trouble".
     "connection_refused": Failure(
-        REFUSED, onyxweb.OnyxwebError, "cdp", ("ERR_CONNECTION_REFUSED",)
+        REFUSED, OnyxwebError, "connection_refused", ("nothing accepted a connection",)
+    ),
+    "a_host_that_does_not_resolve": Failure(
+        "https://this-host-does-not-exist-onyxweb.invalid/",
+        OnyxwebError,
+        "dns_failure",
+        ("cannot resolve",),
+        within_s=5.0,
+    ),
+    "a_redirect_that_only_points_at_itself": Failure(
+        "/loop", OnyxwebError, "redirect_loop", ("redirected too many times",), within_s=5.0
     ),
     # The message carries the URL, the awaited lifecycle event and the timeout.
     "navigation_stuck": Failure(
@@ -108,28 +132,28 @@ FAILURES: dict[str, Failure] = {
     # A throwing script aborts the fetch and names its 0-based index.
     "post_load_script_throws": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "post_load_script",
         ("post_load_scripts[1]", "SECOND_THREW"),
         kwargs={"post_load_scripts": ["1 + 1", "throw new Error('SECOND_THREW')", "2 + 2"]},
     ),
     "post_load_script_throws_first": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "post_load_script",
         ("post_load_scripts[0]", "FIRST_THREW"),
         kwargs={"post_load_scripts": ["throw new Error('FIRST_THREW')"]},
     ),
     "post_load_script_rejects": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "post_load_script",
         ("ASYNC_THREW",),
         kwargs={"post_load_scripts": ["(async () => { throw new Error('ASYNC_THREW'); })()"]},
     ),
     "action_aborts": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "cdp",
         ("click(#nonexistent)",),
         kwargs={"actions": [Click(type="click", selector="#nonexistent", on_error="abort")]},
@@ -137,7 +161,7 @@ FAILURES: dict[str, Failure] = {
     # Has a scheme, so config validation passes; Chrome's parser refuses regexp groups.
     "block_url_chrome_cannot_parse": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "invalid_config",
         ("block_urls", "(\\d+)", "*://*.doubleclick.net/*"),
         kwargs={"block_urls": ["*://*/(\\d+)"]},
@@ -145,7 +169,7 @@ FAILURES: dict[str, Failure] = {
     # A client-level change forces the tab to be recreated, and Chrome refuses the pattern then.
     "tab_cannot_be_recreated": Failure(
         "/ok",
-        onyxweb.OnyxwebError,
+        OnyxwebError,
         "invalid_config",
         ("block_urls", "(\\d+)", "*://*.doubleclick.net/*"),
         client={"block_urls": ["*://*/(\\d+)"]},
@@ -153,7 +177,7 @@ FAILURES: dict[str, Failure] = {
     # The one tab is held longer than the queue timeout, so the fetch gives up waiting for it.
     "queue_wait_exceeds_the_timeout": Failure(
         "/ok",
-        onyxweb.QueueTimeoutError,
+        QueueTimeoutError,
         "queue_timeout",
         ("no tab was free", "300", "queue_timeout_ms"),
         within_s=0.3 + SLACK_S,
@@ -176,45 +200,45 @@ def _check_failure(err: BaseException, row: Failure, url: str) -> None:
 
 @pytest.mark.parametrize("name", list(FAILURES))
 def test_fetch_failure(
-    client: onyxweb.Client, server: HTTPServer, refused_url: str, name: str
+    client: Client, server: HTTPServer, refused_url: str, name: str
 ) -> None:
     """Each cause raises its exception in time, and the tab serves the next fetch."""
     row = FAILURES[name]
     url = _url(row.target, server, refused_url)
     before = client.config.snapshot()
     client.update_config(**row.client)
-    holder: threading.Thread | None = None
+    holder: Thread | None = None
     if row.busy_ms:
         seen = len(server.log)
-        holder = threading.Thread(
+        holder = Thread(
             target=client.fetch,
             args=(server.url_for("/ok"),),
             kwargs={"post_load_scripts": [f"new Promise(r => setTimeout(r, {row.busy_ms}))"]},
         )
         holder.start()
         while len(server.log) == seen:  # its request has arrived, so it holds the tab
-            time.sleep(0.01)
-    started = time.perf_counter()
+            sleep(0.01)
+    started = perf_counter()
     try:
         with pytest.raises(BaseException) as exc:
             client.fetch(url, **row.kwargs)
-        elapsed = time.perf_counter() - started
+        elapsed = perf_counter() - started
     finally:
         if holder is not None:
             holder.join()
         client.update_config(config=before)  # a no-op when the row changed nothing
     _check_failure(exc.value, row, url)
     assert elapsed < row.within_s, f"failed after {elapsed:.2f} s"
-    started = time.perf_counter()
+    started = perf_counter()
     assert "ok" in client.fetch(server.url_for("/ok"))
-    assert time.perf_counter() - started < FAST_S, "the tab was left wedged"
+    assert perf_counter() - started < FAST_S, "the tab was left wedged"
 
 
 Capture = Literal["html", "png", "both"]
 _ITEM_TYPE: dict[Capture, type] = {
-    "html": onyxweb.RenderResult,
+    "html": RenderResult,
     "png": bytes,
-    "both": onyxweb.FetchResult,
+    "both": FetchResult,
 }
 
 
@@ -228,8 +252,8 @@ def test_batch_returns_failures_in_place(
     """``batch`` never raises: a failed URL is its exception, at its own position."""
     row = FAILURES[name]
     ok, bad = server.url_for("/ok"), _url(row.target, server, refused_url)
-    config = onyxweb.FetchConfig(timeout_ms=TIMEOUT_MS)
-    with onyxweb.Client(concurrency=3) as batcher:
+    config = FetchConfig(timeout_ms=TIMEOUT_MS)
+    with Client(concurrency=3) as batcher:
         results = batcher.batch([ok, bad, ok], capture=capture, config=config)
     assert isinstance(results[0], _ITEM_TYPE[capture])
     assert isinstance(results[2], _ITEM_TYPE[capture])
@@ -237,12 +261,12 @@ def test_batch_returns_failures_in_place(
     _check_failure(results[1], row, bad)
 
 
-def test_screenshot_rejects_an_invalid_url_fast(client: onyxweb.Client) -> None:
+def test_screenshot_rejects_an_invalid_url_fast(client: Client) -> None:
     """The screenshot path validates the URL as fetch does."""
-    started = time.perf_counter()
-    with pytest.raises(onyxweb.OnyxwebError) as exc:
+    started = perf_counter()
+    with pytest.raises(OnyxwebError) as exc:
         client.screenshot("not-a-url")
-    assert time.perf_counter() - started < FAST_S
+    assert perf_counter() - started < FAST_S
     _check_failure(exc.value, FAILURES["invalid_url_no_scheme_or_host"], "not-a-url")
 
 
@@ -258,7 +282,7 @@ SUBFRAME_FAILURES: dict[str, tuple[str, dict[str, str]]] = {
 
 @pytest.mark.parametrize("name", list(SUBFRAME_FAILURES))
 def test_subframe_failure_is_not_page_failure(
-    client: onyxweb.Client, httpserver: HTTPServer, refused_url: str, name: str
+    client: Client, httpserver: HTTPServer, refused_url: str, name: str
 ) -> None:
     """``loadingFailed`` reports subframe documents too; only the main frame can fail a fetch."""
     src, headers = SUBFRAME_FAILURES[name]
@@ -274,3 +298,82 @@ def test_subframe_failure_is_not_page_failure(
     r = client.fetch(httpserver.url_for("/"), wait_after_ms=500)
     assert r.status_code == 200
     assert _MAIN in r
+
+
+# Error statuses an origin can answer with and then send no body at all for. Chrome refuses
+# to render such a response and fails the navigation, so the status must survive as the cause.
+_EMPTY_STATUSES = {"not_found": 404, "too_many_requests": 429, "unavailable": 503}
+
+
+@pytest.mark.parametrize(("name", "status"), list(_EMPTY_STATUSES.items()))
+def test_an_empty_error_status_is_the_origins_answer(
+    httpserver: HTTPServer, name: str, status: int
+) -> None:
+    """An error status with no body is ``http_status`` carrying the origin's code.
+
+    New test: ``FAILURES`` drives one shell client for every cause, and only the full engine
+    loses the status (the shell completes the navigation), so this needs a client of its own —
+    and a positive control that the same status *with* a body is still an ordinary page.
+    """
+    httpserver.expect_request(f"/empty-{name}").respond_with_data(
+        "", status=status, content_type="text/html"
+    )
+    httpserver.expect_request(f"/body-{name}").respond_with_data(
+        "<p>a body</p>", status=status, content_type="text/html"
+    )
+    httpserver.expect_request("/ok").respond_with_data(
+        "<html><body>ok</body></html>", content_type="text/html"
+    )
+    with Client(engine="full", concurrency=1) as client:
+        with pytest.raises(OnyxwebError) as exc:
+            client.fetch(httpserver.url_for(f"/empty-{name}"))
+        err = exc.value
+        assert not isinstance(err, TimeoutError)  # a refusal is not a timeout
+        assert err.kind == "http_status"
+        assert err.status_code == status  # the origin's own code
+        assert err.url == httpserver.url_for(f"/empty-{name}")
+        assert str(status) in str(err), str(err)
+        # The same status with a body is the page the origin sent, however unwelcome.
+        page = client.fetch(httpserver.url_for(f"/body-{name}"))
+        assert (page.status_code, page.text.strip()) == (status, "a body")
+        # A failed navigation leaves the tab serving.
+        assert "ok" in client.fetch(httpserver.url_for("/ok"))
+
+
+def test_the_shell_engine_renders_an_empty_error_status(httpserver: HTTPServer) -> None:
+    """The shell finishes the navigation the full engine aborts, so it returns the empty page.
+
+    New test: the difference is the engines', not onyxweb's, and a caller choosing ``shell``
+    must see it stated — the status is still right, there is simply no ``http_status`` cause.
+    """
+    httpserver.expect_request("/empty").respond_with_data(
+        "", status=429, content_type="text/html"
+    )
+    with Client(engine="shell", concurrency=1) as client:
+        page = client.fetch(httpserver.url_for("/empty"))
+    assert page.status_code == 429
+    assert page.text == ""
+
+
+def test_a_refused_certificate_is_not_a_browser_fault() -> None:
+    """A certificate Chrome rejects is ``tls_failure``, naming the switch that allows it.
+
+    New test: it needs an HTTPS server, which no other case here uses. It also pins the one
+    setting that decides whether certificates are checked at all — the default trusts them
+    (Chromium's own client does), and ``ignore_https_errors=False`` is what validates.
+    """
+    certs = Path(__file__).parent / "fixtures"
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certs / "self_signed_cert.pem", certs / "self_signed_key.pem")
+    with HTTPServer(ssl_context=context) as secure:
+        secure.expect_request("/").respond_with_data("<p>secret</p>", content_type="text/html")
+        url = secure.url_for("/")
+        with Client(concurrency=1) as trusting:  # the default: any certificate is accepted
+            assert "secret" in trusting.fetch(url).text
+        with Client(concurrency=1, ignore_https_errors=False) as checking:
+            with pytest.raises(OnyxwebError) as exc:
+                checking.fetch(url)
+            err = exc.value
+            assert err.kind == "tls_failure"
+            assert err.url == url
+            assert "ignore_https_errors" in str(err), str(err)  # names the switch

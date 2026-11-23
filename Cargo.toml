@@ -1,6 +1,6 @@
 [package]
 name = "onyxweb"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 publish = false
 # The sdist is the library: the crate, and the Python package maturin adds itself.
@@ -36,9 +36,9 @@ extension = [
 ]
 
 [dependencies]
-pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.30", features = ["extension-module"], optional = true }
 # Bridges Rust async futures to Python awaitables. Pinned to pyo3's major.
-pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"], optional = true }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"], optional = true }
 
 # Chromium via CDP — the new engine
 chromiumoxide = { version = "0.9", optional = true }

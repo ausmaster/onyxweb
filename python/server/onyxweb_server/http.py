@@ -1,11 +1,13 @@
 """The HTTP front-end: one route per browser operation, whole pages on the wire.
 
 A program calling this wants the page, not a digest of it. ``POST /fetch`` answers with
-`RenderResult.snapshot()` as JSON, and ``RenderResult.load`` rebuilds the page from it.
-``POST /screenshot`` answers with the image itself. ``POST /fetch_all`` answers with one JSON
-object holding both, the image as base64. ``POST /batch`` answers with one line of JSON per URL,
-in the order given, each a snapshot or that URL's own failure. JSON is compressed with zstd
-when the caller accepts it. The server holds nothing between requests.
+`RenderResult.snapshot()` as JSON, and ``RenderResult.load`` rebuilds the page from it; given
+``select``, it answers with just the views of the page named there instead (`Selected`), with
+the final URL, status and anti-bot verdict always among them. ``POST /screenshot`` answers with
+the image itself. ``POST /fetch_all`` answers with one JSON object holding both, the image as
+base64. ``POST /batch`` answers with one line of JSON per URL, in the order given, each a
+snapshot, a selection, or that URL's own failure. JSON is compressed with zstd when the caller
+accepts it. The server holds nothing between requests.
 
 Every route goes through `ServerCore`, so the URL guard and the ceilings apply as they do for
 MCP. A request model lists every field its route accepts and forbids the rest, and the fields
@@ -20,32 +22,39 @@ unless a token is set.
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import dataclasses
-import json
-import os
-import secrets
+from asyncio import to_thread
+from base64 import b64encode
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import fields
+from json import dumps
+from os import environ
+from secrets import compare_digest
 from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict
 
 try:
-    import zstandard
     from fastapi import APIRouter, Depends, FastAPI, Request
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import JSONResponse, Response, StreamingResponse
+    from zstandard import ZstdCompressor
 except ImportError as ie:
     raise ImportError(
         "onyxweb_server.http needs fastapi and zstandard; "
         'install them with pip install "onyxweb-server[http]".'
     ) from ie
 
-import onyxweb
+from onyxweb import OnyxwebError, RenderResult
 
-from onyxweb_server.core import FetchOptions, Refused, ServerCore, ShotOptions, TooLarge
+from onyxweb_server.core import (
+    FetchOptions,
+    Refused,
+    Selected,
+    ServerCore,
+    ShotOptions,
+    TooLarge,
+)
 
 TOKEN_VAR: Final = "ONYXWEB_SERVER_TOKEN"
 REFUSED_FIELDS: Final = ("scripts", "post_load_scripts", "actions")
@@ -60,13 +69,18 @@ STATUS: Final = {
     "chrome_exited": 503,
     "queue_timeout": 503,
     "cdp": 502,
+    "http_status": 502,
+    "dns_failure": 502,
+    "connection_refused": 502,
+    "tls_failure": 502,
+    "redirect_loop": 502,
     "io": 502,
     "navigation_timeout": 504,
     "timeout": 504,
     "internal": 500,
 }
-FETCH_KNOBS: Final = {f.name for f in dataclasses.fields(FetchOptions)}
-SHOT_KNOBS: Final = {f.name for f in dataclasses.fields(ShotOptions)}
+FETCH_KNOBS: Final = {f.name for f in fields(FetchOptions)}
+SHOT_KNOBS: Final = {f.name for f in fields(ShotOptions)}
 
 
 class _Timing(BaseModel):
@@ -103,13 +117,16 @@ class _Image(BaseModel):
 
 
 class FetchRequest(_Page):
-    """The body of ``POST /fetch``."""
+    """The body of ``POST /fetch``; `select` names the views to answer with instead."""
 
     url: str
+    select: list[str] | None = None
 
 
-class FetchAllRequest(FetchRequest, _Image):
+class FetchAllRequest(_Page, _Image):
     """The body of ``POST /fetch_all``; the page is captured at the client's viewport."""
+
+    url: str
 
 
 class ScreenshotRequest(_Timing, _Image):
@@ -120,9 +137,10 @@ class ScreenshotRequest(_Timing, _Image):
 
 
 class BatchRequest(_Page):
-    """The body of ``POST /batch``: the options apply to every URL."""
+    """The body of ``POST /batch``: the options, and `select`, apply to every URL."""
 
     urls: list[str]
+    select: list[str] | None = None
 
 
 class _Unauthorized(Exception):
@@ -142,14 +160,33 @@ def _problem(failure: BaseException) -> tuple[int, str]:
     return STATUS.get(kind, 500), kind
 
 
+def _origin_status(failure: BaseException) -> int | None:
+    """The origin's own status behind a failure, when the cause carries one."""
+    status = getattr(failure, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 def _error(
-    request: Request, status: int, kind: str, message: str, url: str | None = None
+    request: Request,
+    status: int,
+    kind: str,
+    message: str,
+    url: str | None = None,
+    origin: int | None = None,
 ) -> JSONResponse:
-    """One error body, naming the URL the request was about when it has one."""
-    url = url or getattr(request.state, "url", None)
-    return JSONResponse(
-        {"error": {"kind": kind, "message": message, "url": url}}, status_code=status
-    )
+    """One error body, naming the URL the request was about when it has one.
+
+    A cause that is the origin's own answer carries that status as ``status``, so a caller
+    can tell "this host refused with 429" from "the browser failed".
+    """
+    error: dict[str, Any] = {
+        "kind": kind,
+        "message": message,
+        "url": url or getattr(request.state, "url", None),
+    }
+    if origin is not None:
+        error["status"] = origin
+    return JSONResponse({"error": error}, status_code=status)
 
 
 def _accepts_zstd(request: Request) -> bool:
@@ -171,15 +208,16 @@ def _wire(make: Callable[[], Any], compress: bool) -> tuple[bytes, dict[str, str
 
     Runs in a thread, since building a large page's snapshot and compressing it hold the loop.
     """
-    body = json.dumps(make(), ensure_ascii=False).encode()
+    body = dumps(make(), ensure_ascii=False).encode()
     headers = {"Vary": "Accept-Encoding"}
     if compress:
-        return zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(body), headers | {
+        return ZstdCompressor(level=ZSTD_LEVEL).compress(body), headers | {
             "Content-Encoding": "zstd"
         }
     return body, headers
 
 
+# Front-end routes share `ServerCore`; see the docstring for the wire format.
 def build_app(core: ServerCore | None = None, token: str | None = None) -> FastAPI:
     """Build the HTTP app over `core`, or over a default core when none is given.
 
@@ -189,7 +227,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
             ``ONYXWEB_SERVER_TOKEN``; none set, or an empty one, leaves the routes open.
     """
     core = core or ServerCore()
-    token = os.environ.get(TOKEN_VAR) if token is None else token
+    token = environ.get(TOKEN_VAR) if token is None else token
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -203,7 +241,7 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         if not token:
             return
         scheme, _, given = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(given.encode(), token.encode()):
+        if scheme.lower() != "bearer" or not compare_digest(given.encode(), token.encode()):
             raise _Unauthorized
 
     app = FastAPI(title="onyxweb-server", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -246,9 +284,11 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
     async def failed(request: Request, exc: Exception) -> JSONResponse:
         """A refusal or a browser failure, answered from the one mapping in `_problem`."""
         status, kind = _problem(exc)
-        return _error(request, status, kind, str(exc), getattr(exc, "url", None))
+        return _error(
+            request, status, kind, str(exc), getattr(exc, "url", None), _origin_status(exc)
+        )
 
-    for cause in (Refused, onyxweb.OnyxwebError, TimeoutError):
+    for cause in (Refused, OnyxwebError, TimeoutError):
         app.add_exception_handler(cause, failed)
 
     guarded = APIRouter(dependencies=[Depends(authorized)])
@@ -256,8 +296,9 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
     @guarded.post("/fetch")
     async def fetch(wanted: FetchRequest, request: Request) -> Response:
         request.state.url = wanted.url  # the handlers above name it in their answers
-        page = await core.fetch(wanted.url, wanted.options())
-        body, headers = await asyncio.to_thread(_wire, page.snapshot, _accepts_zstd(request))
+        page = await core.fetch(wanted.url, wanted.options(), select=wanted.select)
+        make = page.snapshot if isinstance(page, RenderResult) else lambda: page.data
+        body, headers = await to_thread(_wire, make, _accepts_zstd(request))
         return Response(body, media_type="application/json", headers=headers)
 
     @guarded.post("/screenshot")
@@ -278,32 +319,40 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
         def envelope() -> dict[str, Any]:
             return {
                 "snapshot": both.html.snapshot(),
-                "image": base64.b64encode(both.png).decode(),
+                "image": b64encode(both.png).decode(),
                 "format": wanted.format,
             }
 
-        body, headers = await asyncio.to_thread(_wire, envelope, _accepts_zstd(request))
+        body, headers = await to_thread(_wire, envelope, _accepts_zstd(request))
         return Response(body, media_type="application/json", headers=headers)
 
     @guarded.post("/batch")
     async def batch(wanted: BatchRequest, request: Request) -> StreamingResponse:
-        results = await core.batch(wanted.urls, wanted.options())
+        results = await core.batch(wanted.urls, wanted.options(), select=wanted.select)
         compress = _accepts_zstd(request)
 
-        def line(url: str, item: onyxweb.RenderResult | Exception) -> bytes:
+        def line(url: str, item: RenderResult | Selected | Exception) -> bytes:
             if isinstance(item, Exception):
                 _, kind = _problem(item)
-                error = {"kind": kind, "message": str(item), "url": getattr(item, "url", url)}
+                error: dict[str, Any] = {
+                    "kind": kind,
+                    "message": str(item),
+                    "url": getattr(item, "url", url),
+                }
+                if (origin := _origin_status(item)) is not None:
+                    error["status"] = origin
                 entry: dict[str, Any] = {"url": url, "error": error}
+            elif isinstance(item, Selected):
+                entry = {"url": url, "page": item.data}
             else:
                 entry = {"url": url, "snapshot": item.snapshot()}
-            return json.dumps(entry, ensure_ascii=False).encode() + b"\n"
+            return dumps(entry, ensure_ascii=False).encode() + b"\n"
 
         async def lines() -> AsyncIterator[bytes]:
             """Each URL's line as it is built, so no more than one is held encoded at a time."""
-            packer = zstandard.ZstdCompressor(level=ZSTD_LEVEL).compressobj() if compress else None
+            packer = ZstdCompressor(level=ZSTD_LEVEL).compressobj() if compress else None
             for url, item in zip(wanted.urls, results, strict=True):
-                data = await asyncio.to_thread(line, url, item)
+                data = await to_thread(line, url, item)
                 if chunk := packer.compress(data) if packer else data:
                     yield chunk
             if packer:

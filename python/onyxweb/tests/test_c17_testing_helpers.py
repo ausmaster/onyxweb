@@ -10,18 +10,25 @@ context manager) and run every call shape through it. ``MAGIC``, ``BATCHES``, ``
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Awaitable, Callable
+from inspect import iscoroutinefunction, signature
 from typing import Any
 
-import onyxweb
 import pytest
+from onyxweb import (
+    AsyncClient,
+    ChromeExitedError,
+    FetchConfig,
+    FetchResult,
+    OnyxwebError,
+    RenderResult,
+)
 from onyxweb.testing import FakeClient, FakeClientFactory
 
 URL = "http://example.test/page"
-CANNED = onyxweb.RenderResult("<p>CANNED_RESULT</p>", final_url="http://example.test/final")
+CANNED = RenderResult("<p>CANNED_RESULT</p>", final_url="http://example.test/final")
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-Result = onyxweb.RenderResult | onyxweb.FetchResult | bytes
+Result = RenderResult | FetchResult | bytes
 
 # Every call shape on one URL. A batch's result is its list; `_run` unwraps it.
 CALLS: dict[str, Callable[[FakeClient], Awaitable[Any]]] = {
@@ -38,9 +45,6 @@ PAGE_CALLS: dict[str, Callable[[FakeClient, str], Awaitable[Any]]] = {
 }
 
 
-# --- signatures ---------------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "name",
     ["fetch", "screenshot", "fetch_all", "batch", "aclose", "__aenter__", "__aexit__", "alive"],
@@ -48,22 +52,20 @@ PAGE_CALLS: dict[str, Callable[[FakeClient, str], Awaitable[Any]]] = {
 def test_the_fake_matches_the_real_clients_signature(name: str) -> None:
     def shape(fn: Any) -> list[tuple[str, Any, Any]]:
         """A callable's parameters as (name, kind, default), the part a caller depends on."""
-        return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+        return [(p.name, p.kind, p.default) for p in signature(fn).parameters.values()]
 
-    real, fake = getattr(onyxweb.AsyncClient, name), getattr(FakeClient, name)
+    real, fake = getattr(AsyncClient, name), getattr(FakeClient, name)
     if name == "alive":  # a read-only property on both
         assert isinstance(real, property) and isinstance(fake, property)
         assert fake.fset is None
         return
-    assert inspect.iscoroutinefunction(fake) == inspect.iscoroutinefunction(real)
+    assert iscoroutinefunction(fake) == iscoroutinefunction(real)
     assert shape(fake) == shape(real)
 
 
-# --- pages ------------------------------------------------------------------------------------
-
 # Canned pages -> the URL asked for, a fragment the html must carry, and whether the very object
 # given comes back (a ready-made `RenderResult` is served as it is).
-FETCHES: dict[str, tuple[dict[str, str | onyxweb.RenderResult], str, str, bool]] = {
+FETCHES: dict[str, tuple[dict[str, str | RenderResult], str, str, bool]] = {
     "canned_html": ({URL: "<p>CANNED_HTML</p>"}, URL, "CANNED_HTML", False),
     "an_unknown_url_echoes_itself": ({}, URL, URL, False),
     "another_url_is_not_the_canned_one": ({"http://elsewhere.test/": "<p>NO</p>"}, URL, URL, False),
@@ -76,28 +78,26 @@ FETCHES: dict[str, tuple[dict[str, str | onyxweb.RenderResult], str, str, bool]]
 async def test_a_page_is_served_for_the_url(name: str, op: str) -> None:
     pages, url, says, same = FETCHES[name]
     out = await PAGE_CALLS[op](FakeClient(pages), url)
-    page = out.html if isinstance(out, onyxweb.FetchResult) else out[0] if op == "batch" else out
-    assert isinstance(page, onyxweb.RenderResult)
+    page = out.html if isinstance(out, FetchResult) else out[0] if op == "batch" else out
+    assert isinstance(page, RenderResult)
     assert says in page.html
     if same:
         assert page is pages[url]
     else:
         assert (page.final_url, page.status_code) == (url, 0)  # a fake claims no response
-    if isinstance(out, onyxweb.FetchResult):  # forwards its page's fields, and carries an image
+    if isinstance(out, FetchResult):  # forwards its page's fields, and carries an image
         assert (out.final_url, out.status_code) == (page.final_url, page.status_code)
         assert out.png[:8] == PNG_MAGIC
 
 
-# --- states -----------------------------------------------------------------------------------
-
 # State (actions on a fresh client) -> (alive, closed, what a following call raises; None: a page).
 LIFECYCLES: dict[str, tuple[tuple[str, ...], bool, bool, tuple[type[Exception], str] | None]] = {
     "untouched": ((), True, False, None),
-    "closed": (("aclose",), False, True, (onyxweb.OnyxwebError, "closed")),
-    "died": (("die",), False, False, (onyxweb.ChromeExitedError, "exited")),
+    "closed": (("aclose",), False, True, (OnyxwebError, "closed")),
+    "died": (("die",), False, False, (ChromeExitedError, "exited")),
     # Closing a client whose Chrome is gone works, as it does for the real one.
-    "died_then_closed": (("die", "aclose"), False, True, (onyxweb.OnyxwebError, "closed")),
-    "used_as_a_context_manager": (("with",), False, True, (onyxweb.OnyxwebError, "closed")),
+    "died_then_closed": (("die", "aclose"), False, True, (OnyxwebError, "closed")),
+    "used_as_a_context_manager": (("with",), False, True, (OnyxwebError, "closed")),
     # `error` lets a test drive a caller's failure handling; clearing it lets calls succeed.
     "the_error_knob_set": (("error",), True, False, (RuntimeError, "boom")),
     "the_error_knob_cleared": (("error", "clear"), True, False, None),
@@ -137,18 +137,16 @@ async def test_a_client_in_any_state_answers_every_call(name: str, op: str) -> N
         if isinstance(out, bytes):
             assert out[:8] == PNG_MAGIC
         else:
-            page = out.html if isinstance(out, onyxweb.FetchResult) else out
+            page = out.html if isinstance(out, FetchResult) else out
             assert page.final_url == URL
         return
     error, says = raises
     with pytest.raises(error, match=says) as exc:
         await run()
-    if error is onyxweb.ChromeExitedError:
+    if error is ChromeExitedError:
         # Enriched as the real client's errors are, so callers that read them work unchanged.
         assert (exc.value.kind, exc.value.url) == ("chrome_exited", URL)  # type: ignore[attr-defined]
 
-
-# --- images and batches ---------------------------------------------------------------------
 
 # Format -> whether the bytes open as that format.
 MAGIC: dict[str, Callable[[bytes], bool]] = {
@@ -183,7 +181,7 @@ BATCHES: dict[str, tuple[list[str], str, str, Any]] = {
         [URL],
         "html",
         "aclose",
-        (onyxweb.OnyxwebError, "closed"),
+        (OnyxwebError, "closed"),
     ),
     "an_unknown_capture_names_the_valid_ones": (
         [URL],
@@ -213,8 +211,6 @@ async def test_a_batch_returns_one_item_per_url_in_order(name: str) -> None:
         assert getattr(item, "final_url", getattr(item, "url", url)) == url
 
 
-# --- records and validation ----------------------------------------------------------------
-
 # Call -> what `fetched` must hold after it: (url, the overrides the caller set).
 RECORDED: dict[
     str, tuple[Callable[[FakeClient], Awaitable[object]], list[tuple[str, dict[str, Any]]]]
@@ -233,7 +229,7 @@ RECORDED: dict[
     "fetch_all_quality_zero": (lambda f: f.fetch_all(URL, quality=0), [(URL, {"quality": 0})]),
     "fetch_all_with_defaults": (lambda f: f.fetch_all(URL), [(URL, {})]),
     "batch": (
-        lambda f: f.batch([URL, URL + "2"], config=onyxweb.FetchConfig(timeout_ms=900)),
+        lambda f: f.batch([URL, URL + "2"], config=FetchConfig(timeout_ms=900)),
         [(URL, {"timeout_ms": 900}), (URL + "2", {"timeout_ms": 900})],
     ),
 }

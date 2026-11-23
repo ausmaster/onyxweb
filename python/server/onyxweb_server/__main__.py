@@ -8,14 +8,14 @@ Exit codes: 0 after a clean stop, 1 for a bad argument or a missing extra.
 
 from __future__ import annotations
 
-import argparse
-import ipaddress
-import os
 import sys
+from argparse import ArgumentParser
+from ipaddress import ip_address
+from os import environ
 from typing import NoReturn
 
 
-class _Parser(argparse.ArgumentParser):
+class _Parser(ArgumentParser):
     """Argument parser whose usage errors exit 1, as `onyxweb` does."""
 
     def error(self, message: str) -> NoReturn:
@@ -23,7 +23,7 @@ class _Parser(argparse.ArgumentParser):
         self.exit(1, f"{self.prog}: error: {message}\n")
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> ArgumentParser:
     p = _Parser(prog="onyxweb-server", description="Serve onyxweb's browser to agents.")
     commands = p.add_subparsers(dest="command", required=True, metavar="command")
     commands.add_parser(
@@ -73,10 +73,10 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"onyxweb-server: {ie}\n")
             return 1
         try:
-            loopback = ipaddress.ip_address(args.host).is_loopback
+            loopback = ip_address(args.host).is_loopback
         except ValueError:  # a name: only `localhost` is known to be local
             loopback = args.host == "localhost"
-        if not loopback and not os.environ.get(TOKEN_VAR):
+        if not loopback and not environ.get(TOKEN_VAR):
             parser.error(
                 f"--host {args.host} is not a loopback address, so a token is required; "
                 f"set {TOKEN_VAR}, or bind 127.0.0.1 behind a reverse proxy."

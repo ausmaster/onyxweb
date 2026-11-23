@@ -5,6 +5,47 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-22
+
+### Added
+- `RenderResult.main_text`: the page's main content as text, with navigation, headers, footers,
+  asides and forms left out. The content is the block holding the most non-link text — a `<main>`,
+  `article` or `role="main"` element when the page marks one, otherwise the densest block, followed
+  into the single child that holds nearly all of it — and the furniture around it is dropped. The
+  same HTML always yields the same text, so it can be stored and compared against.
+- `RenderResult.published` and `Published(date, source)`: the date a page states it was published as
+  `YYYY-MM-DD`, with the claim it came from (`"json_ld"`, `"meta"` or `"time"`). One fixed order
+  decides between competing claims, so a page stating several always reports the same one, and a
+  page that states none is `None`.
+- Python 3.15 support: onyxweb builds and runs on CPython 3.15, and the Linux release wheels now cover Python 3.14 and 3.15 (0.3.0 shipped Linux wheels for 3.11 to 3.13 only).
+- `onyxweb.error_kinds()` lists every failure `kind` a fetch can carry, so a caller can map each cause to its own policy and notice a release that adds one.
+
+### Changed
+- `bypass_anti_bot` now presses the control a challenge is gating on, instead of only waiting.
+  Some interstitials never navigate by themselves: they hold a control closed until their own
+  check finishes, and lead on only when it is pressed. The control is known by exactly that — the
+  page held it closed and then opened it — so it is found whatever it is called and whatever
+  language it is labelled in, it is pressed once, and no other control on the page is touched.
+- A challenge that neither moves nor holds a control closed is now reported as it stands within a
+  couple of seconds rather than after the whole wait. A rate-limit page or an interactive captcha
+  cannot pass by waiting, and the verdict is worth more to a caller than the delay.
+- A challenge that gates a page gets up to 20 s to resolve (was 12 s), which is the room its own
+  delay needs before its control opens.
+- Google's own waiting room ("Verifying your request") is now detected as a challenge, with vendor
+  `google`; it used to come back as an ordinary page with no verdict at all, so a caller could
+  store a waiting room as if it were the result.
+- onyxweb is built against PyO3 0.30 instead of 0.25, which cannot build for Python 3.15.
+- A wrong-typed argument that reaches the compiled extension, such as `r.dom.query(1)`, still raises `TypeError`, but the argument's name now sits in the exception's note (`while processing 'selector'`) instead of opening its message (`argument 'selector': ...`).
+- Calling a class that has no constructor, such as `onyxweb.Element()`, still raises `TypeError`, now worded `cannot create 'builtins.Element' instances` instead of `No constructor defined for Element`.
+- `ignore_https_errors` defaults to `True`, which states what onyxweb has always done: Chromium's own client accepts any certificate. Setting it to `False` now really validates, where it previously had no effect.
+
+### Fixed
+- A navigation the browser refused now says which refusal it was instead of landing in one `cdp` bucket: `dns_failure`, `connection_refused`, `tls_failure` and `redirect_loop` each carry their own cause, and an error status with no body is `http_status` with the origin's code on `.status_code`. Only a cause onyxweb does not recognise stays `cdp`. Classification happens in one place (`error.rs`), so both routes a navigation failure can take agree.
+- A page that replaces itself just as it is read, such as a redirect page whose script navigates on a timer, is now captured whole: the fetch returns the page it landed on, read once that page has loaded, with the URL, status, headers and HTML all from that one document. When the replacement fell on the capture point, it used to fail with `CDP: Error -32000: Cannot find context with specified id` or come back empty from the blank document in between.
+- On the shell engine, `chrome_args` written with their leading `--` reach Chrome. The launcher adds its own `--`, so such a flag arrived as `----x`, which Chrome ignores, and did nothing; the engine's own list of 29 flags was inert the same way. That list never took effect, so it is removed rather than switched on, and the engine launches exactly as it always ran.
+- A flag the engine sets and a caller's `chrome_args` also sets, such as `--lang`, now takes the caller's value on every launch. Both reached Chrome before, in an order that varied between launches, so the caller's value won on some launches and lost on others. A caller's `disable-features` (and the other feature lists) joins the engine's on both engines instead of replacing it.
+- A client freed without `close()` is closed the way `close()` closes it, and the temporary Chrome profile it made is deleted. The profile used to stay in the temp dir for good, even after the process exited, a few megabytes per client.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

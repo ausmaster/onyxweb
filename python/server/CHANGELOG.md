@@ -4,6 +4,27 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added
+- `select` on `POST /fetch` and `POST /batch`: a list of view names answers with just those views
+  of the page instead of its snapshot, as `{"onyxweb_page": 1, ...}` (a batch line as
+  `{"url", "page"}`). The names are the page's own views — `title`, `published` (the date the page
+  states, and the claim it came from), `main_text` (the content block, without navigation,
+  headers, footers or forms), `text`, `html`, `elapsed_s`, `errors`, `console_messages`,
+  `metadata`, `headers`, and each bucket's records — encoded as the snapshot encodes them.
+  `final_url`, `status_code` and `anti_bot` come with every selection, so a challenge page always
+  arrives with its verdict. Only the views named are computed, the keys come in one fixed order so
+  the same names over the same HTML give the same bytes, and `ONYXWEB_SERVER_MAX_PAGE_BYTES`
+  measures the selection rather than the page. A name that is no view is refused with the list of
+  those that are, and a view the library gains is one row in `core.VIEWS`.
+
+### Changed
+- `CoreConfig.from_env` takes its optional mapping as `env` instead of `environ`; a caller passing it by keyword must rename the argument.
+- The package metadata lists Python 3.14 and 3.15 as supported; on 3.15 it needs an onyxweb release that ships 3.15 wheels, which 0.3.0 does not.
+- A failure the origin or the network caused now answers 502 with its own kind — `http_status` (plus the origin's code as `error.status`), `dns_failure`, `connection_refused`, `tls_failure` or `redirect_loop` — instead of one `cdp` bucket, so a caller can tell a refusing host from a broken browser; a batch carries the same on its line.
+
+### Fixed
+- Behind the egress guard, a page's WebRTC can no longer reach a private address. The guard is a proxy, and a proxy carries only TCP, so the STUN datagrams a page sends went around it to any host it named, on both engines. The browser is now told to send no UDP it cannot proxy.
+
 ## [0.1.1] - 2026-09-23
 
 ### Fixed

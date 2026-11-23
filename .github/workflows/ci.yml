@@ -181,17 +181,21 @@ jobs:
           path: dist
 
   test:
-    # Smoke-test the linux x86_64 wheel end-to-end: install into a fresh venv,
-    # fetch both Chrome builds via `onyxweb --install`, run
+    # Smoke-test the linux x86_64 wheel end-to-end on the oldest and newest supported Python:
+    # install into a fresh venv, fetch both Chrome builds via `onyxweb --install`, run
     # each project's default pytest suite. Skips the benchmark tests (-m 'not benchmark'
     # from python/onyxweb/pyproject.toml addopts).
     needs: [linux]
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.15"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@v4
         with:
           name: wheels-linux-x86_64

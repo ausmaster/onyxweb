@@ -10,7 +10,7 @@ All knobs live under ``ClientConfig``. Pydantic-settings auto-loads from env
 
 from __future__ import annotations
 
-import re
+from re import compile
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -49,7 +49,7 @@ which is the supported CDP path for navigation referrer.
 
 
 # A URLPattern constructor string opens with its scheme: `*://`, `https:`, `data:`.
-_URL_PATTERN_SCHEME: Final = re.compile(r"[^:/?#]+:")
+_URL_PATTERN_SCHEME: Final = compile(r"[^:/?#]+:")
 
 
 def _validate_block_urls(v: list[str]) -> list[str]:
@@ -192,8 +192,13 @@ class NetworkConfig(BaseModel):
     ``Network.setExtraHTTPHeaders``.
     """
 
-    ignore_https_errors: bool = False
-    """Pass ``--ignore-certificate-errors`` to Chrome."""
+    ignore_https_errors: bool = True
+    """Accept any certificate, which is what onyxweb has always done: Chromium's own client
+    ignores certificate errors unless a caller asks it not to.
+
+    Set it to ``False`` to validate: a bad certificate then raises ``tls_failure`` instead of
+    silently trusting the page. A self-signed host in a recon sweep is the usual reason to
+    leave this on."""
 
     block_urls: list[str] = Field(default_factory=list)
     """URLPattern strings (e.g. ``*://*.doubleclick.net/*``) to drop at the
@@ -343,8 +348,15 @@ class ChromeConfig(BaseModel):
     """Override the resolved binary. Default: bundled → env → system."""
 
     args: list[str] = Field(default_factory=list)
+    """Extra Chrome switches for the launch, written with or without the leading ``--``.
+
+    Where the engine sets the same switch, this value replaces it; a feature list
+    (``--disable-features=...``, ``--enable-features=...`` and the blink ones) joins the
+    engine's own instead. Fixed at launch."""
+
     user_data_dir: str | None = None
-    """None → ephemeral tempdir per launch; a path → persistent profile."""
+    """None → ephemeral tempdir per launch, deleted when the client closes or is freed; a path
+    → persistent profile, never deleted."""
 
     headless: bool = True
 

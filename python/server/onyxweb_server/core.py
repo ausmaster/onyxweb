@@ -9,23 +9,25 @@ vocabulary.
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import logging
-import os
-import re
-import time
+from asyncio import Lock, gather, to_thread
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
+from hashlib import sha256
+from json import dumps
+from logging import getLogger
+from os import environ
+from re import compile
+from time import monotonic
 from types import TracebackType
-from typing import Any, Final, Literal, Protocol, Self, TypeVar, cast
+from typing import Any, Final, Literal, Protocol, Self, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
 import onyxweb
-import pydantic
 from onyxweb import FetchResult, RenderResult
 from onyxweb.config import FetchConfig, ScreenshotConfig
+from onyxweb.records import PAGE_BUCKETS
+from pydantic import ValidationError
 
 from onyxweb_server.egress import REFUSED_HEADER, EgressProxy, is_public, resolve_host
 
@@ -40,9 +42,9 @@ MAX_BLOCKS: Final = 50  # URL patterns a caller may block per fetch
 WAIT_MODES: Final = ("load", "domcontentloaded")
 IMAGE_FORMATS: Final = ("png", "jpeg", "webp")
 MAX_VIEWPORT: Final = 4096  # widest and tallest screenshot viewport, in pixels
-PAGE_ID: Final = re.compile(r"p[0-9a-f]{10}")
+PAGE_ID: Final = compile(r"p[0-9a-f]{10}")
 MB: Final = 1024 * 1024
-log = logging.getLogger("onyxweb_server")
+log = getLogger("onyxweb_server")
 T = TypeVar("T")
 
 
@@ -72,8 +74,6 @@ class TooLarge(Refused):
 
     code = "too_large"
 
-
-# --- limits ------------------------------------------------------------------------------
 
 # CoreConfig field -> (environment variable, smallest allowed value).
 _LIMITS: Final = {
@@ -112,23 +112,23 @@ class CoreConfig:
                 )
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> CoreConfig:
+    def from_env(cls, env: Mapping[str, str] | None = None) -> CoreConfig:
         """Read the limits from ``ONYXWEB_SERVER_*``, keeping a default for each one not set.
 
         Raises:
             ValueError: If a variable is not a whole number, is below its minimum, or
                 ``ONYXWEB_SERVER_EGRESS`` is not 1 or 0.
         """
-        environ = os.environ if environ is None else environ
+        env = environ if env is None else env
         values: dict[str, Any] = {}
         for name, (var, smallest) in _LIMITS.items():
-            if var not in environ:
+            if var not in env:
                 continue
             try:
-                number = int(environ[var])
+                number = int(env[var])
             except ValueError as ve:
                 raise ValueError(
-                    f"{var} must be a whole number, got {environ[var]!r}; set it to a count."
+                    f"{var} must be a whole number, got {env[var]!r}; set it to a count."
                 ) from ve
             if number < smallest:
                 raise ValueError(
@@ -136,15 +136,12 @@ class CoreConfig:
                     "set it to how many the server should allow."
                 )
             values[name] = number
-        if EGRESS_VAR in environ:
-            flag = environ[EGRESS_VAR].strip().lower()
+        if EGRESS_VAR in env:
+            flag = env[EGRESS_VAR].strip().lower()
             if flag not in ("0", "1", "true", "false", "yes", "no", "on", "off"):
-                raise ValueError(f"{EGRESS_VAR} must be 1 or 0, got {environ[EGRESS_VAR]!r}.")
+                raise ValueError(f"{EGRESS_VAR} must be 1 or 0, got {env[EGRESS_VAR]!r}.")
             values["egress"] = flag in ("1", "true", "yes", "on")
         return cls(**values)
-
-
-# --- what a caller may ask for -----------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -201,7 +198,7 @@ class FetchOptions:
         try:
             # The library's own validators: forbidden headers, and URLPatterns Chrome can parse.
             FetchConfig(extra_headers=dict(self.headers), block_urls=list(self.block_urls))
-        except pydantic.ValidationError as ve:
+        except ValidationError as ve:
             raise RefusedOption(
                 "; ".join(e["msg"].removeprefix("Value error, ") for e in ve.errors())
             ) from ve
@@ -266,7 +263,84 @@ class ShotOptions:
         return wanted
 
 
-# --- URL guard ---------------------------------------------------------------------------
+PAGE_KEY: Final = "onyxweb_page"
+PAGE_VERSION: Final = 1  # what a selection answers with; bump when a view changes meaning
+ALWAYS: Final = ("final_url", "status_code", "anti_bot")  # in every selection, named or not
+
+
+def _records(bucket: str) -> Callable[[RenderResult], Any]:
+    """A bucket as a view: every record as a plain dict, which is `Bucket.asdict`."""
+    return lambda page: getattr(page, bucket).asdict()
+
+
+# Name -> that view of a page as JSON-ready data, encoded as `RenderResult.snapshot` encodes it
+# where the snapshot has it. Every public view of `RenderResult` is here but those C14 names in
+# `NOT_SELECTABLE`, so a view the library gains is one row. A view is read only when named.
+VIEWS: Final[Mapping[str, Callable[[RenderResult], Any]]] = {
+    "final_url": lambda page: page.final_url,
+    "status_code": lambda page: page.status_code,
+    "anti_bot": lambda page: asdict(page.anti_bot) if page.anti_bot else None,
+    "title": lambda page: page.title,
+    "published": lambda page: asdict(found) if (found := page.published) else None,
+    "main_text": lambda page: page.main_text,
+    "text": lambda page: page.text,
+    "html": lambda page: page.html,
+    "elapsed_s": lambda page: page.elapsed_s,
+    "errors": lambda page: page.errors,
+    "console_messages": lambda page: [asdict(m) for m in page.console_messages],
+    "metadata": lambda page: asdict(page.metadata),
+    "headers": lambda page: {
+        "pairs": [list(pair) for pair in page.headers.pairs],
+        "raw": page.headers.raw,
+        "hashes": asdict(page.headers.hashes),
+    },
+    **{bucket: _records(bucket) for bucket in PAGE_BUCKETS},
+}
+
+
+def _selection(select: Sequence[str]) -> tuple[str, ...]:
+    """The views a selection answers with: `ALWAYS` and those named, in `VIEWS` order.
+
+    The order is the registry's, not the caller's, so the same names give the same bytes.
+
+    Raises:
+        RefusedOption: Naming each name that is no view, and every name that is.
+    """
+    unknown = [name for name in dict.fromkeys(select) if name not in VIEWS]
+    if unknown:
+        raise RefusedOption(
+            f"select holds {', '.join(map(repr, unknown))}, which name no view of a page; "
+            f"choose from {', '.join(VIEWS)}."
+        )
+    named = {*ALWAYS, *select}
+    return tuple(name for name in VIEWS if name in named)
+
+
+@dataclass(frozen=True)
+class Selected:
+    """The views of one page a caller selected: what `fetch` and `batch` answer with `select`.
+
+    Plain data rather than a page, so it cannot be loaded back as one; it is measured, and sent,
+    as the JSON it is.
+
+    Attributes:
+        data: `PAGE_KEY`, then each view by name in `VIEWS` order, `ALWAYS` among them.
+        size: Bytes of `data` as JSON, which is what the size limit measures.
+    """
+
+    data: dict[str, Any]
+    size: int
+
+    @classmethod
+    def of(cls, page: RenderResult, views: Sequence[str]) -> Selected:
+        """Read `views` of `page`; a view not named is never computed."""
+        data = {PAGE_KEY: PAGE_VERSION, **{name: VIEWS[name](page) for name in views}}
+        return cls(data, len(dumps(data, ensure_ascii=False).encode()))
+
+
+def _select_each(items: Sequence[RenderResult | Exception], views: Sequence[str]) -> list[Any]:
+    """A batch's pages as their selections; a failure stays in its place."""
+    return [Selected.of(i, views) if isinstance(i, RenderResult) else i for i in items]
 
 
 def check_url(url: str) -> None:
@@ -313,9 +387,6 @@ def _where(url: str) -> str:
         return "?"
 
 
-# --- the pages held ----------------------------------------------------------------------
-
-
 class PageStore:
     """Pages fetched this session; the least recently used goes first past either limit."""
 
@@ -348,10 +419,10 @@ class PageStore:
                 f"the page is {size} bytes, over the store's {self._max_bytes}; "
                 "raise ONYXWEB_SERVER_MAX_STORE_BYTES, or fetch a smaller page."
             )
-        digest = hashlib.sha256(f"{page.final_url}\n{page.html}".encode()).hexdigest()
+        digest = sha256(f"{page.final_url}\n{page.html}".encode()).hexdigest()
         page_id = f"p{digest[:10]}"
         self._pages.pop(page_id, None)
-        self._pages[page_id] = (page, time.monotonic(), size)
+        self._pages[page_id] = (page, monotonic(), size)
         while len(self._pages) > self._max or self.held_bytes > self._max_bytes:
             self._pages.popitem(last=False)
         return page_id
@@ -373,11 +444,8 @@ class PageStore:
 
     def newest_first(self) -> list[tuple[str, RenderResult, float]]:
         """Every page held as (id, page, age in seconds), without counting a use."""
-        now = time.monotonic()
+        now = monotonic()
         return [(i, p, now - t) for i, (p, t, _) in reversed(self._pages.items())]
-
-
-# --- browser clients ---------------------------------------------------------------------
 
 
 class BrowserClient(Protocol):
@@ -439,15 +507,26 @@ class ClientPool:
         # Only clients the pool builds itself go through the proxy; a caller's own are theirs.
         self._egress = egress if make is None else None
         self._clients: dict[str, BrowserClient] = {}
-        self._building = asyncio.Lock()
+        self._building = Lock()
         self.restarts = 0  # clients replaced because their Chrome died
 
     def _build(self, engine: str) -> BrowserClient:
         """A real client for `engine`, pointed at the egress proxy when there is one."""
         proxied: dict[str, Any] = {}
         if self._egress is not None:
-            # Chrome skips a proxy for loopback and link-local unless told not to.
-            proxied = {"proxy": self._egress.url, "proxy_bypass_list": "<-loopback>"}
+            # Chrome skips a proxy for loopback and link-local unless told not to. A proxy
+            # carries TCP only, so WebRTC's own UDP would go around it to any address a page
+            # names: Chrome is told to send no UDP it cannot proxy, which is none. Full Chrome
+            # reads the first switch and the headless shell the second (measured); each
+            # ignores the one it does not know.
+            proxied = {
+                "proxy": self._egress.url,
+                "proxy_bypass_list": "<-loopback>",
+                "chrome_args": [
+                    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                ],
+            }
         return onyxweb.AsyncClient(
             concurrency=self._config.concurrency,
             queue_timeout_ms=self._config.queue_ms,
@@ -467,7 +546,7 @@ class ClientPool:
                     self.restarts += 1
                     log.warning(f"chrome for engine={engine} died; starting a new one")
                     await client.aclose()
-                self._clients[engine] = await asyncio.to_thread(self._make or self._build, engine)
+                self._clients[engine] = await to_thread(self._make or self._build, engine)
             return self._clients[engine]
 
     def health(self) -> dict[str, bool]:
@@ -480,9 +559,6 @@ class ClientPool:
             await client.aclose()
         if self._egress is not None:
             await self._egress.aclose()
-
-
-# --- one call ----------------------------------------------------------------------------
 
 
 class _EgressWatch:
@@ -537,7 +613,7 @@ class _Call:
         self._summary = ""
 
     def __enter__(self) -> Self:
-        self._started = time.monotonic()
+        self._started = monotonic()
         self._core._requests += self._count
         return self
 
@@ -547,7 +623,7 @@ class _Call:
         failure: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        elapsed = f"{(time.monotonic() - self._started) * 1000:.0f}ms"
+        elapsed = f"{(monotonic() - self._started) * 1000:.0f}ms"
         head = f"{self._op} {self._label} engine={self._engine}"
         if failure is None:
             log.info(f"{head} ok in {elapsed}{self._summary}")
@@ -567,6 +643,10 @@ class _Call:
             or type(failure).__name__
         )
 
+    def note(self, detail: str) -> None:
+        """Say something more in this call's log line, when its result is not a page or image."""
+        self._summary = detail
+
     def done(self, result: T) -> T:
         """Size-check `result`, note what the log line says, and return it.
 
@@ -583,6 +663,8 @@ class _Call:
                 self._summary = f" {len(one)} bytes"
             elif isinstance(one, RenderResult | FetchResult):
                 self._summary = f" status={one.status_code}"
+            elif isinstance(one, Selected):
+                self._summary = f" status={one.data['status_code']}"
             return result
         items: list[Any] = []
         for item in one:
@@ -597,7 +679,11 @@ class _Call:
         return cast(T, items)
 
     def _check(self, result: object) -> None:
-        """Refuse a page or image over the limit; `fetch_all` carries both, so both are checked."""
+        """Refuse a result over the limit, measured as it is sent.
+
+        A page is its html, an image its bytes, and `fetch_all` carries both, so both are
+        checked; a selection is its JSON, whatever the page it came from weighs.
+        """
         if isinstance(result, FetchResult):
             self._under(len(result.html.html.encode()), "page")
             self._under(len(result.png), "image")
@@ -605,22 +691,21 @@ class _Call:
             self._under(len(result.html.encode()), "page")
         elif isinstance(result, bytes):
             self._under(len(result), "image")
+        elif isinstance(result, Selected):
+            self._under(result.size, "answer", "select fewer views")
 
-    def _under(self, size: int, what: str) -> None:
+    def _under(self, size: int, what: str, fix: str = "fetch a smaller page") -> None:
         if size > (limit := self._core._config.max_page_bytes):
             raise TooLarge(
                 f"the {what} is {size} bytes, over the {limit} limit; "
-                "fetch a smaller page, or raise ONYXWEB_SERVER_MAX_PAGE_BYTES."
+                f"{fix}, or raise ONYXWEB_SERVER_MAX_PAGE_BYTES."
             )
-
-
-# --- the core ----------------------------------------------------------------------------
 
 
 class ServerCore:
     """What every front-end shares: guarded fetching, held pages and browser clients.
 
-    A front-end reaches the browser only through these four calls, so the URL guard, the option
+    A front-end reaches the browser only through these calls, so the URL guard, the option
     ceilings and the size limits cannot be skipped. None of them holds a page; a front-end that
     wants one kept under an id calls `hold`. The caller can never pass scripts or actions:
     `FetchOptions` has no field for them.
@@ -662,22 +747,42 @@ class ServerCore:
         self._pool = ClientPool(make_client, config, self._egress)
         self._retries = 0
 
-    async def fetch(self, url: str, options: FetchOptions | None = None) -> RenderResult:
-        """Fetch `url` in a real browser and return the page, holding nothing.
+    @overload
+    async def fetch(
+        self, url: str, options: FetchOptions | None = None, select: None = None
+    ) -> RenderResult: ...
+
+    @overload
+    async def fetch(
+        self, url: str, options: FetchOptions | None = None, *, select: Sequence[str]
+    ) -> Selected: ...
+
+    async def fetch(
+        self, url: str, options: FetchOptions | None = None, select: Sequence[str] | None = None
+    ) -> RenderResult | Selected:
+        """Fetch `url` in a real browser and return the page, or the views of it selected.
+
+        Holds nothing either way.
 
         Args:
             url: The URL to fetch; the guard refuses anything that is not public http(s).
             options: What the caller may ask of the fetch; see `FetchOptions`.
+            select: Names in `VIEWS` to answer with instead of the page, as `Selected`. The
+                `ALWAYS` views come with any selection, so an empty one is the verdict alone.
 
         Raises:
-            Refused: `RefusedOption` for an option outside its ceiling, `RefusedUrl` from the
-                guard (nothing is built or requested first), or `TooLarge` for a page over the
-                size limit.
+            Refused: `RefusedOption` for an option outside its ceiling or a name that is no
+                view, `RefusedUrl` from the guard (nothing is built or requested first), or
+                `TooLarge` for a page, or a selection, over the size limit.
         """
         options = options or FetchOptions()
         with _Call(self, "fetch", _where(url), options.engine) as call:
             wanted = options.overrides(self._config)
-            return call.done(await self._run(url, options, lambda c: c.fetch(url, **wanted)))
+            views = None if select is None else _selection(select)
+            page = await self._run(url, options, lambda c: c.fetch(url, **wanted))
+            if views is None:
+                return call.done(page)
+            return call.done(await to_thread(Selected.of, page, views))
 
     async def screenshot(
         self, url: str, options: FetchOptions | None = None, shot: ShotOptions | None = None
@@ -716,9 +821,22 @@ class ServerCore:
             wanted |= (shot or ShotOptions()).overrides(viewport_allowed=False)
             return call.done(await self._run(url, options, lambda c: c.fetch_all(url, **wanted)))
 
+    @overload
     async def batch(
-        self, urls: Sequence[str], options: FetchOptions | None = None
-    ) -> list[RenderResult | Exception]:
+        self, urls: Sequence[str], options: FetchOptions | None = None, select: None = None
+    ) -> list[RenderResult | Exception]: ...
+
+    @overload
+    async def batch(
+        self, urls: Sequence[str], options: FetchOptions | None = None, *, select: Sequence[str]
+    ) -> list[Selected | Exception]: ...
+
+    async def batch(
+        self,
+        urls: Sequence[str],
+        options: FetchOptions | None = None,
+        select: Sequence[str] | None = None,
+    ) -> list[Any]:
         """Fetch many URLs at once; each result is its page, or the failure in its place.
 
         A URL the guard refuses is returned as its `RefusedUrl` and never reaches the browser.
@@ -726,14 +844,16 @@ class ServerCore:
         Args:
             urls: 1 to `CoreConfig.max_batch` URLs.
             options: Applied to every URL.
+            select: As for `fetch`: each page becomes its `Selected`, measured on its own.
 
         Raises:
-            RefusedOption: If there are too few or too many URLs, or an option is outside its
-                ceiling. Nothing is built or requested first.
+            RefusedOption: If there are too few or too many URLs, an option is outside its
+                ceiling, or a name is no view. Nothing is built or requested first.
         """
         options = options or FetchOptions()
         with _Call(self, "batch", f"{len(urls)} urls", options.engine, len(urls)) as call:
             wanted = options.overrides(self._config)
+            views = None if select is None else _selection(select)
             if not 1 <= len(urls) <= self._config.max_batch:
                 raise RefusedOption(
                     f"urls holds {len(urls)}; send at least 1 and at most "
@@ -749,7 +869,7 @@ class ServerCore:
                 return None
 
             watch = _EgressWatch(self._egress)
-            verdicts = await asyncio.gather(*(asyncio.to_thread(verdict, url) for url in urls))
+            verdicts = await gather(*(to_thread(verdict, url) for url in urls))
             allowed = [url for url, refusal in zip(urls, verdicts, strict=True) if refusal is None]
             fetched = await self._batch(allowed, options, wanted) if allowed else []
             pending = iter(fetched)
@@ -757,7 +877,9 @@ class ServerCore:
             for url, refusal in zip(urls, verdicts, strict=True):
                 item = refusal if refusal is not None else next(pending)
                 results.append(watch.refusal(url) if watch.refused(item) else item)
-            return call.done(results)
+            if views is None:
+                return call.done(results)
+            return call.done(await to_thread(_select_each, results, views))
 
     async def _batch(
         self, urls: list[str], options: FetchOptions, wanted: dict[str, Any]
@@ -784,7 +906,7 @@ class ServerCore:
         retried, since a fetch is idempotent but a timeout would only repeat. A navigation the
         egress proxy refused (a redirect, or a start URL on a private address) is `RefusedUrl`.
         """
-        await asyncio.to_thread(self._guard, url)
+        await to_thread(self._guard, url)
         watch = _EgressWatch(self._egress)
         try:
             client = await self._pool.get(options.engine)

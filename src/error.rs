@@ -75,6 +75,35 @@ pub enum OnyxError {
     #[error("CDP: {0}")]
     Cdp(String),
 
+    /// The origin answered with an error status and no body, which Chrome will not render:
+    /// it aborts the navigation, so the status would otherwise be lost as a `cdp` fault.
+    #[error(
+        "{url} answered HTTP {status} with no body, which Chrome will not render; the origin \
+         refused the request, so retry it later, or fetch with engine=\"shell\" to read the \
+         empty page it sends"
+    )]
+    HttpStatus { status: u16, url: String },
+
+    /// The host name does not resolve. A dead name is the caller's or the DNS's problem,
+    /// never the browser malfunctioning, so it gets its own cause.
+    #[error("cannot resolve {url}; check the host name, and that DNS works here")]
+    DnsFailure { url: String },
+
+    /// The host resolves but nothing is listening on that port.
+    #[error("nothing accepted a connection to {url}; the host resolves, but that port is closed")]
+    ConnectionRefused { url: String },
+
+    /// The TLS handshake or certificate was refused.
+    #[error(
+        "TLS to {url} failed ({detail}); pass ignore_https_errors=True only if you mean to \
+         trust that certificate"
+    )]
+    TlsFailure { detail: String, url: String },
+
+    /// The origin's redirects never reached a page.
+    #[error("{url} redirected too many times; the origin's redirect loop never reached a page")]
+    RedirectLoop { url: String },
+
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
 
@@ -105,6 +134,11 @@ impl OnyxError {
             OnyxError::PostLoadScript { .. } => "post_load_script",
             OnyxError::Timeout(_) => "timeout",
             OnyxError::Cdp(_) => "cdp",
+            OnyxError::HttpStatus { .. } => "http_status",
+            OnyxError::DnsFailure { .. } => "dns_failure",
+            OnyxError::ConnectionRefused { .. } => "connection_refused",
+            OnyxError::TlsFailure { .. } => "tls_failure",
+            OnyxError::RedirectLoop { .. } => "redirect_loop",
             OnyxError::InvalidUrl(_) => "invalid_url",
             OnyxError::InvalidConfig(_) => "invalid_config",
             OnyxError::Io(_) => "io",
@@ -114,16 +148,89 @@ impl OnyxError {
 
     /// Build the Python exception (`TimeoutError` for timeouts, `OnyxwebError`
     /// otherwise — see `From<OnyxError>`), enriched with `.url` (which fetch
-    /// failed) and `.kind` (the cause category). Used both to raise from a
+    /// failed) and `.kind` (the cause category), plus `.status_code` when the
+    /// cause is the origin's own answer. Used both to raise from a
     /// single fetch and to return the exception in a `batch` result list.
     pub fn into_py_err(self, py: Python<'_>, url: &str) -> PyErr {
         let kind = self.kind();
+        let status = match &self {
+            OnyxError::HttpStatus { status, .. } => Some(*status),
+            _ => None,
+        };
         let err: PyErr = self.into();
         let value = err.value(py).as_any();
         let _ = value.setattr("url", url);
         let _ = value.setattr("kind", kind);
+        if let Some(code) = status {
+            let _ = value.setattr("status_code", code);
+        }
         err
     }
+}
+
+/// Every kind a failure can carry, for the front-ends that map one to their own vocabulary.
+/// Kept beside `kind()` so a new cause is added once, next to its arms; `test_c15_http_api`
+/// fails when the server's map lacks one, so the two cannot drift apart quietly.
+pub const ALL_KINDS: &[&str] = &[
+    "chrome_not_found",
+    "launch_failed",
+    "chrome_exited",
+    "queue_timeout",
+    "navigation_timeout",
+    "post_load_script",
+    "timeout",
+    "cdp",
+    "http_status",
+    "dns_failure",
+    "connection_refused",
+    "tls_failure",
+    "redirect_loop",
+    "invalid_url",
+    "invalid_config",
+    "io",
+    "internal",
+];
+
+/// The cause behind a failed navigation, from the words the browser used and, when a response
+/// preceded the failure, the origin's status.
+///
+/// This is the one place a navigation failure is classified, so both routes it can take — a
+/// `goto` that returns the error, and the pool's recorded `loadingFailed` — agree by
+/// construction. Chrome names its reason in `net::ERR_*`; a reason nobody recognised stays
+/// `cdp` with the browser's own text, never a guess.
+pub fn navigation_failure(text: &str, status: Option<u16>, url: &str) -> OnyxError {
+    let says = |needle: &str| text.contains(needle);
+    if says("ERR_HTTP_RESPONSE_CODE_FAILURE")
+        && let Some(status) = status
+    {
+        return OnyxError::HttpStatus {
+            status,
+            url: url.to_string(),
+        };
+    }
+    if says("ERR_NAME_NOT_RESOLVED") || says("ERR_NAME_RESOLUTION_FAILED") {
+        return OnyxError::DnsFailure {
+            url: url.to_string(),
+        };
+    }
+    if says("ERR_CONNECTION_REFUSED") {
+        return OnyxError::ConnectionRefused {
+            url: url.to_string(),
+        };
+    }
+    // The whole certificate family (`ERR_CERT_*`) and the handshake ones (`ERR_SSL_*`).
+    if says("ERR_CERT_") || says("ERR_SSL_") || says("ERR_BAD_SSL_") {
+        return OnyxError::TlsFailure {
+            detail: text.to_string(),
+            url: url.to_string(),
+        };
+    }
+    if says("ERR_TOO_MANY_REDIRECTS") {
+        return OnyxError::RedirectLoop {
+            url: url.to_string(),
+        };
+    }
+    OnyxError::Cdp(text.to_string())
 }
 
 impl From<OnyxError> for PyErr {

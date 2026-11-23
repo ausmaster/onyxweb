@@ -8,7 +8,9 @@ use the real browser, which needs a Chrome from ``onyxweb --install``.
 
 from __future__ import annotations
 
-import socket
+from collections.abc import Iterator
+from socket import socket
+from ssl import SSLContext
 
 import pytest
 from pytest_httpserver import HTTPServer
@@ -80,10 +82,36 @@ _SUBRESOURCES: dict[str, tuple[str, str]] = {
 @pytest.fixture
 def refused_url() -> str:
     """A URL on a closed local port: its navigation reaches Chrome and fails there."""
-    with socket.socket() as sock:
+    with socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"http://127.0.0.1:{port}/"
+
+
+@pytest.fixture(scope="session")
+def make_httpserver(
+    httpserver_listen_address: tuple[str | None, int | None],
+    httpserver_ssl_context: SSLContext | None,
+) -> Iterator[HTTPServer]:
+    """The plugin's session server, serving connections concurrently as any real origin does.
+
+    The plugin's own serves one connection at a time and blocks reading it. Chrome may open a
+    connection and send nothing on it, so the page's request then waits unaccepted behind that
+    one until the browser gives up: a capture that times out at random. Same inputs as the
+    plugin's, plus ``threaded``.
+    """
+    host, port = httpserver_listen_address
+    server = HTTPServer(
+        host=host or HTTPServer.DEFAULT_LISTEN_HOST,
+        port=port or HTTPServer.DEFAULT_LISTEN_PORT,
+        ssl_context=httpserver_ssl_context,
+        threaded=True,
+    )
+    server.start()
+    yield server
+    server.clear()
+    if server.is_running():
+        server.stop()
 
 
 @pytest.fixture

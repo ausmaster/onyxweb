@@ -16,20 +16,19 @@ wrong reason.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any
 
-import onyxweb
 import pytest
 from conftest import reloaded
-from onyxweb import AntiBot
+from onyxweb import AntiBot, Client, RenderResult
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
 STUB_MAX_BYTES = 30_720  # mirrors CHALLENGE_STUB_MAX_BYTES in src/engine.rs
-CHALLENGE_MAX_WAIT_S = 12.0  # mirrors CHALLENGE_MAX_WAIT_MS in src/engine.rs
+CHALLENGE_MAX_WAIT_S = 20.0  # mirrors CHALLENGE_MAX_WAIT_MS in src/engine.rs
 
 
 @dataclass(frozen=True)
@@ -58,6 +57,27 @@ _TURNSTILE = (
 )
 
 
+def _held_gate(label: str = "Continue", opens_after_ms: int = 0, leads_to: str = "") -> str:
+    """A waiting room that holds its own control closed, shaped like a capture of a real one.
+
+    The control is a ``role=button`` holding its label in a child, closed by a ``disabled``
+    attribute its own script removes after a delay; only then does a click lead anywhere. Element
+    ids differ on every response, so the script's own names are what the page is known by.
+    ``leads_to`` is where a click goes; the script appends how many presses it took.
+    """
+    return (
+        f'<div disabled="" id="GfYR0" role="button" tabindex="0"><div>{label}</div></div>'
+        "<script>(function(){var button_id='GfYR0';"
+        f"var delayMillis={opens_after_ms};var redirectUrl='{leads_to}';var presses=0;"
+        "(function(){var continueBtn = document.getElementById(button_id);"
+        "var targetUrl = redirectUrl;"
+        "setTimeout(function(){continueBtn.removeAttribute('disabled');"
+        "continueBtn.addEventListener('click',function(){presses+=1;if(presses===1){"
+        "setTimeout(function(){window.location.replace(targetUrl+presses);},1200);}});"
+        "},delayMillis);})();})();</script>"
+    )
+
+
 def _challenge(vendor: str, resolved: bool = False) -> AntiBot:
     return AntiBot(vendor=vendor, kind="challenge", resolved=resolved)
 
@@ -68,7 +88,7 @@ def _block(vendor: str | None) -> AntiBot:
 
 # Row -> (response served, verdict expected, premise the capture must meet or None).
 VERDICTS: dict[
-    str, tuple[Served, AntiBot | None, Callable[[onyxweb.RenderResult], bool] | None]
+    str, tuple[Served, AntiBot | None, Callable[[RenderResult], bool] | None]
 ] = {
     # --- no signal ---------------------------------------------------------
     "clean": (Served("<html><body>hello world</body></html>"), None, None),
@@ -127,6 +147,20 @@ VERDICTS: dict[
         None,
         None,
     ),
+    # A control called `continueBtn` sits on checkout pages and sign-up forms everywhere, and
+    # any status line can say a request is being verified: neither is a gate by itself.
+    "continue_button_alone": (
+        Served(_stub('<button id="continueBtn">Continue</button>')),
+        None,
+        None,
+    ),
+    "continue_button_alone_full": (_full('<button id="continueBtn">Continue</button>'), None, None),
+    "continue_button_named_in_a_script": (
+        Served(_stub("<script>var continueBtn = document.getElementById('main');</script>")),
+        None,
+        None,
+    ),
+    "verifying_phrase_alone": (Served(_stub("<p>Verifying your request</p>")), None, None),
     # `akam/13` loads on every Akamai-fronted page, challenged or not.
     "akamai_sensor_alone": (Served(_stub("<script src='/akam/13/abc123'></script>")), None, None),
     # --- challenges --------------------------------------------------------
@@ -252,6 +286,25 @@ VERDICTS: dict[
         _challenge("cloudflare", resolved=True),
         lambda r: r.dom.query_one("iframe") is None,
     ),
+    # Google's waiting room: a 200 with no WAF vendor and no captcha, holding its own Continue
+    # control closed while it checks. Its wording is translated and its ids are random, so it
+    # is known by its script, whose names appear together in every capture of the gate and in
+    # no capture of a results page.
+    "google_waiting_room": (
+        Served(
+            "<html><head><title>Search</title></head><body>"
+            f"<h1>Verifying your request</h1>{_held_gate()}</body></html>"
+        ),
+        _challenge("google"),
+        None,
+    ),
+    "google_waiting_room_in_another_language": (
+        Served(f"<html><body><h1>Anfrage wird geprüft</h1>{_held_gate('Weiter')}</body></html>"),
+        _challenge("google"),
+        None,
+    ),
+    # The real one is about 88 KB: well past the stub gate, so its size must not excuse it.
+    "google_waiting_room_full": (_full(_held_gate()), _challenge("google"), None),
     # --- header and status signals ----------------------------------------------
     # `cf-mitigated: challenge` marks a challenge on a 403 even with no body markers.
     "cloudflare_cf_mitigated_header": (
@@ -308,13 +361,13 @@ VERDICTS: dict[
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[onyxweb.Client]:
-    with onyxweb.Client(concurrency=1) as c:
+def client() -> Iterator[Client]:
+    with Client(concurrency=1) as c:
         yield c
 
 
 @pytest.mark.parametrize("row", list(VERDICTS))
-def test_verdict(client: onyxweb.Client, httpserver: HTTPServer, row: str) -> None:
+def test_verdict(client: Client, httpserver: HTTPServer, row: str) -> None:
     """Each response maps to its verdict; detection runs with bypass off."""
     served, expected, premise = VERDICTS[row]
     assert (len(served.body.encode()) > STUB_MAX_BYTES) == served.full, (
@@ -334,9 +387,6 @@ def test_verdict(client: onyxweb.Client, httpserver: HTTPServer, row: str) -> No
         assert premise(r), "the capture doesn't meet the row's premise"
     assert r.anti_bot == expected
     assert reloaded(r).anti_bot == expected  # the verdict survives a snapshot
-
-
-# --- bypass scenarios --------------------------------------------------------
 
 
 @dataclass
@@ -414,6 +464,84 @@ def _challenge_then_real() -> Site:
     return site
 
 
+def _captcha_wall() -> Site:
+    """A rate-limit page carrying an interactive captcha: not something a wait can pass."""
+    return Site(
+        handler=lambda _r: Response(
+            "<html><head><title>Unusual traffic</title></head><body>"
+            "<p>Our systems have detected unusual traffic from your computer network.</p>"
+            '<div class="g-recaptcha" data-sitekey="abc"></div>'
+            "<p>This page checks to see if it's really you sending the requests.</p>"
+            "</body></html>",
+            content_type="text/html",
+        )
+    )
+
+
+def _wall() -> Site:
+    """A challenge that never moves and offers nothing to press: a refusal dressed as a page."""
+    return Site(
+        handler=lambda _r: Response(
+            '<html><body><div id="cf-browser-verification"></div>'
+            "<p>Checking your browser before accessing.</p></body></html>",
+            content_type="text/html",
+        )
+    )
+
+
+def _gated_waiting_room(label: str = "Continue") -> Site:
+    """A waiting room that never reloads itself: it opens its control late, and a press leads on.
+
+    It stays closed for longer than a wall is given to show something, so passing it takes both
+    waiting for the control and pressing it. The real page says how many presses it took.
+    """
+    site = Site(handler=lambda _r: Response())
+
+    def handler(request: Request) -> Response:
+        site.cookies.append(request.headers.get("Cookie", ""))
+        presses = request.args.get("presses")
+        if presses is not None:  # where the control leads
+            body = (
+                "<html><head><title>Real Page</title></head><body>"
+                f"<p>pressed {presses} time(s)</p>" + "x" * 20_000 + "</body></html>"
+            )
+        else:
+            gate = _held_gate(label, opens_after_ms=3000, leads_to="/?presses=")
+            body = f"<html><head><title>Search</title></head><body>{gate}</body></html>"
+        return Response(body, content_type="text/html")
+
+    site.handler = handler
+    return site
+
+
+_NEVER_CLICKED = (
+    '<p id="state">never clicked</p><button id="continueBtn" '
+    "onclick=\"document.getElementById('state').textContent='clicked'\">Continue</button>"
+)
+
+
+def _ordinary_page() -> Site:
+    """An ordinary page with a Continue button of its own, which is nobody's to press."""
+    return Site(
+        handler=lambda _r: Response(
+            f"<html><head><title>Checkout</title></head><body>{_NEVER_CLICKED}"
+            f"{'<p>page content row</p>' * 2000}</body></html>",
+            content_type="text/html",
+        )
+    )
+
+
+def _wall_with_an_open_control() -> Site:
+    """A challenge that never moves, beside a control it never held closed."""
+    return Site(
+        handler=lambda _r: Response(
+            '<html><body><div id="cf-browser-verification"></div>'
+            f"<p>Checking your browser before accessing.</p>{_NEVER_CLICKED}</body></html>",
+            content_type="text/html",
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Scenario:
     """Fetches against one site; the last fetch is judged."""
@@ -479,7 +607,7 @@ SCENARIOS: dict[str, Scenario] = {
         "sec-if-cpt-container",
         _challenge("akamai"),
     ),
-    # Waiting ends when the real page arrives, far short of the 12 s cap.
+    # Waiting ends when the real page arrives, far short of the cap.
     "waits_out_a_challenge_with_bypass": Scenario(
         _challenge_then_real,
         {"bypass_anti_bot": True},
@@ -488,6 +616,69 @@ SCENARIOS: dict[str, Scenario] = {
         "Real Page",
         _challenge("akamai", resolved=True),
         max_s=CHALLENGE_MAX_WAIT_S / 2,
+    ),
+    # A waiting room that never reloads itself and opens its control late: the heal waits for the
+    # control, presses it once, and the page it leads to is what the caller gets.
+    "presses_a_gate_once_it_opens": Scenario(
+        _gated_waiting_room,
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "pressed 1 time(s)",
+        _challenge("google", resolved=True),
+        max_s=CHALLENGE_MAX_WAIT_S / 2,
+    ),
+    # The control is known by the gate having held it closed, never by what it says: the same
+    # gate in another language passes the same way.
+    "presses_a_gate_in_any_language": Scenario(
+        lambda: _gated_waiting_room(label="Weiter"),
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "pressed 1 time(s)",
+        _challenge("google", resolved=True),
+        max_s=CHALLENGE_MAX_WAIT_S / 2,
+    ),
+    # A control the challenge never held closed is not the gate's, so it is never pressed.
+    "never_presses_a_control_the_gate_did_not_hold": Scenario(
+        _wall_with_an_open_control,
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "never clicked",
+        _challenge("cloudflare"),
+        max_s=CHALLENGE_MAX_WAIT_S / 4,
+    ),
+    # An ordinary page is returned as it is, at once, with its own controls untouched.
+    "leaves_an_ordinary_page_alone": Scenario(
+        _ordinary_page,
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "never clicked",
+        None,
+        max_s=CHALLENGE_MAX_WAIT_S / 4,
+    ),
+    # A refusal that never moves and offers nothing to press is reported at once rather than
+    # waited out: waiting cannot pass it, and the caller needs the verdict, not the delay.
+    "reports_a_wall_without_waiting_it_out": Scenario(
+        _wall,
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "Checking your browser",
+        _challenge("cloudflare"),
+        max_s=CHALLENGE_MAX_WAIT_S / 4,
+    ),
+    # An interactive captcha cannot be waited out or pressed: report it as it stands, at once.
+    "reports_an_interactive_captcha_at_once": Scenario(
+        _captcha_wall,
+        {"bypass_anti_bot": True},
+        ({"timeout_ms": 30_000},),
+        200,
+        "unusual traffic",
+        _challenge("recaptcha"),
+        max_s=CHALLENGE_MAX_WAIT_S / 4,
     ),
 }
 
@@ -499,12 +690,12 @@ def test_bypass_scenario(httpserver: HTTPServer, name: str) -> None:
     site = s.site()
     httpserver.expect_request("/").respond_with_handler(site.handler)
     url = httpserver.url_for("/")
-    with onyxweb.Client(concurrency=1, **s.client) as client:
+    with Client(concurrency=1, **s.client) as client:
         for kwargs in s.fetches[:-1]:
             client.fetch(url, **kwargs)
-        started = time.perf_counter()
+        started = perf_counter()
         r = client.fetch(url, **s.fetches[-1])
-        elapsed = time.perf_counter() - started
+        elapsed = perf_counter() - started
     assert r.status_code == s.status
     assert s.shows in r
     assert r.anti_bot == s.verdict

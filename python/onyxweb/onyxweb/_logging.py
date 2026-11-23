@@ -7,21 +7,21 @@ Control via ``ONYXWEB_LOG`` env var (read at module import) or
 
 from __future__ import annotations
 
-import logging
-import os
+from logging import CRITICAL, DEBUG, ERROR, INFO, WARNING, basicConfig, getLogger
+from os import environ
 
-logger = logging.getLogger("onyxweb")
+logger = getLogger("onyxweb")
 
 # stdlib has no TRACE level — Rust trace prints via Rust logger; on the Python
 # side we bucket it to DEBUG so set_log_level("trace") is still meaningful.
 _LEVEL_MAP = {
-    "trace": logging.DEBUG,
-    "debug": logging.DEBUG,
-    "info": logging.INFO,
-    "warn": logging.WARNING,
-    "warning": logging.WARNING,
-    "error": logging.ERROR,
-    "off": logging.CRITICAL + 1,
+    "trace": DEBUG,
+    "debug": DEBUG,
+    "info": INFO,
+    "warn": WARNING,
+    "warning": WARNING,
+    "error": ERROR,
+    "off": CRITICAL + 1,
 }
 
 
@@ -31,7 +31,7 @@ def _parse_level(level: str | int) -> int:
     # Accept env_logger-style filter strings ("onyxweb::engine=trace,warn") by
     # taking the first token's level.
     first = level.split(",")[0].split("=")[-1].strip().lower()
-    return _LEVEL_MAP.get(first, logging.WARNING)
+    return _LEVEL_MAP.get(first, WARNING)
 
 
 def configure(level: str | int | None = None) -> None:
@@ -41,13 +41,13 @@ def configure(level: str | int | None = None) -> None:
     a default timestamped format only if no handlers are already configured.
     """
     if level is None:
-        level = os.environ.get("ONYXWEB_LOG", "warn")
+        level = environ.get("ONYXWEB_LOG", "warn")
     numeric = _parse_level(level)
-    if not logging.getLogger().handlers:
-        logging.basicConfig(
+    if not getLogger().handlers:
+        basicConfig(
             format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
-            level=logging.WARNING,
+            level=WARNING,
         )
     logger.setLevel(numeric)
 
@@ -60,10 +60,10 @@ def set_log_level(level: str | int) -> None:
     """
     configure(level)
     rust_level = level if isinstance(level, str) else {
-        logging.DEBUG: "debug",
-        logging.INFO: "info",
-        logging.WARNING: "warn",
-        logging.ERROR: "error",
+        DEBUG: "debug",
+        INFO: "info",
+        WARNING: "warn",
+        ERROR: "error",
     }.get(level, "warn")
     from onyxweb import _onyxweb
 
