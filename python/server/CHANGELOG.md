@@ -4,6 +4,8 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-23
+
 ### Added
 - `select` on `POST /fetch` and `POST /batch`: a list of view names answers with just those views
   of the page instead of its snapshot, as `{"onyxweb_page": 1, ...}` (a batch line as
@@ -19,7 +21,7 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
 
 ### Changed
 - `CoreConfig.from_env` takes its optional mapping as `env` instead of `environ`; a caller passing it by keyword must rename the argument.
-- The package metadata lists Python 3.14 and 3.15 as supported; on 3.15 it needs an onyxweb release that ships 3.15 wheels, which 0.3.0 does not.
+- The package metadata lists Python 3.14 and 3.15 as supported, which needs an onyxweb release that ships 3.15 wheels: 0.3.0 does not, 0.3.1 does. The dependency is `onyxweb>=0.3.1` for that reason, so a 0.3.1 wheel must be on PyPI before this package is installed.
 - A failure the origin or the network caused now answers 502 with its own kind — `http_status` (plus the origin's code as `error.status`), `dns_failure`, `connection_refused`, `tls_failure` or `redirect_loop` — instead of one `cdp` bucket, so a caller can tell a refusing host from a broken browser; a batch carries the same on its line.
 
 ### Fixed
