@@ -1103,6 +1103,98 @@ def test_main_text_picks_the_densest_block_when_none_is_marked() -> None:
     assert "FOOTER_TEXT" not in page.main_text
 
 
+# How `main_text` must behave where picking the content block is hard: what it must carry, what it
+# must never carry. Every row also asserts the invariant below — a view cannot show what `text`
+# does not — which is the rule the whole family of these bugs breaks.
+_PROSE = "Prose sentence about the subject. " * 5
+_PAYLOAD = 'self.__next_f.push([1,"' + ("# API Reference\\n\\n" * 60) + '"])'
+_CANDIDATE_PAGES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    # A framework's inline state is not content, however much text it holds.
+    "script_payload": (
+        f"<html><body><script>{_PAYLOAD}</script><div><p>{_PROSE}</p></div></body></html>",
+        (_PROSE.strip(),),
+        ("self.__next_f",),
+    ),
+    # The parser keeps a template's children in the tree, so excluding the element alone is not
+    # enough: nothing inside one may be a candidate either.
+    "template_payload": (
+        f"<html><body><template><div>{_PAYLOAD}</div></template>"
+        f"<div><p>{_PROSE}</p></div></body></html>",
+        (_PROSE.strip(),),
+        ("self.__next_f",),
+    ),
+    # The landmark branch chooses an element by selector, so it has to refuse the same elements.
+    "script_is_the_landmark": (
+        f'<html><body><script role="main">{_PAYLOAD}</script>'
+        f"<div><p>{_PROSE}</p></div></body></html>",
+        (_PROSE.strip(),),
+        ("self.__next_f",),
+    ),
+    # A script inside the chosen block must be left out of it.
+    "script_inside_the_block": (
+        f"<html><body><div><script>{_PAYLOAD}</script><p>{_PROSE}</p></div></body></html>",
+        (_PROSE.strip(),),
+        ("self.__next_f",),
+    ),
+    # Furniture is the only element that aggregates siblings on these pages, so it stays a
+    # candidate: barring it returned one paragraph where three exist.
+    "form_wraps_the_page": (
+        "<html><body><form>"
+        + "".join(f"<p>{c}</p>" for c in ("AAA " * 25, "BBB " * 25, "CCC " * 25))
+        + "</form></body></html>",
+        ("AAA", "BBB", "CCC"),
+        (),
+    ),
+    "aside_holds_the_only_text": (
+        f"<html><body><aside>{_PROSE}</aside></body></html>",
+        (_PROSE.strip(),),
+        (),
+    ),
+    # Prose directly in `<body>`, with no wrapper to hold it: `<body>` itself has to be a candidate,
+    # or there is nothing that aggregates the siblings and only the first one survives.
+    "body_holds_the_prose": (
+        f"<html><body>{_PROSE}</body></html>",
+        (_PROSE.strip(),),
+        (),
+    ),
+    "body_siblings_are_one_block": (
+        "<html><body>" + "".join(f"<p>{c}</p>" for c in ("AAA " * 25, "BBB " * 25, "CCC " * 25))
+        + "</body></html>",
+        ("AAA", "BBB", "CCC"),
+        (),
+    ),
+    # The landmark branch selects by selector over the whole document, so it must refuse a
+    # landmark that sits inside an element displaying no text, not only one that is such an element.
+    "landmark_inside_template": (
+        f"<html><body><template><article>{_PAYLOAD}</article></template>"
+        f"<div><p>{_PROSE}</p></div></body></html>",
+        (_PROSE.strip(),),
+        ("self.__next_f",),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_CANDIDATE_PAGES))
+def test_main_text_picks_what_the_page_displays(name: str) -> None:
+    """``main_text`` carries the page's prose, and never anything ``text`` leaves out.
+
+    The second half is the stronger claim, and the one every bug in this family breaks: a script's
+    inline payload, or a template's, is a big block of text in the tree, and a view that counts it
+    disagrees with ``text`` about what the page says.
+    """
+    html, must_contain, must_not = _CANDIDATE_PAGES[name]
+    page = RenderResult(html)
+    main, text = page.main_text, page.text
+    for fragment in must_contain:
+        assert fragment in main, f"{name}: main_text lost {fragment!r}: {main[:200]!r}"
+    for fragment in must_not:
+        assert fragment not in main, f"{name}: main_text carries {fragment!r}"
+    for line in main.splitlines():
+        if line.strip():
+            shown = line.strip()
+            assert shown in text, f"{name}: main_text shows a line text does not: {shown[:80]!r}"
+
+
 # Where a page states its date, in the order the extraction trusts: structured data, a date
 # meta tag, then a <time> element.
 _DATED: dict[str, tuple[str, str, str]] = {
