@@ -3,7 +3,63 @@
 All notable changes to onyxweb. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Releases before this file are listed under [GitHub tags](https://github.com/ausmaster/onyxweb/tags).
 
-## [Unreleased]
+## [0.3.2] - 2026-11-24
+
+### Added
+- `Client.session()` and `AsyncClient.session()`: a run of fetches that share one browser tab. The
+  tab is leased on the session's first fetch and kept until it is closed, so what the first page
+  stored in it — a cookie, a `localStorage` entry, a script's nonce — is there for the fetches that
+  follow. A session adds no state to a tab; it chooses the tab. Each pooled tab has always kept its
+  own browser context for as long as it lives, but which tab a fetch lands on is the pool's choice,
+  so a follow-up fetch met that state only by chance, and with other work in flight almost never.
+  Nothing about a fetch outside a session changes. It costs concurrency, because a session holds a
+  tab out of the pool while it lives: `concurrency=4` with two sessions open leaves two tabs for
+  everything else. A fetch that fails leaves the tab to the session: the tab is reset to a blank
+  page with its context intact, so the next fetch still meets what the session's pages stored, and
+  only a tab the engine could not reset is replaced.
+
+### Fixed
+- A fetch that follows one whose page never finished loading no longer stalls for 30 s. The browser
+  runs one navigation per tab at a time, so a navigation the previous fetch abandoned — its page
+  came back at a lifecycle event, or the fetch ran out of budget — kept that slot until its own
+  30 s command timeout, and the next fetch's hop to a blank page queued behind it: a page that
+  answers in milliseconds failed as `timeout` after 30 s. When that hop does not settle at once,
+  the tab now clears what is holding it before hopping: the load is stopped, which settles a
+  request that never answered, and the blank page is then committed from inside the document,
+  because a plain navigation is what the queue is holding. The reset after a failed fetch does the
+  same, so a tab is only recreated when it is genuinely wedged. A healthy tab never takes that
+  path: its hop resolves in milliseconds.
+- Importing `onyxweb` no longer configures the root logger, and a program's own logging setup works
+  whether it runs before or after the import. `ONYXWEB_LOG`, or `set_log_level(...)`, gives the
+  `onyxweb` logger a handler of its own on stderr; with neither, the logger inherits the host's
+  level and handlers and installs nothing anywhere, and a warning still reaches stderr through the
+  logging module's fallback. `basicConfig` does nothing once root has a handler, so an import that
+  installed one silently took the host's logging with it: every line it logged afterwards went
+  through onyxweb's format, or nowhere at all.
+- `main_text` no longer returns a page's JavaScript as its content. A page that marks no `<main>`,
+  `<article>` or `role="main"` has its blocks scored by the non-link text they hold, and an element
+  that displays no text — a `<script>` shipping a framework's inline state or an analytics blob, a
+  `<template>`, a `<style>` — was scored by its own source text, so on such a page it won and
+  `main_text` came back as source code while `text` listed the page's prose. Two views of one parse
+  contradicting each other. Nothing that displays no text is a content block now, and neither is
+  anything inside one (a `<template>` keeps its children in the tree, so excluding the element
+  alone was not enough), on the landmark path as well as the scored one. Furniture stays eligible
+  on purpose: a `<form>` or `<aside>` wrapping a page is the only element that aggregates its
+  siblings, and barring it truncated `main_text` to one paragraph — or emptied it — on pages that
+  relied on it. On the page that surfaced this, `main_text` fell from 36 206 to 17 124 characters
+  and its word-level F1 against trafilatura rose from 0.229 to 0.765; across 39 pages measured,
+  only that one changed and none regressed.
+
+### Changed
+- A response with status 429 always carries an `anti_bot` verdict. One whose headers or page
+  identify a vendor or a challenge is reported as before; one that names nothing used to come back
+  with `anti_bot=None` and read as an ordinary page whose text happened to be empty, and is now
+  `kind="block"`, `vendor=None`, `resolved=False`. No vendor is inferred from the page's wording,
+  and a 429 that names none is reported, not retried.
+- A trace line now names the navigation stage a fetch reached (`stage=reset-from`, then
+  `stage=navigate`), so a stall between `capture_page` and `nav done` names the step instead of
+  leaving a bare 30 s CDP timeout as the only evidence. The stage names the step and never the
+  tab's previous URL, which on a shared pool belongs to another caller.
 
 ## [0.3.1] - 2026-11-22
 
@@ -122,6 +178,8 @@ Releases before this file are listed under [GitHub tags](https://github.com/ausm
 - `onyxweb --install` keeps the bundled wrapper.
 - A Chrome found only on `PATH` is resolved on Windows.
 
-[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ausmaster/onyxweb/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/ausmaster/onyxweb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ausmaster/onyxweb/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/ausmaster/onyxweb/compare/v0.2.2...v0.2.3

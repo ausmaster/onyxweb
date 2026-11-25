@@ -1,6 +1,6 @@
 [package]
 name = "onyxweb"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 publish = false
 # The sdist is the library: the crate, and the Python package maturin adds itself.
