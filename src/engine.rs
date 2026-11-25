@@ -958,6 +958,16 @@ pub async fn capture_page(
                 kind: "challenge",
                 resolved: v == "cloudflare" && turnstile_token_present(html),
             })
+        } else if result.status_code == 429 {
+            // Last of the detectors, so it never shadows one that says more. 429 is the origin
+            // refusing this client for now, and a page naming no vendor does not make that less
+            // true: without this, a rate-limit page reads as an ordinary page whose text happens
+            // to be empty. No vendor is claimed, because its wording is not evidence of one.
+            Some(AntiBotRs {
+                vendor: None,
+                kind: "block",
+                resolved: false,
+            })
         } else {
             block_hit.map(|v| AntiBotRs {
                 vendor: vendor_opt(v),
