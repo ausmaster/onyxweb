@@ -615,10 +615,10 @@ def test_a_real_page_over_http(bucket_page: str, path: str) -> None:
 _KNOBS = {"engine", "wait_ms", "timeout_ms", "wait_until", "headers"}
 _IMAGE = {"full_page", "format", "quality"}
 SCHEMAS: dict[str, set[str]] = {
-    "/fetch": {"url", "block_urls", "bypass_anti_bot", "select"} | _KNOBS,
+    "/fetch": {"url", "block_urls", "bypass_anti_bot", "select", "session"} | _KNOBS,
     "/fetch_all": {"url", "block_urls", "bypass_anti_bot"} | _IMAGE | _KNOBS,
     "/screenshot": {"url", "viewport"} | _IMAGE | _KNOBS,
-    "/batch": {"urls", "block_urls", "bypass_anti_bot", "select"} | _KNOBS,
+    "/batch": {"urls", "block_urls", "bypass_anti_bot", "select", "session"} | _KNOBS,
 }
 
 
@@ -693,3 +693,28 @@ def test_a_token_gates_every_route_but_health(
             assert "s3cret" not in r.text
             assert factory.built == [] and core.stats()["requests"] == 0
         assert client.get("/health", headers=headers).status_code == 200  # a liveness probe
+
+
+def test_a_session_over_http_is_one_tab_until_it_is_closed() -> None:
+    """`session` holds a tab across requests; `/session/close` gives it back, and says so."""
+    client, _, factory = _client(config={"egress": False})
+    with client:
+        first = _post(client, dict(OK, session="alpha"))
+        second = _post(client, dict(OK, session="alpha"))
+        assert (first.status_code, second.status_code) == (200, 200)
+        held = factory.built[0][1].sessions
+        assert len(held) == 1, "both requests named one session, so one tab served them"
+        assert len(held[0].fetched) == 2
+        assert client.post("/session/close", json={"session": "alpha"}).json() == {"closed": True}
+        again = client.post("/session/close", json={"session": "alpha"})
+        assert again.json() == {"closed": False}, "closing twice is not an error"
+
+
+def test_a_session_past_the_cap_answers_503_with_its_own_kind() -> None:
+    """Over the cap is the server's state, not a malformed request: 503, `refused_session`."""
+    client, _, _ = _client(config={"egress": False, "max_sessions": 1})
+    with client:
+        assert _post(client, dict(OK, session="alpha")).status_code == 200
+        over = _post(client, dict(OK, session="beta"))
+    assert over.status_code == 503
+    assert over.json()["error"]["kind"] == "refused_session"

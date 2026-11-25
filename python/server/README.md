@@ -13,10 +13,11 @@ onyxweb-server http --port 8000              # binds 127.0.0.1
 
 | Route | Returns |
 |---|---|
-| `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it. With `select`, only the views named: `{"onyxweb_page", "final_url", "status_code", "anti_bot", ...}` |
+| `POST /fetch` | the whole page as `RenderResult.snapshot()` JSON; `RenderResult.load` rebuilds it. With `select`, only the views named: `{"onyxweb_page", "final_url", "status_code", "anti_bot", ...}`. With `session`, the fetch runs on that session's tab |
 | `POST /screenshot` | the image itself, as `image/png`, `image/jpeg` or `image/webp` |
 | `POST /fetch_all` | `{"snapshot": {...}, "image": "<base64>", "format": "png"}`: the page and its image from one visit |
-| `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, `{"url", "page"}` with `select`, or `{"url", "error"}` for a URL that failed |
+| `POST /batch` | NDJSON in the order given, one line per URL: `{"url", "snapshot"}`, `{"url", "page"}` with `select`, or `{"url", "error"}` for a URL that failed. With `session`, its URLs run in turn on that one tab |
+| `POST /session/close` | `{"session": "<id>"}` → `{"closed": true}`, or `{"closed": false}` when no such session was open. Gives the tab back; see [Sessions](#sessions) |
 | `GET /health` | `{"status": "ok", "engines": {"full": true}, "stats": {...}}`: each engine built so far and whether its Chrome is alive, plus counters (requests, failures by kind, retries, restarts, pages held, egress refusals) |
 
 Every body is a JSON object sent with `Content-Type: application/json`. A route accepts the fields below and refuses any other by name:
@@ -63,11 +64,38 @@ Both front-ends share one core, so they refuse the same things. `ONYXWEB_SERVER_
 | `MAX_TIMEOUT_MS` | 60000 | longest navigation budget |
 | `QUEUE_MS` | 10000 | longest a request waits for a free tab, then `queue_timeout` |
 | `CONCURRENCY` | 4 | tabs per engine |
+| `MAX_SESSIONS` | 16 | sessions held at once; each one leases a tab |
+| `SESSION_TTL_MS` | 120000 | longest a session may idle before its tab goes back |
 | `EGRESS` | 1 | `0` turns the egress proxy off |
 
 A caller may set only `engine`, `wait_ms`, `timeout_ms`, `wait_until`, extra headers, `block_urls` and `bypass_anti_bot`, each within a ceiling, and choose what comes back with `select`. A Chrome that dies mid-call is replaced and the call retried once.
 
 The browser reaches the network through a proxy the server runs on 127.0.0.1. It resolves every host itself, refuses the request unless every answer is a public address, and connects to the address it checked. So a redirect, a rebinding host, or a page's own script cannot reach a private, loopback or link-local address. A proxy carries only TCP, so the browser is also told to send no UDP it cannot proxy: a page's WebRTC cannot go around the proxy either. A full Chrome opens one connection to `www.google.com` per tab when it starts. The proxy allows it, since the address is public. A refused navigation is refused like a private URL: a 400 over HTTP, a tool error over MCP. A screenshot of a refused plain-HTTP page shows the proxy's refusal text, because an image carries no status. The proxy adds no authentication of its own: it listens on loopback only, and it can reach only public addresses.
+
+## Sessions
+
+A request that names a `session` runs on a tab held for that id, so the pages it fetches share what the first of them left in that tab — a cookie, a `localStorage` entry, the tab's own state. A link whose next step depends on the page above it needs exactly that: a search engine's redirect token resolves only in the tab that rendered the results, and from any other tab it stays a token page.
+
+```jsonc
+POST /fetch          {"url": "<results page>",   "select": ["html"], "session": "<uuid4().hex>"}
+POST /fetch          {"url": "<redirect token>", "wait_ms": 2000,    "session": "<the same id>"}
+POST /session/close  {"session": "<the same id>"}
+```
+
+```bash
+curl -s localhost:8766/fetch -H 'content-type: application/json' \
+  -d '{"url":"<redirect token>","wait_ms":2000,"session":"a4f2"}'
+curl -s localhost:8766/session/close -H 'content-type: application/json' \
+  -d '{"session":"a4f2"}'
+```
+
+A session leases one of the engine's `CONCURRENCY` tabs for as long as it lives, so four open sessions leave that engine's remaining tabs for sessionless work, and a request that finds none queues as usual. `MAX_SESSIONS` bounds how many ids may hold a tab at once; past it the answer is `refused_session`, a 503 whose message names the way out. A session idle longer than `SESSION_TTL_MS` is closed by the server itself, no later than a quarter of the TTL (5 s at most) after it runs out, whether or not another request arrives. Closing is explicit and idempotent: `{"closed": false}` means there was nothing to close, not that anything failed.
+
+A session adds no state to a tab; it chooses the tab. Every tab keeps its own browser context for as long as it lives, isolated from the other tabs', so a site's cookies and storage outlast the request that set them, and a later request that happens to land on that tab meets them. Which tab a request lands on is the pool's choice; a session is how a caller makes it the same one. When a session closes, its tab goes back as any request returns it.
+
+A session ends with the browser its tab lived in. If that browser exits, the session's next call is answered once with `chrome_exited` and is not retried on a fresh tab, which would hold none of what the session's pages stored; the id then opens a new session.
+
+Within a session, fetches take turns on its tab, so `/batch` with a session runs its URLs one after another rather than across the pool. A request that names no session is untouched by all of this: it takes a tab, uses it, and gives it back, as before.
 
 ## MCP
 

@@ -141,6 +141,8 @@ __all__ = [
     "RedirectHop",
     "Published",
     "RenderResult",
+    "Session",
+    "AsyncSession",
     "ResponseHeaders",
     "ResponseMetadata",
     "Wait",
@@ -531,6 +533,97 @@ def _make_render_result(raw: _RenderOutput | _FetchOutput) -> RenderResult:
         anti_bot=_make_anti_bot(raw),
         _raw=raw,
     )
+
+
+class Session:
+    """A run of fetches that share one browser tab.
+
+    A session is how a caller says these fetches belong together: the tab is leased on the first
+    fetch and kept until the session is closed, so what the first page stored in it — a cookie, a
+    ``localStorage`` entry, a script's nonce — is there for the ones that follow.
+
+    A session adds no state to a tab; it chooses the tab. Each pooled tab keeps its own browser
+    context for as long as it lives, isolated from every other tab's, so a site's cookies and
+    storage outlast the fetch that set them. Without a session, which tab a fetch lands on is the
+    pool's choice, so a follow-up fetch meets that state only by chance. A fetch never sees the
+    previous page itself: it leaves for a blank document first.
+
+    A session holds a tab out of the pool while it lives, so close it when the run is done. The tab
+    goes back as any fetch returns it, its context intact.
+
+    Example:
+        >>> with client.session() as s:
+        ...     page = s.fetch("https://example.com/results")
+        ...     for link in links_of(page):
+        ...         followed = s.fetch(link)      # same tab, so same session state
+    """
+
+    def __init__(self, rust: Any) -> None:
+        self._rust = rust
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        config: FetchConfig | None = None,
+        **overrides: Any,
+    ) -> RenderResult:
+        """Fetch ``url`` on this session's tab, leasing the tab on first use."""
+        fc = _merge_fetch_config(config, overrides)
+        _client_log.debug("session fetch: %s", url)
+        return _make_render_result(self._rust.fetch(url, fc.model_dump()))
+
+    def close(self) -> None:
+        """Return this session's tab to the pool. Safe to call more than once."""
+        self._rust.close()
+
+    def __enter__(self) -> Session:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+
+class AsyncSession:
+    """A run of fetches that share one browser tab (async shape of :class:`Session`).
+
+    The tab is leased on the first fetch and kept until the session is closed, so state the first
+    page left in it is still there for the ones that follow.
+
+    Example:
+        >>> async with client.session() as s:
+        ...     page = await s.fetch("https://example.com/results")
+        ...     followed = await s.fetch(link)
+    """
+
+    def __init__(self, rust: Any) -> None:
+        self._rust = rust
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        config: FetchConfig | None = None,
+        **overrides: Any,
+    ) -> RenderResult:
+        """Fetch ``url`` on this session's tab, leasing the tab on first use."""
+        fc = _merge_fetch_config(config, overrides)
+        _client_log.debug("asession fetch: %s", url)
+        return _make_render_result(await self._rust.fetch_async(url, fc.model_dump()))
+
+    async def close(self) -> None:
+        """Return this session's tab to the pool. Safe to call more than once."""
+        await self._rust.close_async()
+
+    async def aclose(self) -> None:
+        """Alias of :meth:`close`, for symmetry with ``AsyncClient``."""
+        await self.close()
+
+    async def __aenter__(self) -> AsyncSession:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.close()
 
 
 class RenderResult:
@@ -1107,6 +1200,10 @@ class Client:
 
     # --- Primary API -------------------------------------------------------
 
+    def session(self) -> Session:
+        """Open a session: fetches that share one tab, and so share what the first left in it."""
+        return Session(self._rust.session())
+
     def fetch(
         self,
         url: str,
@@ -1384,6 +1481,10 @@ class AsyncClient:
         self._config = new_config
 
     # --- Primary API ------------------------------------------------------
+
+    def session(self) -> AsyncSession:
+        """Open a session: fetches that share one tab, and so share what the first left in it."""
+        return AsyncSession(self._rust.session())
 
     async def fetch(
         self,

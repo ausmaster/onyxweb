@@ -16,6 +16,7 @@ A fake client stands in for the browser, so nothing here launches Chrome.
 
 from __future__ import annotations
 
+from asyncio import gather, sleep
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property, partial
@@ -48,6 +49,8 @@ from onyxweb_server.core import (
     CoreConfig,
     FetchOptions,
     Refused,
+    RefusedOption,
+    RefusedSession,
     Selected,
     ServerCore,
     ShotOptions,
@@ -990,3 +993,203 @@ def test_the_limits_come_from_the_environment_or_arguments(
     config = build()
     for attr, value in expected.items():
         assert getattr(config, attr) == value, attr
+
+
+async def test_a_session_is_one_tab_for_every_fetch_that_names_it() -> None:
+    """An id holds one tab: its fetches land there in order, and a second id gets its own."""
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False))
+    try:
+        await core.fetch("https://example.com/a", session="alpha")
+        await core.fetch("https://example.com/b", session="alpha")
+        await core.fetch("https://example.com/c", session="beta")
+        client = factory.built[0][1]
+        assert len(client.sessions) == 2, "one tab per id, not one per fetch"
+        assert [url for url, _ in client.sessions[0].fetched] == [
+            "https://example.com/a",
+            "https://example.com/b",
+        ]
+        assert [url for url, _ in client.sessions[1].fetched] == ["https://example.com/c"]
+    finally:
+        await core.aclose()
+
+
+async def test_a_closed_session_gives_its_tab_back_and_the_next_fetch_opens_another() -> None:
+    """Closing is explicit and idempotent: the tab returns, and a reused id starts clean."""
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False))
+    try:
+        await core.fetch("https://example.com/a", session="alpha")
+        assert await core.close_session("alpha") is True
+        client = factory.built[0][1]
+        assert client.sessions[0].closed is True
+        assert core.session_count() == 0
+        await core.fetch("https://example.com/b", session="alpha")
+        assert len(client.sessions) == 2, "the id is the caller's; the tab behind it is new"
+        assert client.sessions[1].closed is False
+        assert await core.close_session("never-opened") is False
+    finally:
+        await core.aclose()
+
+
+async def test_an_idle_session_expires_and_gives_its_tab_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TTL is measured from the last use, so a session in use is never expired under it."""
+    now = [0.0]
+    monkeypatch.setattr("onyxweb_server.core.monotonic", lambda: now[0])
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False, session_ttl_ms=1000))
+    try:
+        await core.fetch("https://example.com/a", session="alpha")
+        client = factory.built[0][1]
+        now[0] = 0.5
+        await core.fetch("https://example.com/b", session="alpha")
+        assert len(client.sessions) == 1, "inside the TTL the same tab serves the next fetch"
+        now[0] = 2.0  # 1.5 s after the last use at 0.5, past a 1000 ms TTL
+        await core.fetch("https://example.com/c", session="alpha")
+        assert client.sessions[0].closed is True, "the idle tab went back to the pool"
+        assert len(client.sessions) == 2
+    finally:
+        await core.aclose()
+
+
+async def test_a_session_past_the_cap_is_refused_naming_the_way_out() -> None:
+    """The cap is a 503-class refusal whose message says how to get in; nothing is built for it."""
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False, max_sessions=1))
+    try:
+        await core.fetch("https://example.com/a", session="alpha")
+        with pytest.raises(RefusedSession) as refusal:
+            await core.fetch("https://example.com/b", session="beta")
+        assert refusal.value.code == "refused_session"
+        assert "ONYXWEB_SERVER_MAX_SESSIONS" in str(refusal.value)
+        assert core.session_count() == 1
+        assert factory.built[0][1].sessions[-1].closed is False, "the held tab is untouched"
+    finally:
+        await core.aclose()
+
+
+async def test_an_unusable_session_id_is_a_malformed_request_not_a_full_server() -> None:
+    """A bad id is the caller's error, so it is not reported as the cap being reached."""
+    core = ServerCore(FakeClientFactory(), config=CoreConfig(egress=False))
+    try:
+        for bad in ("", "x" * 201):
+            with pytest.raises(RefusedOption):
+                await core.fetch("https://example.com/a", session=bad)
+        assert core.session_count() == 0
+    finally:
+        await core.aclose()
+
+
+async def test_a_batch_sharing_a_session_takes_its_turns_on_one_tab() -> None:
+    """A batch on a session is a run of fetches on one tab, not a fan-out across the pool."""
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False))
+    urls = ["https://example.com/a", "https://example.com/b"]
+    try:
+        results = await core.batch(urls, session="alpha")
+        client = factory.built[0][1]
+        assert len(client.sessions) == 1
+        assert [url for url, _ in client.sessions[0].fetched] == urls
+        assert all(not isinstance(item, Exception) for item in results), "each URL answered"
+        assert len(results) == len(urls)
+    finally:
+        await core.aclose()
+
+
+async def test_the_session_cap_holds_when_the_first_requests_arrive_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission is serialised: a launch awaited inside it cannot let four ids past a cap of two.
+
+    The fake client opens a session without yielding, so the launch is stood in for: a real first
+    use awaits Chrome, and that await is the window the cap and the id both raced through.
+    """
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False, max_sessions=2))
+    real_get = core._pool.get
+
+    async def slow_get(engine: str) -> Any:
+        await sleep(0)
+        return await real_get(engine)
+
+    monkeypatch.setattr(core._pool, "get", slow_get)
+    try:
+        results = await gather(
+            *(core.fetch(f"https://example.com/{i}", session=f"s{i}") for i in range(4)),
+            return_exceptions=True,
+        )
+        served = [item for item in results if not isinstance(item, BaseException)]
+        refused = [item for item in results if isinstance(item, RefusedSession)]
+        assert len(served) == 2, f"{len(served)} served, past a cap of 2"
+        assert len(refused) == 2
+        assert core.session_count() == 2
+    finally:
+        await core.aclose()
+
+
+@pytest.mark.parametrize("dies", ["between_fetches", "during_a_fetch"])
+async def test_a_session_ends_with_its_browser_and_says_so_once(dies: str) -> None:
+    """A session cannot outlive the browser its tab lived in, and its next call says so, once.
+
+    The call is answered with the browser's exit and is not retried: a fresh tab holds none of
+    what the session's pages stored, so a retry could answer a page that looks right and is not.
+    The id then opens a new session. `between_fetches` is a browser that died while the session
+    idled: the pool replaces it before the session's stale tab is tried, so the library's own
+    answer there is a "Client is closed" with no kind. `during_a_fetch` is the exit the library
+    names itself.
+    """
+    factory = _MortalFactory(1) if dies == "during_a_fetch" else FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False))
+    try:
+        if dies == "between_fetches":
+            await core.fetch("https://example.com/a", session="alpha")
+            factory.built[0][1].die()
+            assert core.session_count() == 0, "a session whose browser is gone holds no tab"
+        with pytest.raises(onyxweb.ChromeExitedError) as lost:
+            await core.fetch("https://example.com/b", session="alpha")
+        told = (getattr(lost.value, "kind", None), getattr(lost.value, "url", None))
+        assert told == ("chrome_exited", "https://example.com/b")
+        first = factory.built[0][1]
+        assert first.sessions[0].closed is True
+        assert core.session_count() == 0 and core.stats()["sessions"] == 0
+        assert core.stats()["retries"] == 0, "a session fetch is not retried on a fresh tab"
+        await core.fetch("https://example.com/c", session="alpha")
+        second = factory.built[1][1]
+        assert [url for url, _ in second.sessions[0].fetched] == ["https://example.com/c"]
+        assert core.session_count() == 1, "the id opened a new session on the new browser"
+    finally:
+        await core.aclose()
+
+
+async def test_a_batch_whose_session_loses_its_browser_answers_each_url_left_as_the_exit() -> None:
+    """The URLs left are not tried on a fresh tab: each is the exit, under its own URL."""
+    factory = _MortalFactory(1)
+    core = ServerCore(factory, config=CoreConfig(egress=False))
+    urls = ["https://example.com/a", "https://example.com/b", "https://example.com/c"]
+    try:
+        results = await core.batch(urls, session="alpha")
+        assert [type(item) for item in results] == [onyxweb.ChromeExitedError] * 3
+        assert [getattr(item, "url", None) for item in results] == urls
+        assert {getattr(item, "kind", None) for item in results} == {"chrome_exited"}
+        assert [url for url, _ in factory.built[0][1].fetched] == urls[:1], "the rest never ran"
+        assert len(factory.built) == 1, "and no other browser was asked for them"
+        assert core.session_count() == 0
+    finally:
+        await core.aclose()
+
+
+async def test_an_idle_session_expires_without_any_later_session_request() -> None:
+    """The reaper expires an idle session on its own, so a caller that died cannot pin a tab."""
+    factory = FakeClientFactory()
+    core = ServerCore(factory, config=CoreConfig(egress=False, session_ttl_ms=100))
+    try:
+        await core.fetch("https://example.com/a", session="alpha")
+        client = factory.built[0][1]
+        assert client.sessions[0].closed is False
+        await sleep(0.3)  # three TTLs; nothing else calls into the core in this window
+        assert client.sessions[0].closed is True, "the reaper closed it, with no caller asking"
+        assert core.session_count() == 0
+    finally:
+        await core.aclose()

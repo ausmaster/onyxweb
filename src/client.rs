@@ -35,7 +35,7 @@ use crate::config::{
 };
 use crate::engine::{CaptureMode, CaptureOutput, capture_page};
 use crate::error::{OnyxError, Result};
-use crate::pool::PagePool;
+use crate::pool::{PageGuard, PagePool};
 use crate::result::{RawFetchOutput, RawRenderOutput};
 use crate::runtime;
 
@@ -505,6 +505,145 @@ async fn do_fetch_inner(
         .await
 }
 
+/// One browser tab held across several fetches, so a run of requests lands on the same tab and
+/// meets what its own pages stored there — cookies, `localStorage`, a script's nonce — instead of
+/// each landing on whichever tab the pool hands out next. The tab is leased on the first fetch
+/// and returned to the pool when the session is closed or dropped.
+///
+/// A session adds no state to a tab; it chooses the tab. Every pooled tab keeps its own browser
+/// context for as long as it lives, so what a site stored is already there for a later fetch that
+/// lands on that tab — but which tab a fetch gets is the pool's choice, and with other work in
+/// flight it is rarely the same one twice. A session is how a caller makes it the same one. When
+/// it ends, the tab goes back as any fetch returns it, its context intact.
+///
+/// A fetch that fails does not cost the session its tab: the tab is reset to a blank page with
+/// its context intact, so the next fetch still meets what the session's pages stored. Only a tab
+/// the engine could not reset is replaced, and that is the one case where what it held is gone.
+#[pyclass]
+pub struct Session {
+    inner: Arc<ClientState>,
+    /// `None` until the first fetch leases a tab. Held across a fetch, so a session's own calls
+    /// take turns on its one tab — which is what sharing a session means.
+    held: Arc<tokio::sync::Mutex<Option<PageGuard>>>,
+}
+
+impl Session {
+    fn check_open(&self) -> Result<()> {
+        if self.inner.is_closed() {
+            Err(OnyxError::Internal("Client is closed".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Fetch on a session's own tab. The tab is leased on first use and kept across failures: only a
+/// tab the engine could not reset is given up, because only then is what it held gone.
+async fn do_session_fetch_inner(
+    state: Arc<ClientState>,
+    held: Arc<tokio::sync::Mutex<Option<PageGuard>>>,
+    url: String,
+    fetch_cfg: FetchConfigRs,
+) -> Result<RawRenderOutput> {
+    let shot_cfg = ScreenshotConfigRs::default();
+    state
+        .guarded(async {
+            let mut slot = held.lock().await;
+            if slot.is_none() {
+                *slot = Some(state.pool.acquire(state.queue_wait()).await?);
+            }
+            let base_cfg = state.config.read().clone();
+            let captured = {
+                let guard = slot.as_ref().expect("a tab was leased just above");
+                // The tab is held across fetches, so the per-fetch staging the pool would clear
+                // when handing a tab out is cleared here, or the last fetch's `nav_error` would be
+                // read again as this fetch's own.
+                guard.start_fetch();
+                capture_page(
+                    guard,
+                    &url,
+                    &base_cfg,
+                    &fetch_cfg,
+                    &shot_cfg,
+                    CaptureMode::Html,
+                )
+                .await
+            };
+            if captured.is_err() {
+                // A failure the page survived leaves the tab on about:blank with its browser
+                // context intact, so the session keeps it: what its pages stored is still there
+                // for the next fetch. Only a tab the engine could not reset is given up, and the
+                // pool recreates it before the next fetch.
+                let gone = slot.as_ref().is_some_and(|guard| guard.is_poisoned());
+                if gone {
+                    *slot = None;
+                }
+            }
+            Ok(captured?.into())
+        })
+        .await
+}
+
+#[pymethods]
+impl Session {
+    /// Fetch `url` on this session's tab, leasing the tab on first use.
+    fn fetch(
+        &self,
+        py: Python<'_>,
+        url: String,
+        per_call: &Bound<'_, PyAny>,
+    ) -> PyResult<RawRenderOutput> {
+        self.check_open().map_err(PyErr::from)?;
+        let fetch_cfg = parse_fetch_config(per_call).map_err(PyErr::from)?;
+        let state = self.inner.clone();
+        let held = self.held.clone();
+        let runtime = state.runtime.clone();
+        let url_err = url.clone();
+        py.detach(move || runtime.block_on(do_session_fetch_inner(state, held, url, fetch_cfg)))
+            .map_err(|e| e.into_py_err(py, &url_err))
+    }
+
+    /// Fetch `url` on this session's tab (async shape).
+    fn fetch_async<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        per_call: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.check_open().map_err(PyErr::from)?;
+        let fetch_cfg = parse_fetch_config(per_call).map_err(PyErr::from)?;
+        let state = self.inner.clone();
+        let held = self.held.clone();
+        let url_err = url.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            do_session_fetch_inner(state, held, url, fetch_cfg)
+                .await
+                .map_err(|e| Python::attach(|py| e.into_py_err(py, &url_err)))
+        })
+    }
+
+    /// Return this session's tab to the pool. Safe to call more than once.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let held = self.held.clone();
+        let runtime = self.inner.runtime.clone();
+        py.detach(move || {
+            runtime.block_on(async move {
+                *held.lock().await = None;
+            })
+        });
+        Ok(())
+    }
+
+    /// Return this session's tab to the pool (async shape).
+    fn close_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let held = self.held.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            *held.lock().await = None;
+            Ok(())
+        })
+    }
+}
+
 async fn do_screenshot_inner(
     state: Arc<ClientState>,
     url: String,
@@ -796,6 +935,16 @@ impl Client {
         self.inner.pool.bump_generation();
         log::debug!(target: "onyxweb::client", "update_config applied; tabs rebuild on next acquire");
         Ok(())
+    }
+
+    /// Open a session: a run of fetches that share one tab, and so share what the first left in
+    /// it. The tab is leased on the first fetch; closing the session returns it to the pool.
+    fn session(&self) -> PyResult<Session> {
+        self.check_open().map_err(PyErr::from)?;
+        Ok(Session {
+            inner: self.inner.clone(),
+            held: Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     // -----------------------------------------------------------------------

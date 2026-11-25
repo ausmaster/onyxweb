@@ -37,6 +37,41 @@ _IMAGES: Final = {
 }
 
 
+class FakeSession:
+    """A `Session` over canned pages, recording that its calls belonged together.
+
+    It serves what its client serves and keeps `fetched` of its own, so a test can see the calls
+    that named this session — which is all a server test needs of one: which tab a session holds
+    is the library's own contract, tested there.
+    """
+
+    def __init__(self, client: FakeClient) -> None:
+        self.client = client
+        self.fetched: list[tuple[str, dict[str, Any]]] = []
+        self.closed = False
+        client.sessions.append(self)
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        config: FetchConfig | None = None,
+        **overrides: Any,
+    ) -> RenderResult:
+        """Serve the page for `url`, as the client would, and record the call."""
+        page = await self.client.fetch(url, config=config, **overrides)
+        self.fetched.append((url, overrides))
+        return page
+
+    async def close(self) -> None:
+        """Close this session; the client keeps serving everything else."""
+        self.closed = True
+
+    async def aclose(self) -> None:
+        """Alias of `close`, as `AsyncClient` has."""
+        await self.close()
+
+
 class FakeClient:
     """An `AsyncClient` that serves canned pages and never launches Chrome.
 
@@ -60,6 +95,7 @@ class FakeClient:
         self.error = error
         self.closed = False
         self.fetched: list[tuple[str, dict[str, Any]]] = []
+        self.sessions: list[FakeSession] = []
         self._alive = True
 
     @property
@@ -74,6 +110,10 @@ class FakeClient:
     def _check_open(self) -> None:
         if self.closed:
             raise OnyxwebError("internal: Client is closed")
+
+    def session(self) -> FakeSession:
+        """Open a session: its own `fetched` shows which requests shared it."""
+        return FakeSession(self)
 
     def _serve(self, url: str) -> RenderResult:
         """The page for `url`, or what a real client raises in the fake's current state."""

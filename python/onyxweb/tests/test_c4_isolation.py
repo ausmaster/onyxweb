@@ -12,6 +12,7 @@ navigation, and checks the earlier fetch really differed from the fresh one.
 
 from __future__ import annotations
 
+from asyncio import run
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ from time import sleep
 from typing import Any
 
 import pytest
-from onyxweb import Click, Client, OnyxwebError
+from onyxweb import AsyncClient, Click, Client, OnyxwebError
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -212,6 +213,89 @@ def test_fetch_after_earlier_fetches_matches_a_fresh_client(
         assert _observe(client, server, control) == expected
 
 
+# `localStorage` belongs to one tab's browser context and survives a fetch, so a page that reads
+# it names the tab it landed on. Written by one page, read by the next.
+_SESSION_MARK = (
+    "<html><body><script>localStorage.setItem('probe','from-this-tab')</script>marked</body></html>"
+)
+_SESSION_READ = (
+    "<html><body><script>"
+    "document.title = localStorage.getItem('probe') || 'none'"
+    "</script>read</body></html>"
+)
+
+
+def _probe_server() -> HTTPServer:
+    server = HTTPServer(threaded=True)
+    server.expect_request("/mark").respond_with_data(_SESSION_MARK, content_type="text/html")
+    server.expect_request("/read").respond_with_data(_SESSION_READ, content_type="text/html")
+    server.start()
+    return server
+
+
+def test_a_session_keeps_its_tab_while_other_tabs_are_in_use() -> None:
+    """A session's fetches share one tab, and so share what the first one left in it.
+
+    New test: every other fetch resets its tab to about:blank first, so it cannot depend on what
+    an earlier fetch left there — which makes a session the only way to follow a page whose next
+    step depends on state the page above it set. Two tabs are in the pool and one is leased to the
+    session, so the sessionless fetch below cannot land on the session's tab: the reading says
+    which tab was used, not merely that a tab was reused.
+    """
+    server = _probe_server()
+    try:
+        with Client(concurrency=2) as client, client.session() as session:
+            assert session.fetch(server.url_for("/mark")).status_code == 200
+            # Another caller's fetch runs on the other tab and sees nothing of that state.
+            assert client.fetch(server.url_for("/read")).title == "none"
+            # The session's own fetches stay on its tab, with the state the first one left.
+            assert session.fetch(server.url_for("/read")).title == "from-this-tab"
+            assert session.fetch(server.url_for("/read")).title == "from-this-tab"
+    finally:
+        server.clear()
+        server.stop()
+
+
+def test_an_async_session_keeps_its_tab_too() -> None:
+    """The async shape leases its tab the same way — a separate entry point in the extension.
+
+    New test: the async session is its own pair of methods, so the sync case above cannot vouch
+    for it.
+    """
+    server = _probe_server()
+
+    async def probe() -> tuple[str | None, str | None]:
+        async with AsyncClient(concurrency=2) as client, client.session() as session:
+            await session.fetch(server.url_for("/mark"))
+            theirs = await client.fetch(server.url_for("/read"))
+            mine = await session.fetch(server.url_for("/read"))
+            return theirs.title, mine.title
+
+    try:
+        assert run(probe()) == ("none", "from-this-tab")
+    finally:
+        server.clear()
+        server.stop()
+
+
+def test_two_sessions_are_two_tabs() -> None:
+    """Sessions do not share a tab with each other: what one leaves behind is not the other's.
+
+    New test: the counterpart of the case above — a session isolates a caller's state from other
+    callers as firmly as a sessionless fetch does, so a session cannot be used to read another's
+    page.
+    """
+    server = _probe_server()
+    try:
+        with Client(concurrency=2) as client, client.session() as first, client.session() as second:
+            assert first.fetch(server.url_for("/mark")).status_code == 200
+            assert first.fetch(server.url_for("/read")).title == "from-this-tab"
+            assert second.fetch(server.url_for("/read")).title == "none"
+    finally:
+        server.clear()
+        server.stop()
+
+
 def test_simultaneous_fetches_keep_their_own_settings(server: HTTPServer, gauge: Gauge) -> None:
     """Two fetches in flight at once on a two-tab client each see only their own settings.
 
@@ -247,6 +331,42 @@ def _full_client() -> Client:
         if "not found" in str(e).lower():
             pytest.skip(f"full Chrome unavailable: {e}")
         raise
+
+
+@pytest.mark.parametrize("how", ["timeout", "refused"])
+def test_a_session_keeps_its_tab_through_a_failure_that_is_not_the_browsers(
+    how: str, refused_url: str
+) -> None:
+    """A fetch that fails inside a session does not cost the session its tab, or its own outcome.
+
+    A session gives its tab up only when the tab is gone. A timeout leaves the tab on about:blank
+    with its browser context intact, so what the session's pages stored is still there for its
+    next fetch; handing the tab back would lease a recreated one, and a caller working through a
+    run of requests would lose that state with no error to tell it so. The reading fetch after the
+    failure must also be its own page: the failed fetch's cause is not the next fetch's, which is
+    what a held tab reads back if it keeps the per-fetch staging the pool clears on hand-out.
+    """
+
+    def slow(_r: Request) -> Response:
+        sleep(6)  # past the failing fetch's budget, so it fails as a navigation timeout
+        return Response("late", content_type="text/html")
+
+    server = _probe_server()
+    server.expect_request("/slow").respond_with_handler(slow)
+    try:
+        with Client(concurrency=1) as client, client.session() as session:
+            session.fetch(server.url_for("/mark"))
+            assert session.fetch(server.url_for("/read")).title == "from-this-tab"
+            if how == "timeout":
+                with pytest.raises(TimeoutError):
+                    session.fetch(server.url_for("/slow"), timeout_ms=1000)
+            else:
+                with pytest.raises(OnyxwebError):
+                    session.fetch(refused_url)
+            assert session.fetch(server.url_for("/read")).title == "from-this-tab"
+    finally:
+        server.clear()
+        server.stop()
 
 
 @pytest.mark.parametrize("together", [True, False], ids=["at_once", "one_after_another"])
