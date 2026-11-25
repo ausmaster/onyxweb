@@ -16,6 +16,8 @@ and the presets, which are bundles of flat kwargs. The tables:
 - ``MERGE``: a per-fetch setting overrides (headers) or adds to (blocks, scripts)
   the client's, and a ``Referer`` travels as the navigation referrer.
 - ``PROXIES``: the proxy carries the page, authenticates, and moves at runtime.
+- ``LOGGING``: ``ONYXWEB_LOG`` and ``set_log_level`` speak for the ``onyxweb`` logger alone, and
+  importing onyxweb leaves the host's own logging setup untouched.
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ from json import dumps
 from os import environ
 from pathlib import Path
 from re import escape
+from subprocess import run as run_process
+from sys import executable
 from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 from typing import Any
@@ -1321,3 +1325,54 @@ def test_proxy(
             else:
                 assert "PROXIED_OK" not in r
                 assert not any(carried.values())
+
+
+_LOGGING_HOST_PROBE = """
+import logging
+import sys
+
+import onyxweb
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="host:%(message)s")
+logging.getLogger("host").info("host line")
+print("root-handlers", len(logging.getLogger().handlers))
+"""
+
+
+def test_importing_onyxweb_leaves_the_hosts_logging_alone() -> None:
+    """A library configures only its own logger, so the host's setup still works after the import.
+
+    ``basicConfig`` does nothing once the root logger has a handler, so an import that installs one
+    silently takes the host's logging with it: the host's own lines then arrive in onyxweb's format,
+    or not at all. What it pins happens at import, so it runs in its own interpreter.
+    """
+    done = run_process(
+        [executable, "-c", _LOGGING_HOST_PROBE], capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    assert "host:host line" in done.stderr, f"the host's logging was taken: {done.stderr!r}"
+    assert "root-handlers 1" in done.stdout, done.stdout
+
+
+_LOGGING_ENV_PROBE = """
+import logging
+import sys
+
+import onyxweb
+
+onyxweb.logger.info("onyxweb line")
+print("root-handlers", len(logging.getLogger().handlers))
+"""
+
+
+def test_onyxweb_log_asks_for_onyxweb_lines_and_leaves_root_alone() -> None:
+    """``ONYXWEB_LOG`` asks for onyxweb's lines, through its own handler, never the host's root."""
+    done = run_process(
+        [executable, "-c", _LOGGING_ENV_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**environ, "ONYXWEB_LOG": "info"},
+    )
+    assert done.returncode == 0, done.stderr
+    assert "onyxweb line" in done.stderr, f"ONYXWEB_LOG did not reach stderr: {done.stderr!r}"
+    assert "root-handlers 0" in done.stdout, "onyxweb put a handler on the host's root logger"

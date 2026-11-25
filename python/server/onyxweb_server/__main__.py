@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 from argparse import ArgumentParser
 from ipaddress import ip_address
+from logging import Formatter, StreamHandler, getLogger
 from os import environ
 from typing import NoReturn
 
@@ -52,8 +53,27 @@ def _build_parser() -> ArgumentParser:
     return p
 
 
+def _log_to_stderr() -> None:
+    """Give ``onyxweb_server``'s own lines a timestamped handler on stderr.
+
+    onyxweb configures only its own logger, so an application configures its own. Nothing here
+    touches the root logger, so a host that calls ``main()`` inside its own process keeps its
+    logging; stdout is left free for the protocol.
+    """
+    log = getLogger("onyxweb_server")
+    if any(getattr(handler, "_onyxweb_server", False) for handler in log.handlers):
+        return
+    handler = StreamHandler()
+    handler.setFormatter(
+        Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S")
+    )
+    handler._onyxweb_server = True  # type: ignore[attr-defined]
+    log.addHandler(handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``onyxweb-server``; returns the process exit code."""
+    _log_to_stderr()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "mcp":
