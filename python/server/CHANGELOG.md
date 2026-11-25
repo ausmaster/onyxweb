@@ -2,7 +2,50 @@
 
 All notable changes to onyxweb-server. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.3] - 2026-11-24
+
+### Changed
+- A session keeps its tab through a fetch that fails, so a run of requests is not moved onto a
+  fresh tab — with none of what its pages stored — by one bad page. The tab is reset to a blank
+  page and its browser context is untouched; a session is still dropped when its browser is gone.
+- `onyxweb-server` configures its own `onyxweb_server` logger, with the same timestamped line on
+  stderr as before. onyxweb now configures only its own logger, so an application does this for
+  itself; nothing here touches the root logger.
+
+### Added
+- Sessions: `session` on `POST /fetch` and `POST /batch` names an id of the caller's own, and
+  every request naming it runs on one tab, so a page and the pages that follow from it share what
+  the first left behind — a cookie, a `localStorage` entry. That is what a link whose next step
+  depends on the page above it needs: search engines hand out redirect tokens that resolve only in
+  the tab that rendered the results, which is why following them from a pool of tabs failed. A
+  session leases one tab for as long as it lives, so it costs one of
+  `ONYXWEB_SERVER_CONCURRENCY`; the tabs it does not hold serve sessionless requests as before.
+  `POST /batch` with a session runs its URLs in turn on that one tab, not across the pool.
+- `POST /session/close` with `{"session": <id>}` gives the tab back: `{"closed": true}`, or
+  `{"closed": false}` when no such session was open, which is not an error. A run of searches can
+  hold one session per search and close each as it ends.
+- `ONYXWEB_SERVER_MAX_SESSIONS` (default 16) and `ONYXWEB_SERVER_SESSION_TTL_MS` (default 120000,
+  counted from the session's last use) bound the tabs sessions may hold. The server closes a
+  session that idles past the TTL by itself, no later than a quarter of the TTL (5 s at most) after
+  it runs out, so a caller that goes away without closing cannot keep a tab.
+- A session ends with the browser its tab lived in. Its next call is answered once with
+  `chrome_exited` (503) and is not retried on a fresh tab, which would hold none of what the
+  session's pages stored and could answer a page that looks right and is not; the id then opens a
+  new session. In a `/batch`, each URL left is answered with that failure under its own URL. Such
+  a session holds no tab, so it stops counting against the cap and in `/health` at once.
+- `refused_session`: 503 when the cap is reached, because the server's state is the reason; the
+  message names the way out. An id that is empty or over 200 characters is `RefusedOption`, 400,
+  because that is the caller's error rather than a full server.
+- `stats()` reports `sessions` and `max_sessions`, so `/health` shows them.
+
+### Changed
+- `ServerCore.fetch` and `ServerCore.batch` take `session: str | None = None`. Absent, nothing
+  changes for a caller that does not use it.
+- Sessions are the HTTP front-end's: the MCP tools take no session, since nothing that calls them
+  needs two visits to share a tab.
+- The release depends on `onyxweb>=0.3.2`, the first library with `session()`. The metadata keeps
+  `onyxweb>=0.3.1` until that release exists, so a development build installs beside a 0.3.2.dev
+  wheel, which PEP 440 orders below 0.3.2.
 
 ## [0.1.2] - 2026-11-23
 
@@ -57,6 +100,8 @@ All notable changes to onyxweb-server. The format follows [Keep a Changelog](htt
   Pages stay in memory for the session, and every tool caps its output. It runs no caller-supplied scripts and never fetches a private, loopback or link-local address. Everything a page wrote, its title and URL included, appears below the untrusted label.
 - `onyxweb_server.core.ServerCore`, the part every front-end shares: a guarded, stateless `fetch`, held pages, and a browser client per engine that is rebuilt after its Chrome dies. `ONYXWEB_SERVER_MAX_PAGES` (default 50) sets how many pages it holds.
 
-[Unreleased]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.1...HEAD
+[Unreleased]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.3...HEAD
+[0.1.3]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.2...server-v0.1.3
+[0.1.2]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.1...server-v0.1.2
 [0.1.1]: https://github.com/ausmaster/onyxweb/compare/server-v0.1.0...server-v0.1.1
 [0.1.0]: https://github.com/ausmaster/onyxweb/releases/tag/server-v0.1.0
