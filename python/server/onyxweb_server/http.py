@@ -50,6 +50,7 @@ from onyxweb import OnyxwebError, RenderResult
 from onyxweb_server.core import (
     FetchOptions,
     Refused,
+    RefusedSession,
     Selected,
     ServerCore,
     ShotOptions,
@@ -121,6 +122,7 @@ class FetchRequest(_Page):
 
     url: str
     select: list[str] | None = None
+    session: str | None = None
 
 
 class FetchAllRequest(_Page, _Image):
@@ -141,6 +143,15 @@ class BatchRequest(_Page):
 
     urls: list[str]
     select: list[str] | None = None
+    session: str | None = None  # every URL runs on that one session's tab, in turn
+
+
+class SessionRequest(BaseModel):
+    """The body of ``POST /session/close``: the id whose session should end."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session: str
 
 
 class _Unauthorized(Exception):
@@ -151,6 +162,10 @@ def _problem(failure: BaseException) -> tuple[int, str]:
     """The status and kind a failure is answered with, in a response or in a batch's line."""
     if isinstance(failure, TooLarge):
         return 413, "too_large"
+    if isinstance(failure, RefusedSession):
+        # The server cannot open another session now; closing one, or waiting out the idle TTL,
+        # is the caller's way in, so this is not a malformed request.
+        return 503, failure.code
     if isinstance(failure, Refused):
         return 400, "invalid_request"
     # A launch error has no kind: there is no URL to attach one to.
@@ -296,10 +311,17 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
     @guarded.post("/fetch")
     async def fetch(wanted: FetchRequest, request: Request) -> Response:
         request.state.url = wanted.url  # the handlers above name it in their answers
-        page = await core.fetch(wanted.url, wanted.options(), select=wanted.select)
+        page = await core.fetch(
+            wanted.url, wanted.options(), select=wanted.select, session=wanted.session
+        )
         make = page.snapshot if isinstance(page, RenderResult) else lambda: page.data
         body, headers = await to_thread(_wire, make, _accepts_zstd(request))
         return Response(body, media_type="application/json", headers=headers)
+
+    @guarded.post("/session/close")
+    async def session_close(wanted: SessionRequest) -> dict[str, bool]:
+        """Close a session, returning its tab to the pool. Closing none is not an error."""
+        return {"closed": await core.close_session(wanted.session)}
 
     @guarded.post("/screenshot")
     async def screenshot(wanted: ScreenshotRequest, request: Request) -> Response:
@@ -328,7 +350,9 @@ def build_app(core: ServerCore | None = None, token: str | None = None) -> FastA
 
     @guarded.post("/batch")
     async def batch(wanted: BatchRequest, request: Request) -> StreamingResponse:
-        results = await core.batch(wanted.urls, wanted.options(), select=wanted.select)
+        results = await core.batch(
+            wanted.urls, wanted.options(), select=wanted.select, session=wanted.session
+        )
         compress = _accepts_zstd(request)
 
         def line(url: str, item: RenderResult | Selected | Exception) -> bytes:

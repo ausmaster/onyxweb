@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::fetch::{
     DisableParams as FetchDisableParams, EnableParams as FetchEnableParams, EventRequestPaused,
@@ -18,7 +19,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, CaptureScreenshotParams,
     EventDomContentEventFired, EventFrameNavigated, EventLoadEventFired, NavigateParams,
-    ReferrerPolicy, RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier,
+    ReferrerPolicy, RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier, StopLoadingParams,
 };
 use chromiumoxide::error::CdpError;
 use futures::StreamExt;
@@ -327,10 +328,16 @@ pub async fn capture_page(
             // on those events to tell it apart from this fetch's own). Skipped only for
             // a fresh tab's first fetch, which is already at about:blank.
             if current_url.is_some() && !continue_document {
-                page.goto("about:blank").await?;
+                // Name the stage, never the URL: `current_url` is whatever the tab last showed,
+                // which on a shared pool is another caller's page, query string and all.
+                log::trace!(target: "onyxweb::engine", "[{url}] stage=reset-from");
+                leave_for_blank(page, BLANK_GRACE).await?;
                 // The blank page ran the tab's init scripts; what they logged isn't this page's.
                 guard.console_messages().lock().clear();
             }
+            // Outside the block above, so a tab's first fetch and a continued hash navigation
+            // both name the stage they reached.
+            log::trace!(target: "onyxweb::engine", "[{url}] stage=navigate");
 
             // Subscribe before the nav so the race below can't miss an early event.
             let t_goto = Instant::now();
@@ -910,10 +917,9 @@ pub async fn capture_page(
     // On error, reset the page so the next URL on this tab isn't poisoned by
     // a half-loaded predecessor.
     if matches!(&fut_result, Err(_) | Ok(Err(_))) {
-        // Reset the tab; if that fails (wedged by a stuck nav, or the target
-        // died) mark it so the pool recreates it before the next fetch.
-        let reset = tokio::time::timeout(RESET_TIMEOUT, page.goto("about:blank")).await;
-        if !matches!(reset, Ok(Ok(_))) {
+        // A reset that fails means the tab itself is wedged (a stuck navigation, or a target that
+        // died), so mark it and the pool recreates it before the next fetch.
+        if leave_for_blank(page, RESET_TIMEOUT).await.is_err() {
             guard.mark_poisoned();
         }
     }
@@ -958,6 +964,16 @@ pub async fn capture_page(
                 kind: "challenge",
                 resolved: v == "cloudflare" && turnstile_token_present(html),
             })
+        } else if result.status_code == 429 {
+            // Last of the detectors, so it never shadows one that says more. 429 is the origin
+            // refusing this client for now, and a page naming no vendor does not make that less
+            // true: without this, a rate-limit page reads as an ordinary page whose text happens
+            // to be empty. No vendor is claimed, because its wording is not evidence of one.
+            Some(AntiBotRs {
+                vendor: None,
+                kind: "block",
+                resolved: false,
+            })
         } else {
             block_hit.map(|v| AntiBotRs {
                 vendor: vendor_opt(v),
@@ -982,6 +998,49 @@ pub async fn capture_page(
 /// reset takes about 5 ms; after a stuck navigation it never completes and the tab
 /// is recreated instead (about 23 ms), so a longer wait only delays the error.
 const RESET_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long a blank-page hop waits before concluding the tab is holding a navigation the previous
+/// fetch abandoned. A healthy hop takes milliseconds, and concluding wrongly costs one extra blank
+/// navigation rather than a failure, so this stays short: an abandoned navigation would otherwise
+/// cost a whole second of the caller's budget before recovery starts.
+const BLANK_GRACE: Duration = Duration::from_millis(250);
+
+/// Take the tab off whatever document it is on, and wait for the blank page to commit.
+///
+/// `about:blank` is normally reached with `Page.navigate`, and chromiumoxide runs one navigation
+/// per tab at a time: a navigation an earlier fetch abandoned — its page came back at a lifecycle
+/// event, a request never answered, or the fetch ran out of budget — holds that slot until its own
+/// 30 s command timeout. A hop queued behind it makes a page that answers at once fail as
+/// `timeout`, and a reset queued behind it fails too, which marks a healthy tab for recreation.
+///
+/// When the hop does not settle at once the tab is holding such a navigation, and clearing it
+/// takes both steps: stopping the load settles one that never answered, and a blank page committed
+/// from inside the document releases the slot where a `Page.navigate` cannot, because the queue is
+/// what is blocked. The hop then runs. A tab with nothing outstanding never reaches this branch.
+async fn leave_for_blank(page: &Page, grace: Duration) -> Result<()> {
+    match tokio::time::timeout(grace, page.goto("about:blank")).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(OnyxError::from(e)),
+        Err(_) => {
+            log::debug!(
+                target: "onyxweb::engine",
+                "blank hop queued behind an abandoned navigation; clearing it"
+            );
+            let clearing = async {
+                let _ = page.execute(StopLoadingParams::default()).await;
+                let _ = page.evaluate("location.replace('about:blank')").await;
+                page.goto("about:blank").await
+            };
+            match tokio::time::timeout(grace, clearing).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(OnyxError::from(e)),
+                Err(_) => Err(OnyxError::Timeout(format!(
+                    "the tab's previous navigation could not be cleared within {grace:?}"
+                ))),
+            }
+        }
+    }
+}
 
 /// Max time to wait for an anti-bot challenge interstitial to self-resolve.
 ///

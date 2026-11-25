@@ -749,7 +749,7 @@ wheels = [
 
 [[package]]
 name = "onyxweb"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "python/onyxweb" }
 dependencies = [
     { name = "pydantic" },

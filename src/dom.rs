@@ -1395,9 +1395,41 @@ fn is_furniture(e: &ElementRef<'_>) -> bool {
         || v.attr("aria-hidden") == Some("true")
 }
 
+/// True for an element whose text is not displayed, and so never part of a page's content.
+fn is_text_skip(e: &ElementRef<'_>) -> bool {
+    TEXT_SKIP.contains(&e.value().name())
+}
+
+/// True when `e`, or any element above it, displays no text: nothing inside such an element is
+/// part of the page. A `<template>` keeps its children in the tree, so an element one level down
+/// is not itself a skip — its ancestry is what disqualifies it. The walk goes over nodes, not
+/// elements: a template's contents hang off a document fragment, and an element-only walk stops
+/// there without ever seeing the `<template>` above it.
+fn is_text_skip_or_inside(e: &ElementRef<'_>) -> bool {
+    let mut node = Some(**e); // `*e` is still the ElementRef; `**e` is the NodeRef it derefs to
+    while let Some(current) = node {
+        let skip = current
+            .value()
+            .as_element()
+            .is_some_and(|el| TEXT_SKIP.contains(&el.name()));
+        if skip {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
+}
+
 /// Characters of text in `e` that are neither link text nor furniture: the score that picks the
 /// content block. A page's navigation and menus are made of links, so they score nothing.
+///
+/// An element that displays no text of its own scores nothing, whatever its caller: a `<script>`
+/// shipping a data payload is a large block of text in the tree, and counting it would let
+/// JavaScript be chosen as the page's content.
 fn content_score(e: ElementRef<'_>) -> usize {
+    if is_text_skip_or_inside(&e) {
+        return 0;
+    }
     let mut score = 0;
     for node in e.children() {
         match node.value() {
@@ -1420,13 +1452,35 @@ fn content_score(e: ElementRef<'_>) -> usize {
 }
 
 /// Every element a content block could be, for a page with no landmark to point at one.
+///
+/// An element that displays no text is never a candidate, and neither is anything inside one:
+/// a `<template>`'s children are in the tree, so offering every descendant would let a template's
+/// payload — or a script's, where the parser keeps it as a subtree — be scored and chosen as the
+/// page's content, which is the one way `main_text` could disagree with `text`. Furniture stays a
+/// candidate on purpose: a `<form>` or `<aside>` wrapping the page is the only element that
+/// aggregates its siblings, so barring it truncates or empties `main_text` on real pages.
 fn content_candidates(html: &Html) -> Vec<ElementRef<'_>> {
     let body = Selector::parse("body").ok();
     let root = body
         .as_ref()
         .and_then(|s| html.select(s).next())
         .unwrap_or_else(|| html.root_element());
-    root.descendants().filter_map(ElementRef::wrap).collect()
+    // Pre-order, document order (the fold below keeps the earliest of an equal score), skipping
+    // the whole subtree of anything that displays no text. The root is a candidate: a page whose
+    // prose sits directly in `<body>`, with no wrapper to aggregate its siblings, has nothing else
+    // that holds it together — `descendants()` counted the root, and dropping it emptied those.
+    let mut out = Vec::new();
+    let mut stack: Vec<ElementRef<'_>> = vec![root];
+    while let Some(e) = stack.pop() {
+        if is_text_skip(&e) {
+            continue;
+        }
+        out.push(e);
+        let mut children: Vec<ElementRef<'_>> = e.children().filter_map(ElementRef::wrap).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    out
 }
 
 /// The element holding the page's content: a landmark when the page marks one, otherwise the
@@ -1437,7 +1491,7 @@ fn content_root(html: &Html) -> Option<ElementRef<'_>> {
         .as_ref()
         .map(|sel| {
             html.select(sel)
-                .filter(|e| !is_furniture(e))
+                .filter(|e| !is_furniture(e) && !is_text_skip_or_inside(e))
                 .collect::<Vec<_>>()
         })
         .filter(|found| !found.is_empty())

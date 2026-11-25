@@ -245,6 +245,30 @@ pub struct PooledPage {
     pub auth_fetch_active: bool,
 }
 
+impl PooledPage {
+    /// Start a fetch on this tab: drop what the previous fetch staged and roll the response record
+    /// over.
+    ///
+    /// Called whenever a tab begins serving a fetch, whether the pool just handed it out or a
+    /// session is holding it. Snapshot the previous response before clearing — same-doc navs (no
+    /// new HTTP response) propagate the prior document's metadata. Only shift into `prev` if `main`
+    /// was actually populated by the prior fetch; otherwise keep the existing prev so chains of
+    /// same-doc navs (each leaving `main` unset) all see the document's original response.
+    /// `pending_extra` is always cleared — it's per-fetch staging.
+    pub fn start_fetch(&self) {
+        self.console_messages.lock().clear();
+        let mut rs = self.response.lock();
+        if rs.main.is_some() {
+            rs.prev = rs.main.take();
+        }
+        rs.pending_extra.clear();
+        rs.doc_frames.clear();
+        rs.redirects.clear();
+        rs.nav_error = None;
+        rs.main_doc_status = None;
+    }
+}
+
 /// Pool sized to the Client's `concurrency`. `acquire()` returns page + permit
 /// together; excess callers queue on the semaphore.
 pub struct PagePool {
@@ -274,7 +298,7 @@ impl PagePool {
         let t0 = std::time::Instant::now();
         log::info!(target: "onyxweb::pool", "creating pool of {size} pages");
         let base = config.read().clone();
-        let futs = (0..size).map(|_| create_pooled_page(&browser, &base, 0));
+        let futs = (0..size).map(|_| create_pooled_page(&browser, &base, 0, None));
         let created: Vec<PooledPage> = futures::future::try_join_all(futs).await?;
         log::info!(
             target: "onyxweb::pool",
@@ -331,38 +355,31 @@ impl PagePool {
             Some(p) if !p.poisoned.load(Ordering::Acquire) && p.generation == generation => p,
             stale => {
                 log::debug!(target: "onyxweb::pool", "recreating pooled tab (missing, poisoned or stale config)");
+                // Two reasons to replace a tab, and they differ. A poisoned page is a wedged
+                // renderer: the tab's browser context is still good, and its storage is what a
+                // session's state lives in, so the new page goes into the same one. A stale config
+                // may have changed what the context is made of — the proxy is per-context — so that
+                // context is disposed with it.
+                let mut keep = None;
                 if let Some(p) = stale {
                     let _ = tokio::time::timeout(Duration::from_secs(5), p.page.close()).await;
-                    let _ = self
-                        .browser
-                        .read()
-                        .await
-                        .dispose_browser_context(p.browser_context_id)
-                        .await;
+                    if p.generation == generation {
+                        keep = Some(p.browser_context_id);
+                    } else {
+                        let _ = self
+                            .browser
+                            .read()
+                            .await
+                            .dispose_browser_context(p.browser_context_id)
+                            .await;
+                    }
                 }
                 let base = self.config.read().clone();
-                create_pooled_page(&self.browser, &base, generation).await?
+                create_pooled_page(&self.browser, &base, generation, keep).await?
             }
         };
         lost.0 = None;
-        pooled.console_messages.lock().clear();
-        // Snapshot previous response before clearing — same-doc navs (no new
-        // HTTP response) propagate the prior document's metadata. Only shift
-        // into `prev` if `main` was actually populated by the prior fetch;
-        // otherwise keep the existing prev so chains of same-doc navs (each
-        // leaving `main` unset) all see the document's original response.
-        // `pending_extra` is always cleared — it's per-fetch staging.
-        {
-            let mut rs = pooled.response.lock();
-            if rs.main.is_some() {
-                rs.prev = rs.main.take();
-            }
-            rs.pending_extra.clear();
-            rs.doc_frames.clear();
-            rs.redirects.clear();
-            rs.nav_error = None;
-            rs.main_doc_status = None;
-        }
+        pooled.start_fetch();
         log::trace!(
             target: "onyxweb::pool",
             "acquired page (waited {:?}, pool available={})",
@@ -422,6 +439,13 @@ impl PageGuard {
         &self.page.as_ref().expect("guard drained").page
     }
 
+    /// Start a fetch on this tab: drop what the previous fetch staged, exactly as handing the tab
+    /// out from the pool does. A session holds its tab across fetches, so it must do this itself or
+    /// a failure's `nav_error` would be read again as the next fetch's own.
+    pub fn start_fetch(&self) {
+        self.page.as_ref().expect("guard drained").start_fetch();
+    }
+
     /// Flag this tab as unusable so `acquire()` recreates it before reuse.
     pub fn mark_poisoned(&self) {
         self.page
@@ -429,6 +453,15 @@ impl PageGuard {
             .expect("guard drained")
             .poisoned
             .store(true, Ordering::Release);
+    }
+
+    /// Whether this tab has been flagged unusable, so what it holds is about to be thrown away.
+    pub fn is_poisoned(&self) -> bool {
+        self.page
+            .as_ref()
+            .expect("guard drained")
+            .poisoned
+            .load(Ordering::Acquire)
     }
 
     /// True when chromiumoxide owns this tab's Fetch domain for proxy auth;
@@ -563,6 +596,7 @@ async fn create_pooled_page(
     browser: &BrowserLock<Browser>,
     base: &ClientConfigRs,
     generation: u64,
+    keep: Option<BrowserContextId>,
 ) -> Result<PooledPage> {
     let t0 = std::time::Instant::now();
     // Each tab gets its own browser context so cookies/storage are isolated
@@ -578,12 +612,17 @@ async fn create_pooled_page(
     } else {
         None
     };
-    let browser_context_id = browser
-        .read()
-        .await
-        .create_browser_context(ctx_params)
-        .await
-        .map_err(OnyxError::from)?;
+    // A replacement page for a wedged one goes into the tab's existing context, so what that tab
+    // stored is still there; a tab built from scratch gets its own.
+    let browser_context_id = match keep {
+        Some(id) => id,
+        None => browser
+            .read()
+            .await
+            .create_browser_context(ctx_params)
+            .await
+            .map_err(OnyxError::from)?,
+    };
     let mut target = CreateTargetParams::new("about:blank");
     target.browser_context_id = Some(browser_context_id.clone());
     let page = browser

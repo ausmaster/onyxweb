@@ -9,9 +9,10 @@ vocabulary.
 
 from __future__ import annotations
 
-from asyncio import Lock, gather, to_thread
+from asyncio import CancelledError, Lock, Task, create_task, gather, sleep, to_thread
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
 from json import dumps
@@ -75,6 +76,12 @@ class TooLarge(Refused):
     code = "too_large"
 
 
+class RefusedSession(Refused):
+    """A session the core will not open: the cap is reached, or the id is not usable."""
+
+    code = "refused_session"
+
+
 # CoreConfig field -> (environment variable, smallest allowed value).
 _LIMITS: Final = {
     "max_pages": ("ONYXWEB_SERVER_MAX_PAGES", 1),
@@ -85,6 +92,8 @@ _LIMITS: Final = {
     "max_timeout_ms": ("ONYXWEB_SERVER_MAX_TIMEOUT_MS", MIN_TIMEOUT_MS),
     "queue_ms": ("ONYXWEB_SERVER_QUEUE_MS", 1),
     "concurrency": ("ONYXWEB_SERVER_CONCURRENCY", 1),
+    "max_sessions": ("ONYXWEB_SERVER_MAX_SESSIONS", 1),
+    "session_ttl_ms": ("ONYXWEB_SERVER_SESSION_TTL_MS", 1),
 }
 EGRESS_VAR: Final = "ONYXWEB_SERVER_EGRESS"
 
@@ -101,6 +110,8 @@ class CoreConfig:
     max_timeout_ms: int = 60_000  # longest navigation budget
     queue_ms: int = 10_000  # longest a request waits for a free tab
     concurrency: int = CLIENT_CONCURRENCY  # tabs per engine
+    max_sessions: int = 16  # sessions held at once; each leases one tab
+    session_ttl_ms: int = 120_000  # longest a session may idle before its tab goes back
     egress: bool = True  # route the browser through the egress proxy
 
     def __post_init__(self) -> None:
@@ -463,6 +474,9 @@ class BrowserClient(Protocol):
     ) -> RenderResult:
         """Fetch `url`, applying the per-call `overrides` of `FetchConfig`."""
 
+    def session(self) -> Any:
+        """Open a session: fetches that share one tab, and so share what the first left in it."""
+
     async def screenshot(
         self, url: str, *, config: ScreenshotConfig | None = None, **overrides: Any
     ) -> bytes:
@@ -702,6 +716,32 @@ class _Call:
             )
 
 
+@dataclass
+class _HeldSession:
+    """One caller's session id: the tab it is holding, and the browser that tab lives in."""
+
+    session: Any  # a `Session` from the browser client: an `AsyncSession`, or a fake in tests
+    client: BrowserClient  # the browser that built it; the session ends when this one does
+    engine: str  # which engine built it; a session cannot move between engines
+    last_used: float  # monotonic seconds, for the idle TTL
+
+
+def _session_ended(url: str) -> onyxweb.ChromeExitedError:
+    """What a session's call for `url` is answered with once its browser is gone.
+
+    The library names a browser's exit itself when it happens under a fetch. One that exits while a
+    session idles is replaced by the pool before the session's tab is tried again, and all the
+    library can then say of that tab is "Client is closed", with no cause. The cause is known here.
+    """
+    exited = onyxweb.ChromeExitedError(
+        "the browser this session's tab lived in exited, so the session is closed; "
+        "its id opens a new session on the next call"
+    )
+    exited.kind = "chrome_exited"
+    exited.url = url
+    return exited
+
+
 class ServerCore:
     """What every front-end shares: guarded fetching, held pages and browser clients.
 
@@ -746,19 +786,124 @@ class ServerCore:
         self._egress = egress if make_client is None else None
         self._pool = ClientPool(make_client, config, self._egress)
         self._retries = 0
+        # Session id -> the tab it holds. A session leases a tab from the pool for as long as it
+        # lives, so it is bounded by both `max_sessions` and the pool's own concurrency.
+        self._sessions: dict[str, _HeldSession] = {}
+        # One call at a time through admission: opening a session awaits a Chrome launch, and the
+        # count it checked must still be true when it inserts, or the cap and the id both race.
+        self._admission = Lock()
+        self._reaper: Task[None] | None = None
+
+    async def _expire_sessions(self, now: float) -> None:
+        """Close every session that has idled past the TTL, releasing its tab."""
+        idle = self._config.session_ttl_ms / 1000
+        for sid in [s for s, held in self._sessions.items() if now - held.last_used > idle]:
+            await self._close_session(sid)
+
+    async def _close_session(self, sid: str) -> bool:
+        """Close `sid` and release its tab; False when it was not open."""
+        held = self._sessions.pop(sid, None)
+        if held is None:
+            return False
+        await held.session.close()
+        return True
+
+    async def close_session(self, sid: str) -> bool:
+        """Close the session `sid`, returning its tab to the pool.
+
+        False means no such session was open, which a caller may read as already closed.
+        """
+        return await self._close_session(sid)
+
+    async def _session_for(self, sid: str, engine: str) -> _HeldSession:
+        """The session `sid` owns, opened on first use and refreshed on every call.
+
+        Admission is one call at a time, because opening a session launches Chrome: the count
+        checked before that await must still hold when the session is inserted, or four concurrent
+        first requests open four sessions past a cap of two, and two first uses of one id open two
+        tabs under it.
+
+        Raises:
+            RefusedSession: When `max_sessions` are already open, or the id is unusable. The
+                message names the way out, because the caller has to close one to get in.
+        """
+        if not sid:
+            raise RefusedOption("session must not be empty; give it an id of your own.")
+        if len(sid) > 200:
+            raise RefusedOption(f"session is {len(sid)} characters; use at most 200.")
+        await self._expire_sessions(monotonic())
+        async with self._admission:
+            held = self._sessions.get(sid)
+            if held is not None and held.engine != engine:
+                # A tab belongs to the engine that built it, so this id starts over on the new one.
+                await self._close_session(sid)
+                held = None
+            if held is None:
+                holding = self.session_count()
+                if holding >= self._config.max_sessions:
+                    raise RefusedSession(
+                        f"{holding} sessions are open, the most this server keeps "
+                        f"(ONYXWEB_SERVER_MAX_SESSIONS). Close one, or wait "
+                        f"{self._config.session_ttl_ms} ms for an idle one to expire."
+                    )
+                self._start_reaper()
+                client = await self._pool.get(engine)
+                held = _HeldSession(client.session(), client, engine, last_used=monotonic())
+                self._sessions[sid] = held
+            held.last_used = monotonic()
+            return held
+
+    def _start_reaper(self) -> None:
+        """Start the task that expires idle sessions: once per core, with the first session."""
+        if self._reaper is None:
+            # A quarter of the TTL, so a session is gone within a quarter-TTL of idling out; a
+            # 50 ms floor keeps a tiny TTL from spinning, a 5 s ceiling keeps a long one prompt.
+            interval = max(0.05, min(self._config.session_ttl_ms / 4000, 5.0))
+            self._reaper = create_task(self._reap(interval))
+
+    async def _reap(self, interval: float) -> None:
+        """Close sessions idle past the TTL, whether or not a caller comes back.
+
+        Expiring only when a session request arrives lets a caller that dies mid-search pin its
+        tab forever, because sessionless traffic never runs the sweep.
+        """
+        while True:
+            await sleep(interval)
+            await self._expire_sessions(monotonic())
+
+    def session_count(self) -> int:
+        """How many sessions hold a tab.
+
+        A session whose browser is gone holds none, so it is not counted, though its id is kept
+        until its caller is told (on its next call), it is closed, or it idles out.
+        """
+        return sum(1 for held in self._sessions.values() if held.client.alive)
 
     @overload
     async def fetch(
-        self, url: str, options: FetchOptions | None = None, select: None = None
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+        select: None = None,
+        session: str | None = None,
     ) -> RenderResult: ...
 
     @overload
     async def fetch(
-        self, url: str, options: FetchOptions | None = None, *, select: Sequence[str]
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+        *,
+        select: Sequence[str],
+        session: str | None = None,
     ) -> Selected: ...
 
     async def fetch(
-        self, url: str, options: FetchOptions | None = None, select: Sequence[str] | None = None
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+        select: Sequence[str] | None = None,
+        session: str | None = None,
     ) -> RenderResult | Selected:
         """Fetch `url` in a real browser and return the page, or the views of it selected.
 
@@ -769,17 +914,26 @@ class ServerCore:
             options: What the caller may ask of the fetch; see `FetchOptions`.
             select: Names in `VIEWS` to answer with instead of the page, as `Selected`. The
                 `ALWAYS` views come with any selection, so an empty one is the verdict alone.
+            session: An id of the caller's own. Naming one fetches on that session's tab, which
+                carries what the first fetch left in it — a cookie, a `localStorage` entry — so a
+                link whose next step depends on the page above it can be followed. It leases a tab
+                out of the pool for as long as it lives, so it costs one of the tabs.
 
         Raises:
             Refused: `RefusedOption` for an option outside its ceiling or a name that is no
-                view, `RefusedUrl` from the guard (nothing is built or requested first), or
-                `TooLarge` for a page, or a selection, over the size limit.
+                view, `RefusedUrl` from the guard (nothing is built or requested first),
+                `RefusedSession` for a session over the cap, or `TooLarge` for a page, or a
+                selection, over the size limit.
         """
         options = options or FetchOptions()
         with _Call(self, "fetch", _where(url), options.engine) as call:
             wanted = options.overrides(self._config)
             views = None if select is None else _selection(select)
-            page = await self._run(url, options, lambda c: c.fetch(url, **wanted))
+            if session is None:
+                page = await self._run(url, options, lambda c: c.fetch(url, **wanted))
+            else:
+                held = await self._session_for(session, options.engine)
+                page = await self._session_fetch(session, held, url, options, wanted)
             if views is None:
                 return call.done(page)
             return call.done(await to_thread(Selected.of, page, views))
@@ -823,12 +977,22 @@ class ServerCore:
 
     @overload
     async def batch(
-        self, urls: Sequence[str], options: FetchOptions | None = None, select: None = None
+        self,
+        urls: Sequence[str],
+        options: FetchOptions | None = None,
+        select: None = None,
+        *,
+        session: str | None = None,
     ) -> list[RenderResult | Exception]: ...
 
     @overload
     async def batch(
-        self, urls: Sequence[str], options: FetchOptions | None = None, *, select: Sequence[str]
+        self,
+        urls: Sequence[str],
+        options: FetchOptions | None = None,
+        *,
+        select: Sequence[str],
+        session: str | None = None,
     ) -> list[Selected | Exception]: ...
 
     async def batch(
@@ -836,6 +1000,8 @@ class ServerCore:
         urls: Sequence[str],
         options: FetchOptions | None = None,
         select: Sequence[str] | None = None,
+        *,
+        session: str | None = None,
     ) -> list[Any]:
         """Fetch many URLs at once; each result is its page, or the failure in its place.
 
@@ -845,15 +1011,19 @@ class ServerCore:
             urls: 1 to `CoreConfig.max_batch` URLs.
             options: Applied to every URL.
             select: As for `fetch`: each page becomes its `Selected`, measured on its own.
+            session: As for `fetch`. Every URL of the batch runs on that one session's tab, so
+                they take turns rather than fanning out across the pool.
 
         Raises:
             RefusedOption: If there are too few or too many URLs, an option is outside its
                 ceiling, or a name is no view. Nothing is built or requested first.
+            RefusedSession: If the session cap is reached, naming the way out.
         """
         options = options or FetchOptions()
         with _Call(self, "batch", f"{len(urls)} urls", options.engine, len(urls)) as call:
             wanted = options.overrides(self._config)
             views = None if select is None else _selection(select)
+            held = None if session is None else await self._session_for(session, options.engine)
             if not 1 <= len(urls) <= self._config.max_batch:
                 raise RefusedOption(
                     f"urls holds {len(urls)}; send at least 1 and at most "
@@ -871,7 +1041,7 @@ class ServerCore:
             watch = _EgressWatch(self._egress)
             verdicts = await gather(*(to_thread(verdict, url) for url in urls))
             allowed = [url for url, refusal in zip(urls, verdicts, strict=True) if refusal is None]
-            fetched = await self._batch(allowed, options, wanted) if allowed else []
+            fetched = await self._batch(allowed, options, wanted, held, session) if allowed else []
             pending = iter(fetched)
             results: list[RenderResult | Exception] = []
             for url, refusal in zip(urls, verdicts, strict=True):
@@ -882,10 +1052,34 @@ class ServerCore:
             return call.done(await to_thread(_select_each, results, views))
 
     async def _batch(
-        self, urls: list[str], options: FetchOptions, wanted: dict[str, Any]
+        self,
+        urls: list[str],
+        options: FetchOptions,
+        wanted: dict[str, Any],
+        held: _HeldSession | None = None,
+        sid: str | None = None,
     ) -> list[Any]:
-        """Fetch every allowed URL, giving each one whose Chrome died a second try."""
+        """Fetch every allowed URL, giving each one whose Chrome died a second try.
+
+        With `held`, every URL runs on that session's tab, one after another: a session is a run of
+        fetches that share one tab, so a batch cannot fan out across the pool within it. When that
+        tab's browser is gone the session ends, and each URL left is answered with the exit under
+        its own URL rather than tried on a fresh tab, which would hold none of what the session's
+        pages stored and could answer a page that looks right and is not.
+        """
         config = FetchConfig(**wanted)
+        if held is not None and sid is not None:
+            out: list[Any] = []
+            for url in urls:
+                if not held.client.alive:
+                    out.append(await self._session_failure(sid, held, url, None))
+                    continue
+                try:
+                    out.append(await held.session.fetch(url, config=config))
+                except (onyxweb.OnyxwebError, TimeoutError) as err:
+                    # A failure is returned in its place, as a batch always does.
+                    out.append(await self._session_failure(sid, held, url, err))
+            return out
         client = await self._pool.get(options.engine)
         fetched = await client.batch(urls, capture="html", config=config)
         died = [i for i, item in enumerate(fetched) if isinstance(item, onyxweb.ChromeExitedError)]
@@ -898,13 +1092,20 @@ class ServerCore:
         return fetched
 
     async def _run(
-        self, url: str, options: FetchOptions, do: Callable[[BrowserClient], Awaitable[T]]
+        self,
+        url: str,
+        options: FetchOptions,
+        do: Callable[[BrowserClient], Awaitable[T]],
+        retry: bool = True,
     ) -> T:
         """Run `do` on the engine's client once the guard accepts `url`.
 
         A Chrome that dies mid-call is replaced and the call made once more; nothing else is
-        retried, since a fetch is idempotent but a timeout would only repeat. A navigation the
-        egress proxy refused (a redirect, or a start URL on a private address) is `RefusedUrl`.
+        retried, since a fetch is idempotent but a timeout would only repeat. `retry=False` is for
+        a session fetch, whose tab cannot come back: a replacement tab has none of the state the
+        session was holding, so a retry could answer a page that looks right and is not.
+        A navigation the egress proxy refused (a redirect, or a start URL on a private address)
+        is `RefusedUrl`.
         """
         await to_thread(self._guard, url)
         watch = _EgressWatch(self._egress)
@@ -913,6 +1114,8 @@ class ServerCore:
             try:
                 result = await do(client)
             except onyxweb.ChromeExitedError:
+                if not retry:
+                    raise
                 self._retries += 1
                 result = await do(await self._pool.get(options.engine))
         except onyxweb.OnyxwebError as err:
@@ -922,6 +1125,42 @@ class ServerCore:
         if watch.refused(result):
             raise watch.refusal(url)
         return result
+
+    async def _session_fetch(
+        self, sid: str, held: _HeldSession, url: str, options: FetchOptions, wanted: dict[str, Any]
+    ) -> RenderResult:
+        """Fetch `url` on a session's tab; a session whose browser is gone ends, and says so.
+
+        There is no retry on a fresh tab: it holds none of what the session's pages stored, so a
+        retry could answer a page that looks right and is not. The caller decides whether to start
+        over, and the id opens a new session when it does.
+        """
+        try:
+            return await self._run(
+                url, options, lambda _client: held.session.fetch(url, **wanted), retry=False
+            )
+        except (onyxweb.OnyxwebError, TimeoutError) as err:
+            failure = await self._session_failure(sid, held, url, err)
+            if failure is err:
+                raise
+            raise failure from err
+
+    async def _session_failure(
+        self, sid: str, held: _HeldSession, url: str, failure: Exception | None
+    ) -> Exception:
+        """What a session's failed call is answered with, ending it if its browser is gone.
+
+        While the browser lives the failure is the page's own, and the session goes on. Once it is
+        gone the session is closed and the answer is the browser's exit: the library's own when it
+        named one, otherwise the one this core can name (`failure` is None for a URL never tried).
+        """
+        if failure is not None and held.client.alive:
+            return failure
+        if self._sessions.get(sid) is held:  # not a newer session a concurrent call opened
+            await self._close_session(sid)
+        if failure is not None and isinstance(failure, onyxweb.ChromeExitedError):
+            return failure
+        return _session_ended(url)
 
     def hold(self, page: RenderResult) -> str:
         """Keep `page` under an id, counting it as used; the same page gets the same id."""
@@ -949,8 +1188,17 @@ class ServerCore:
             "held_pages": len(self._store),
             "held_bytes": self._store.held_bytes,
             "egress_refusals": self._egress.refusals if self._egress is not None else 0,
+            "sessions": self.session_count(),
+            "max_sessions": self._config.max_sessions,
         }
 
     async def aclose(self) -> None:
-        """Close every browser client."""
+        """Stop reaping, close every session, then every browser client."""
+        if self._reaper is not None:
+            self._reaper.cancel()
+            with suppress(CancelledError):
+                await self._reaper
+            self._reaper = None
+        for sid in list(self._sessions):
+            await self._close_session(sid)
         await self._pool.aclose()

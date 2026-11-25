@@ -336,6 +336,26 @@ VERDICTS: dict[
         _challenge("aws"),
         None,
     ),
+    # A bare 429 is the origin refusing this client for now, and naming no vendor does not make
+    # that less so: the status alone is the signal, so a rate-limit page is not read as an ordinary
+    # page that happens to be empty. No vendor is invented from its wording.
+    "rate_limited_429_no_vendor": (
+        Served("<html><body><div id=root></div></body></html>", status=429),
+        _block(None),
+        None,
+    ),
+    # A 429 whose page is a challenge the detector knows stays that challenge: the status rule is
+    # for the page that names nothing, and must not shadow a verdict that says more.
+    "challenge_on_a_429_keeps_its_vendor": (
+        Served(
+            "<html><head><title>Just a moment...</title></head><body>"
+            "<script>window._cf_chl_opt={cvId:'3',cType:'managed'};</script>"
+            "<h1>Verifying you are human. This may take a few seconds.</h1></body></html>",
+            status=429,
+        ),
+        _challenge("cloudflare"),
+        None,
+    ),
     "akamai_block_403": (
         Served(
             "<html><head><title>Access Denied</title></head><body>"

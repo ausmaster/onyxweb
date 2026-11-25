@@ -532,6 +532,36 @@ def test_dcl_fetch_does_not_leak_a_pending_load_into_the_next_fetch(tserver: HTT
     )
 
 
+def test_a_fetch_on_a_tab_whose_last_page_never_finished_still_runs(tserver: HTTPServer) -> None:
+    """A page that returns at its lifecycle event leaves a navigation the tab never finished.
+
+    The next fetch on that tab leaves for a blank page before it navigates, and a blank hop that
+    queues behind the abandoned navigation waits there for the whole CDP command budget: a page
+    that answers in milliseconds fails after 30 s, reported as ``timeout``. ``timeout_ms`` is held
+    below that budget here so a regression fails in two seconds and says its kind, rather than
+    reading as a slow site.
+    """
+
+    def never(_r: Request) -> Response:
+        sleep(6)  # outlasts this case; the image's answer never reaches the page
+        return Response(b"\x89PNG", content_type="image/png")
+
+    tserver.expect_request("/never.png").respond_with_handler(never)
+    tserver.expect_request("/unfinished").respond_with_data(
+        "<html><body>a<img src='/never.png'></body></html>", content_type="text/html"
+    )
+    tserver.expect_request("/after").respond_with_data(
+        "<html><body>after</body></html>", content_type="text/html"
+    )
+    with Client(concurrency=1, wait_until="domcontentloaded") as c:
+        assert "a" in c.fetch(tserver.url_for("/unfinished"))
+        started = perf_counter()
+        page = c.fetch(tserver.url_for("/after"), timeout_ms=2000)
+        elapsed = perf_counter() - started
+    assert "after" in page, "the fetch after an unfinished page did not get its own page"
+    assert elapsed < 1.0, f"the next fetch waited on the abandoned navigation: {elapsed:.2f}s"
+
+
 def test_capture_returns_the_new_page_despite_a_prior_pushstate(tserver: HTTPServer) -> None:
     """The prior page keeps firing pushState and the next page is slow to respond; the
     goto/lifecycle race must not resolve on the outgoing page's events mid-navigation."""
